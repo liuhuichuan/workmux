@@ -9,7 +9,10 @@ use tracing::{debug, trace};
 #[cfg(unix)]
 fn dup_stderr() -> std::io::Result<Stdio> {
     use std::os::fd::AsFd;
-    std::io::stderr().as_fd().try_clone_to_owned().map(Stdio::from)
+    std::io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .map(Stdio::from)
 }
 
 #[cfg(windows)]
@@ -178,7 +181,7 @@ pub fn shell_command_with_env_mode(
     env_vars: &[(&str, &str)],
     output: ShellOutput,
 ) -> Result<()> {
-    let default_shell = ["bash".to_string(), "-c".to_string()];
+    let default_shell = crate::shell::default_hook_argv();
     let argv = hook_shell.unwrap_or(&default_shell);
     let (executable, args) = argv
         .split_first()

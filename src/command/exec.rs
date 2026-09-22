@@ -53,10 +53,13 @@ fn try_run(run_dir: &Path) -> Result<()> {
         .open(&stderr_path)
         .context("Failed to open stderr file")?;
 
-    // Spawn the command
-    let mut child = Command::new("bash")
-        .arg("-c")
-        .arg(&spec.command)
+    // Spawn the command through the platform shell.
+    let argv = crate::shell::snippet_argv(&spec.command);
+    let (program, args) = argv
+        .split_first()
+        .expect("snippet_argv always returns a program");
+    let mut child = Command::new(program)
+        .args(args)
         .current_dir(&spec.worktree_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

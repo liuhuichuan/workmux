@@ -23,13 +23,14 @@ pub trait PaneHandshake: Send {
     /// Used by backends that need a single command string (tmux).
     fn wrapper_command(&self, shell: &str) -> String;
 
-    /// Returns the raw POSIX script body that signals readiness and exec's the shell.
-    /// Does NOT include `sh -c` wrapping -- the backend decides how to invoke it.
-    /// Used by the shared `setup_panes` implementation, where each backend wraps
-    /// the script appropriately for its CLI.
-    fn script_content(&self, shell: &str) -> String {
+    /// Returns the command that starts the handshake wrapper around `shell`.
+    ///
+    /// Does NOT include `sh -c`/`cmd /C` wrapping -- the backend decides how to
+    /// invoke it. Used by the shared `setup_panes` implementation, where each
+    /// backend wraps the command appropriately for its CLI.
+    fn script_content(&self, shell: &str) -> Result<String> {
         // Default: delegate to wrapper_command (backwards compat)
-        self.wrapper_command(shell)
+        Ok(self.wrapper_command(shell))
     }
 
     /// Waits for the handshake signal, consuming the handshake object.
@@ -96,11 +97,11 @@ impl PaneHandshake for TmuxHandshake {
         )
     }
 
-    fn script_content(&self, shell: &str) -> String {
-        format!(
+    fn script_content(&self, shell: &str) -> Result<String> {
+        Ok(format!(
             "stty -echo 2>/dev/null; tmux wait-for -U {}; stty echo 2>/dev/null; exec '{}' -l",
             self.channel, shell
-        )
+        ))
     }
 
     /// Wait for the shell to signal it is ready, then clean up.
@@ -226,12 +227,12 @@ impl PaneHandshake for UnixPipeHandshake {
         )
     }
 
-    fn script_content(&self, shell: &str) -> String {
-        format!(
+    fn script_content(&self, shell: &str) -> Result<String> {
+        Ok(format!(
             "echo ready > {}; exec '{}' -l",
             self.pipe_path.display(),
             shell
-        )
+        ))
     }
 
     fn wait(self: Box<Self>) -> Result<()> {
@@ -301,48 +302,72 @@ impl Drop for UnixPipeHandshake {
 /// Marker-file handshake for Windows, where neither FIFOs nor `tmux wait-for`
 /// exist.
 ///
-/// The pane shell writes a marker file before handing over to the interactive
+/// `cmd.exe` rewrites the command line it is handed under `/C`, so a wrapper
+/// that needs quoting (any path with a space) cannot be passed as an argument:
+/// the quotes come back backslash-escaped and the wrapper never runs. The
+/// wrapper therefore lives in a temporary `.cmd` file, which `cmd.exe` parses
+/// with its ordinary rules, and the pane is started with that file's path.
+///
+/// The wrapper writes a marker file before handing the pane to the interactive
 /// shell, and `wait` polls for that file. Signalling through the filesystem
 /// keeps `wait` independent of the backend that owns the pane.
 #[cfg(windows)]
 pub struct MarkerFileHandshake {
     marker_path: PathBuf,
+    script_path: PathBuf,
 }
 
 #[cfg(windows)]
 impl MarkerFileHandshake {
-    /// Create a new handshake with a unique, not-yet-existing marker path.
+    /// Create a new handshake with unique, not-yet-existing paths.
     pub fn new() -> Result<Self> {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         let pid = std::process::id();
+        let stem = format!("workmux_ready_{}_{}", pid, nanos);
 
-        let marker_path = std::env::temp_dir().join(format!("workmux_ready_{}_{}.marker", pid, nanos));
+        let marker_path = std::env::temp_dir().join(format!("{stem}.marker"));
+        let script_path = std::env::temp_dir().join(format!("{stem}.cmd"));
         // A leftover marker would report readiness before the pane ever starts.
         let _ = std::fs::remove_file(&marker_path);
 
-        Ok(Self { marker_path })
+        Ok(Self {
+            marker_path,
+            script_path,
+        })
     }
 }
 
 #[cfg(windows)]
 impl PaneHandshake for MarkerFileHandshake {
     fn wrapper_command(&self, shell: &str) -> String {
-        format!("cmd /c \"{}\"", self.script_content(shell))
+        // The path is left unquoted: `cmd.exe` accepts a bare path that contains
+        // spaces, but rejects one whose quotes arrived backslash-escaped.
+        format!("cmd /c {}", self.script_path.display())
     }
 
-    /// `cmd.exe` dialect: write the marker, then hand the pane to the shell.
+    /// Write the wrapper script and return the command that runs it.
     ///
-    /// The redirect must follow `echo` with no space so the marker file contains
-    /// no leading blank, and the shell is quoted so paths with spaces still run.
-    fn script_content(&self, shell: &str) -> String {
-        format!(
-            "echo ready> \"{}\" & \"{}\"",
+    /// The returned command is a single unquoted path, so the backend can hand
+    /// it to `cmd.exe /C` as one argument.
+    fn script_content(&self, shell: &str) -> Result<String> {
+        // Inside the script quoting is ordinary: only the command line is
+        // rewritten by `cmd.exe`. The redirect follows `echo` with no space so
+        // the marker file holds no leading blank.
+        let script = format!(
+            "@echo off\r\necho ready> \"{}\"\r\n\"{}\"\r\n",
             self.marker_path.display(),
             shell
-        )
+        );
+        std::fs::write(&self.script_path, script).with_context(|| {
+            format!(
+                "Failed to write pane handshake script to {}",
+                self.script_path.display()
+            )
+        })?;
+        Ok(self.script_path.display().to_string())
     }
 
     fn wait(self: Box<Self>) -> Result<()> {
@@ -376,5 +401,45 @@ impl PaneHandshake for MarkerFileHandshake {
 impl Drop for MarkerFileHandshake {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.marker_path);
+        let _ = std::fs::remove_file(&self.script_path);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// The wrapper must survive the exact hand-off used for panes: a single
+    /// `cmd.exe /C <script>` command line.
+    ///
+    /// The shell path deliberately contains a space: quoting it is what breaks
+    /// once the wrapper is inlined into that command line instead of living in
+    /// its own file.
+    #[test]
+    fn script_content_runs_through_a_cmd_command_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let shell_dir = temp.path().join("shell dir");
+        std::fs::create_dir_all(&shell_dir).unwrap();
+        let shell = shell_dir.join("fake shell.cmd");
+        std::fs::write(&shell, "@echo off\r\nexit /b 0\r\n").unwrap();
+
+        let handshake = MarkerFileHandshake::new().unwrap();
+        let marker_path = handshake.marker_path.clone();
+        let script = handshake.script_content(shell.to_str().unwrap()).unwrap();
+
+        let argv = crate::shell::snippet_argv(&script);
+        let (program, args) = argv.split_first().unwrap();
+        let output = Command::new(program).args(args).output().unwrap();
+
+        assert!(
+            output.status.success(),
+            "wrapper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            marker_path.exists(),
+            "wrapper did not write the readiness marker"
+        );
     }
 }

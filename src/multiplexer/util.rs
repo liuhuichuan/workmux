@@ -12,10 +12,10 @@ use super::agent::SelectedAgent;
 use crate::config::Config;
 
 use super::PaneHandshake;
-#[cfg(unix)]
-use super::handshake::UnixPipeHandshake;
 #[cfg(windows)]
 use super::handshake::MarkerFileHandshake;
+#[cfg(unix)]
+use super::handshake::UnixPipeHandshake;
 use super::types::LivePaneInfo;
 
 /// Helper function to add prefix to window name.
@@ -109,7 +109,15 @@ where
 
 /// Resolve the default shell from `$SHELL`, falling back when unset.
 pub fn default_shell(fallback: &str) -> Result<String> {
-    std::env::var("SHELL").or_else(|_| Ok(fallback.to_string()))
+    if let Ok(shell) = std::env::var("SHELL") {
+        return Ok(shell);
+    }
+    // Windows has no `$SHELL`; `%COMSPEC%` is the console's interpreter.
+    #[cfg(windows)]
+    if let Ok(shell) = std::env::var("COMSPEC") {
+        return Ok(shell);
+    }
+    Ok(fallback.to_string())
 }
 
 /// Create a named-pipe (FIFO) handshake for shell startup synchronization.
@@ -130,12 +138,27 @@ pub fn windows_marker_handshake() -> Result<Box<dyn PaneHandshake>> {
     Ok(Box::new(MarkerFileHandshake::new()?))
 }
 
-/// Run a shell script detached via `nohup sh -c`.
-pub fn run_detached_sh_c(script: &str) -> Result<()> {
-    Command::new("nohup")
-        .arg("sh")
-        .arg("-c")
-        .arg(script)
+/// Run a script in a detached process that outlives workmux.
+///
+/// The script text must match the platform shell: POSIX `sh` on Unix,
+/// PowerShell on Windows, where there is no `nohup`.
+pub fn run_detached_script(script: &str) -> Result<()> {
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new("nohup");
+        command.arg("sh").arg("-c").arg(script);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(script);
+        command
+    };
+
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -375,7 +398,7 @@ mod tests {
             crate::shell::shell_quote(&output.to_string_lossy())
         );
 
-        run_detached_sh_c(&script).unwrap();
+        run_detached_script(&script).unwrap();
         for _ in 0..100 {
             if output.exists() {
                 break;

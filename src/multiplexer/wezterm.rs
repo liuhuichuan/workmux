@@ -106,6 +106,10 @@ impl WezTermBackend {
     }
 
     /// Get the current foreground process details for a pane tty.
+    ///
+    /// Unix reads the tty's foreground process group. Windows panes report no
+    /// tty and have no `ps`, so there is nothing to inspect yet.
+    #[cfg(unix)]
     fn foreground_process_info(&self, tty_name: Option<&str>) -> (Option<u32>, Option<String>) {
         let tty = tty_name.map(|t| t.trim_start_matches("/dev/"));
 
@@ -141,6 +145,11 @@ impl WezTermBackend {
             .filter(|s| !s.is_empty());
 
         (pid, current_command)
+    }
+
+    #[cfg(windows)]
+    fn foreground_process_info(&self, _tty_name: Option<&str>) -> (Option<u32>, Option<String>) {
+        (None, None)
     }
 
     fn live_pane_snapshot(&self, p: &WezTermPane) -> util::LivePaneSnapshot {
@@ -235,13 +244,14 @@ impl WezTermBackend {
         }
         let _ = size; // WezTerm doesn't support absolute sizes via CLI
 
-        // Handle optional command: always wrap in sh -c to correctly handle
-        // both simple commands and complex shell scripts with quoting
-        if let Some(cmd) = command {
+        // Route the command through the platform shell so simple commands and
+        // multi-statement scripts are handled the same way.
+        let snippet = command.map(crate::shell::snippet_argv);
+        if let Some(snippet) = &snippet {
             args.push("--");
-            args.push("sh");
-            args.push("-c");
-            args.push(cmd);
+            for arg in snippet {
+                args.push(arg.as_str());
+            }
         }
 
         let output = self
@@ -375,14 +385,18 @@ impl Multiplexer for WezTermBackend {
             .collect::<Vec<_>>()
             .join("; ");
 
-        // nohup inherits WEZTERM_UNIX_SOCKET from environment
-        let script = format!(
-            "nohup sh -c 'sleep {}; {}' >/dev/null 2>&1 &",
-            delay.as_secs_f64(),
-            kill_cmds
-        );
+        // The detached process inherits WEZTERM_UNIX_SOCKET from the environment.
+        let script = if cfg!(windows) {
+            format!(
+                "Start-Sleep -Milliseconds {}; {}",
+                delay.as_millis(),
+                kill_cmds
+            )
+        } else {
+            format!("sleep {}; {}", delay.as_secs_f64(), kill_cmds)
+        };
 
-        Cmd::new("sh").args(&["-c", &script]).run()?;
+        util::run_detached_script(&script)?;
         Ok(())
     }
 
@@ -393,7 +407,7 @@ impl Multiplexer for WezTermBackend {
     }
 
     fn run_deferred_script(&self, script: &str) -> Result<()> {
-        util::run_detached_sh_c(script)
+        util::run_detached_script(script)
     }
 
     fn shell_select_window_cmd(&self, full_name: &str) -> Result<String> {
@@ -572,12 +586,13 @@ impl Multiplexer for WezTermBackend {
             let cwd_str = cwd.to_string_lossy();
             let mut args = vec!["cli", "spawn", "--cwd", &*cwd_str];
 
-            // Wrap in sh -c to correctly handle complex shell scripts with quoting
-            if let Some(c) = cmd {
+            // Route the command through the platform shell, as in split_pane.
+            let snippet = cmd.map(crate::shell::snippet_argv);
+            if let Some(snippet) = &snippet {
                 args.push("--");
-                args.push("sh");
-                args.push("-c");
-                args.push(c);
+                for arg in snippet {
+                    args.push(arg.as_str());
+                }
             }
 
             let output = self

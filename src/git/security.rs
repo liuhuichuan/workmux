@@ -229,10 +229,13 @@ fn protected_git(workdir: Option<&Path>, interactive: bool) -> Result<Command> {
         match RepositoryIdentity::discover(path) {
             Ok(identity) => {
                 command
-                    .env("GIT_DIR", &identity.admin_dir)
-                    .env("GIT_COMMON_DIR", &identity.common_dir);
+                    .env("GIT_DIR", crate::util::git_path(&identity.admin_dir))
+                    .env(
+                        "GIT_COMMON_DIR",
+                        crate::util::git_path(&identity.common_dir),
+                    );
                 if !identity.is_bare {
-                    command.env("GIT_WORK_TREE", &identity.worktree);
+                    command.env("GIT_WORK_TREE", crate::util::git_path(&identity.worktree));
                 }
             }
             Err(error) => {
@@ -522,6 +525,37 @@ mod tests {
             assert_eq!(environment.get(key), Some(&None), "{key} was not cleared");
         }
         assert!(!marker.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_git_pins_repository_paths_for_windows() {
+        let (_temp, worktree) = linked_repo();
+
+        let command = pinned_git(&worktree).unwrap();
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        // Git rejects extended-length (`\\?\`) paths in these overrides, so the
+        // pinned repository must be described with ordinary Windows paths.
+        for key in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"] {
+            let value = environment
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} was not pinned"))
+                .as_deref()
+                .unwrap_or_else(|| panic!("{key} was cleared"));
+            assert!(
+                !value.starts_with(r"\\?\"),
+                "{key} must not be extended-length: {value}"
+            );
+        }
     }
 
     #[test]

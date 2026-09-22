@@ -599,7 +599,7 @@ pub trait Multiplexer: Send + Sync {
 
     /// Fallback shell when `$SHELL` is unset.
     fn default_shell_fallback(&self) -> &'static str {
-        "/bin/bash"
+        crate::shell::default_interactive_shell()
     }
 
     /// Get the default shell for new panes
@@ -698,7 +698,7 @@ pub trait Multiplexer: Send + Sync {
 
                 // Spawn with handshake so we can send the command after shell is ready
                 let handshake = self.create_handshake()?;
-                let script = handshake.script_content(&shell);
+                let script = handshake.script_content(&shell)?;
 
                 let spawned_id = if is_first {
                     self.respawn_pane(&pane_ids[0], working_dir, Some(&script))?

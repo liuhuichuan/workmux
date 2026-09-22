@@ -36,7 +36,30 @@ mod xdg;
 use anyhow::Result;
 use tracing::{error, info};
 
+// Windows gives the main thread a 1 MiB stack, which is not always enough for
+// the debug-build call chain that builds the CLI and configuration. Unix keeps
+// the plain `main` so signal and thread semantics stay untouched.
+#[cfg(unix)]
 fn main() -> Result<()> {
+    real_main()
+}
+
+#[cfg(windows)]
+fn main() -> Result<()> {
+    let worker = std::thread::Builder::new()
+        .stack_size(WINDOWS_MAIN_STACK_BYTES)
+        .spawn(real_main)
+        .expect("failed to spawn main worker thread");
+    match worker.join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+#[cfg(windows)]
+const WINDOWS_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn real_main() -> Result<()> {
     logger::init()?;
     let context = LogContext::current();
     let args = std::env::args().collect::<Vec<_>>();

@@ -2628,7 +2628,7 @@ impl Config {
         }
 
         if config.hook_shell.is_none() {
-            config.hook_shell = Some(vec!["bash".to_string(), "-c".to_string()]);
+            config.hook_shell = Some(crate::shell::default_hook_argv());
         }
         validate_hook_shell(config.hook_shell.as_deref())?;
 
@@ -3295,7 +3295,7 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 # Executable and arguments used to run lifecycle hooks. The hook command is
 # appended as the final argument. Configure machine-specific paths globally;
 # project configuration may override the complete argv.
-# Default: ["bash", "-c"]
+# Default: ["bash", "-c"] on Unix, ["cmd.exe", "/C"] on Windows
 # hook_shell: ["/opt/homebrew/bin/bash", "-c"]
 
 # Commands to run in new worktree before tmux window opens.
@@ -4165,7 +4165,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_shell_defaults_to_bash_c() {
+    fn hook_shell_defaults_to_the_platform_shell() {
         let config = Config::merge_and_apply_defaults(
             Config::default(),
             Config::default(),
@@ -4174,10 +4174,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            config.hook_shell,
-            Some(vec!["bash".to_string(), "-c".to_string()])
-        );
+        assert_eq!(config.hook_shell, Some(crate::shell::default_hook_argv()));
     }
 
     #[test]

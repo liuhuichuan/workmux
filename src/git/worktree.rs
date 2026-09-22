@@ -70,7 +70,8 @@ pub fn create_worktree_in(
     track_upstream: bool,
     workdir: Option<&Path>,
 ) -> Result<()> {
-    let path_str = worktree_path
+    let path = crate::util::git_path(worktree_path);
+    let path_str = path
         .to_str()
         .ok_or_else(|| anyhow!("Invalid worktree path"))?;
 
@@ -103,6 +104,8 @@ pub fn create_worktree_in(
 /// `.git` pointer. Note: the admin dir itself (`.git/worktrees/<basename>/`)
 /// keeps its original basename; workmux does not rely on that path shape.
 pub fn move_worktree(old_path: &Path, new_path: &Path) -> Result<()> {
+    let old_path = crate::util::git_path(old_path);
+    let new_path = crate::util::git_path(new_path);
     let old = old_path
         .to_str()
         .ok_or_else(|| anyhow!("Invalid old worktree path"))?;
@@ -639,6 +642,40 @@ mod tests {
     use crate::test_support;
     use std::path::PathBuf;
     use std::process::Command;
+
+    #[test]
+    fn create_worktree_in_accepts_canonicalized_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_support::init_repo(&repo);
+
+        // `canonicalize` produces extended-length paths on Windows, which Git
+        // rejects when they are used as `git worktree add` arguments.
+        let base = temp.path().canonicalize().unwrap();
+        let worktree_path = base.join("wts").join("feature");
+        create_worktree_in(
+            &worktree_path,
+            "feature",
+            true,
+            Some("main"),
+            false,
+            Some(&repo),
+        )
+        .unwrap();
+
+        let listed = Command::new("git")
+            .current_dir(&repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        assert!(
+            String::from_utf8_lossy(&listed.stdout).contains("branch refs/heads/feature"),
+            "worktree was not registered: {}",
+            String::from_utf8_lossy(&listed.stdout)
+        );
+    }
 
     #[test]
     fn create_worktree_in_uses_explicit_repo_not_process_cwd() {

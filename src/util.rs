@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, anyhow};
+use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -122,6 +124,29 @@ impl FileLock {
 /// Canonicalize a path, falling back to the original if canonicalization fails.
 pub fn canon_or_self(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Rewrite a path into the form Git accepts on this platform.
+///
+/// `std::fs::canonicalize` returns extended-length (`\\?\`) paths on Windows,
+/// but Git rejects those both in environment overrides such as `GIT_DIR` and
+/// when they are passed as arguments such as `git worktree add <path>`.
+pub fn git_path(path: &Path) -> Cow<'_, OsStr> {
+    #[cfg(windows)]
+    if let Some(stripped) = strip_verbatim_prefix(path) {
+        return Cow::Owned(stripped);
+    }
+    Cow::Borrowed(path.as_os_str())
+}
+
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: &Path) -> Option<std::ffi::OsString> {
+    let text = path.to_str()?;
+    let rest = text.strip_prefix(r"\\?\")?;
+    Some(std::ffi::OsString::from(match rest.strip_prefix("UNC\\") {
+        Some(unc) => format!(r"\\{unc}"),
+        None => rest.to_string(),
+    }))
 }
 
 /// Lexically normalize a path by resolving `.` and `..` components without
@@ -544,6 +569,32 @@ mod tests {
     fn format_compact_age_years() {
         assert_eq!(format_compact_age(365 * 86400), "1y");
         assert_eq!(format_compact_age(730 * 86400), "2y");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn git_path_strips_windows_verbatim_prefix() {
+        assert_eq!(
+            &*git_path(Path::new(r"\\?\C:\repo\.git")),
+            OsStr::new(r"C:\repo\.git")
+        );
+        assert_eq!(
+            &*git_path(Path::new(r"\\?\UNC\server\share\.git")),
+            OsStr::new(r"\\server\share\.git")
+        );
+        assert_eq!(
+            &*git_path(Path::new(r"C:\repo\.git")),
+            OsStr::new(r"C:\repo\.git")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn git_path_keeps_unix_paths() {
+        assert_eq!(
+            &*git_path(Path::new("/repo/.git")),
+            OsStr::new("/repo/.git")
+        );
     }
 
     #[test]

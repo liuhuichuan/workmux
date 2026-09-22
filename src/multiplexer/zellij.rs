@@ -535,7 +535,7 @@ impl Multiplexer for ZellijBackend {
     }
 
     fn run_deferred_script(&self, script: &str) -> Result<()> {
-        util::run_detached_sh_c(script)
+        util::run_detached_script(script)
     }
 
     fn shell_select_window_cmd(&self, full_name: &str) -> Result<String> {
