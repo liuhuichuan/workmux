@@ -13,7 +13,12 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 use toml_edit::{DocumentMut, Item, Table, Value as TomlValue, value};
 
 use super::{StatusCheck, UpdatePreview};
@@ -24,6 +29,195 @@ use crate::agent_setup::json_config::{
 
 /// Hooks configuration embedded at compile time.
 const HOOKS_JSON: &str = include_str!("../../resources/codex/hooks/workmux-status.json");
+
+/// Handshake an app server expects before it answers a request.
+const INITIALIZE_REQUEST: &str = concat!(
+    r#"{"jsonrpc":"2.0","id":0,"method":"initialize","#,
+    r#""params":{"clientInfo":{"name":"workmux","version":"1"}}}"#
+);
+
+/// Asks for the hooks of the session's working directory.
+const HOOKS_LIST_REQUEST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"hooks/list","params":{}}"#;
+
+/// Hook trust states Codex runs a hook for.
+///
+/// Codex approves a hook entry by recording a hash of the entry it reviewed,
+/// and reports the verdict in `hooks/list`: `trusted` and `managed` hooks run,
+/// and the others -- `untrusted` (never reviewed) and `modified` (reviewed, then
+/// changed) -- are skipped.
+const RUNNABLE_TRUST: [&str; 2] = ["trusted", "managed"];
+
+/// How long Codex has to answer `hooks/list` before the check gives up.
+///
+/// `workmux setup` is interactive, so an answer is worth a pause; handshakes
+/// measured on this machine take about three seconds.
+const HOOK_REVIEW_DEADLINE: Duration = Duration::from_secs(8);
+
+/// How long a stdio app server has to stop once its input closes.
+const APP_SERVER_STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// How often a stopping app server is checked while it runs out that grace.
+const APP_SERVER_STOP_POLL: Duration = Duration::from_millis(10);
+
+/// A workmux hook Codex has been given but will not run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreviewedHook {
+    /// Hook event as Codex names it, e.g. `sessionStart`.
+    pub event: String,
+    /// Command Codex would run, e.g. `workmux register-agent`.
+    pub command: String,
+    /// `modified` when the entry changed after review, `untrusted` when it was
+    /// never reviewed at all.
+    pub trust_status: String,
+}
+
+/// Ask Codex which of the installed workmux hooks it will skip.
+///
+/// Codex runs a hook only after reviewing that entry, and skips the ones it has
+/// not approved. Nothing says so outside Codex's own review prompt -- a
+/// `codex exec` run skips in silence -- so status tracking goes quiet with no
+/// symptom a user can see, which is exactly when they run `workmux setup`.
+/// The hash Codex compares is Codex's to compute, so the verdict has to come
+/// from Codex: this asks its app server instead of guessing from the hook file.
+///
+/// `None` means Codex could not be asked (not installed, or no answer before
+/// the deadline), which is not the same as "nothing is skipped".
+pub fn unreviewed_hooks() -> Option<Vec<UnreviewedHook>> {
+    let hooks = query_hooks(&mut app_server_command(), HOOK_REVIEW_DEADLINE)?;
+    Some(unreviewed_in(&hooks))
+}
+
+/// Command that starts a Codex app server speaking JSON-RPC on stdio.
+///
+/// A Windows Codex is usually a `.cmd` shim, which `CreateProcess` will not
+/// start on its own, so the shell there does the lookup.
+fn app_server_command() -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("cmd");
+        command.args(["/c", "codex", "app-server"]);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = Command::new("codex");
+        command.arg("app-server");
+        command
+    }
+}
+
+/// Ask an app server for its hook list, or `None` if it does not answer.
+///
+/// The app server is a stdio service that stops when its input closes, so the
+/// requests are answered, the write end is released, and the process is waited
+/// out rather than killed -- killing a wrapper would leave the server behind.
+fn query_hooks(command: &mut Command, deadline: Duration) -> Option<Vec<Value>> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+
+    for request in [INITIALIZE_REQUEST, HOOKS_LIST_REQUEST] {
+        if writeln!(stdin, "{request}").is_err() {
+            break;
+        }
+    }
+    let _ = stdin.flush();
+
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stdout)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let mut hooks = None;
+    while let Some(remaining) = deadline.checked_sub(started.elapsed()) {
+        match receiver.recv_timeout(remaining) {
+            Ok(line) => {
+                if let Some(listed) = hooks_in_reply(&line) {
+                    hooks = Some(listed);
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    drop(stdin);
+    stop_app_server(&mut child);
+    let _ = reader.join();
+
+    hooks
+}
+
+/// Wait out an app server that is stopping, and end one that does not.
+fn stop_app_server(child: &mut Child) {
+    let deadline = Instant::now() + APP_SERVER_STOP_GRACE;
+    while Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        thread::sleep(APP_SERVER_STOP_POLL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The hooks Codex listed, if this line answers the `hooks/list` request.
+fn hooks_in_reply(line: &str) -> Option<Vec<Value>> {
+    let reply: Value = serde_json::from_str(line).ok()?;
+    if reply.get("id") != Some(&Value::from(1)) {
+        return None;
+    }
+    let reports = reply.get("result")?.get("data")?.as_array()?;
+
+    let mut hooks = Vec::new();
+    for report in reports {
+        hooks.extend(report.get("hooks")?.as_array()?.iter().cloned());
+    }
+    Some(hooks)
+}
+
+/// The workmux hooks among `hooks` that Codex will not run.
+fn unreviewed_in(hooks: &[Value]) -> Vec<UnreviewedHook> {
+    hooks
+        .iter()
+        .filter_map(|hook| {
+            let command = hook.get("command")?.as_str()?;
+            // Hooks other tools installed are theirs to explain.
+            if !command.contains("workmux") {
+                return None;
+            }
+            if hook.get("enabled").and_then(Value::as_bool) == Some(false) {
+                return None;
+            }
+            let trust_status = hook.get("trustStatus")?.as_str()?.to_string();
+            if RUNNABLE_TRUST.contains(&trust_status.as_str()) {
+                return None;
+            }
+            Some(UnreviewedHook {
+                event: hook
+                    .get("eventName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                command: command.to_string(),
+                trust_status,
+            })
+        })
+        .collect()
+}
 
 fn codex_dir() -> Option<PathBuf> {
     codex_dir_from_env(
@@ -352,6 +546,91 @@ pub fn install() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `hooks/list` answer shaped like the real one: workmux hooks Codex has
+    /// not reviewed, beside hooks it runs, another tool's hook, and a disabled
+    /// entry.
+    fn hooks_list_reply() -> String {
+        let hooks = vec![
+            reported_hook("sessionStart", "workmux register-agent", "modified", true),
+            reported_hook(
+                "userPromptSubmit",
+                "workmux set-window-status working",
+                "untrusted",
+                true,
+            ),
+            reported_hook("stop", "workmux set-window-status done", "trusted", true),
+            reported_hook(
+                "permissionRequest",
+                "workmux set-window-status waiting",
+                "managed",
+                true,
+            ),
+            reported_hook("postToolUse", "other-tool notify", "untrusted", true),
+            reported_hook(
+                "subagentStop",
+                "workmux set-window-status working",
+                "untrusted",
+                false,
+            ),
+        ];
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "data": [{ "cwd": "C:\\repo", "hooks": hooks }] },
+        })
+        .to_string()
+    }
+
+    fn reported_hook(event: &str, command: &str, trust_status: &str, enabled: bool) -> Value {
+        serde_json::json!({
+            "eventName": event,
+            "command": command,
+            "trustStatus": trust_status,
+            "enabled": enabled,
+        })
+    }
+
+    #[test]
+    fn reports_the_workmux_hooks_codex_will_skip() {
+        let hooks = hooks_in_reply(&hooks_list_reply()).unwrap();
+        assert_eq!(
+            unreviewed_in(&hooks),
+            vec![
+                UnreviewedHook {
+                    event: "sessionStart".to_string(),
+                    command: "workmux register-agent".to_string(),
+                    trust_status: "modified".to_string(),
+                },
+                UnreviewedHook {
+                    event: "userPromptSubmit".to_string(),
+                    command: "workmux set-window-status working".to_string(),
+                    trust_status: "untrusted".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_approved_hook_needs_no_review() {
+        let hooks = vec![
+            reported_hook("stop", "workmux set-window-status done", "trusted", true),
+            reported_hook(
+                "subagentStart",
+                "workmux set-window-status working",
+                "managed",
+                true,
+            ),
+        ];
+        assert!(unreviewed_in(&hooks).is_empty());
+    }
+
+    #[test]
+    fn reads_only_the_hook_list_reply() {
+        assert!(hooks_in_reply(r#"{"jsonrpc":"2.0","id":0,"result":{"data":[]}}"#).is_none());
+        assert!(hooks_in_reply(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#).is_none());
+        assert!(hooks_in_reply("not json at all").is_none());
+    }
 
     #[test]
     fn codex_root_prefers_non_empty_current_then_legacy_env() {

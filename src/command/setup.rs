@@ -78,6 +78,8 @@ fn run_hooks_setup(checks: &[agent_setup::AgentCheck]) -> Result<()> {
         }
     }
 
+    print_codex_hook_review(checks);
+
     if !any_needed {
         println!(
             "  {}",
@@ -120,6 +122,54 @@ fn run_hooks_setup(checks: &[agent_setup::AgentCheck]) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Warn when Codex will not run the hooks workmux installed for it.
+///
+/// Codex runs a hook only after it has reviewed that entry, and skips the ones
+/// it has not approved -- in silence, outside its own review prompt, which only
+/// the interactive client shows. A hook set that changed since the last review,
+/// which is what a workmux release with new hooks leaves behind, therefore stops
+/// reporting status with nothing on screen to show for it. `workmux setup` is
+/// where a user looks when that happens, so it asks Codex for the verdict and
+/// names the hooks Codex would skip.
+fn print_codex_hook_review(checks: &[agent_setup::AgentCheck]) {
+    let installed = checks.iter().any(|check| {
+        check.agent == Agent::Codex
+            && matches!(
+                check.status,
+                StatusCheck::Installed | StatusCheck::UpdateAvailable
+            )
+    });
+    if !installed {
+        return;
+    }
+    let Some(unreviewed) = agent_setup::codex::unreviewed_hooks() else {
+        return;
+    };
+    if unreviewed.is_empty() {
+        return;
+    }
+
+    println!(
+        "  {} Codex will skip {} workmux hook{} until you review {}",
+        style("!").yellow(),
+        unreviewed.len(),
+        if unreviewed.len() == 1 { "" } else { "s" },
+        if unreviewed.len() == 1 { "it" } else { "them" },
+    );
+    for hook in &unreviewed {
+        println!("    {} {} ({})", style("•").dim(), hook.command, hook.event);
+    }
+    println!(
+        "    {}",
+        style(
+            "Codex runs a hook only after you approve it, and says nothing when it skips \
+             one. Start `codex` and choose \"Trust all and continue\"."
+        )
+        .dim()
+    );
+    println!();
 }
 
 fn run_skills_setup(checks: &[agent_setup::AgentCheck]) -> Result<()> {
