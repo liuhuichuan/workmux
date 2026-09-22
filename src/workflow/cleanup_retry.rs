@@ -129,15 +129,7 @@ fn retry_with_clock(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
-
-    fn identity(path: &Path) -> DirectoryIdentity {
-        let metadata = std::fs::symlink_metadata(path).unwrap();
-        DirectoryIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
-    }
+    use super::super::cleanup::test_identity as identity;
 
     #[derive(Default)]
     struct Clock {
@@ -259,16 +251,16 @@ mod tests {
             assert_eq!(clock.elapsed.get(), RETRY_TIMEOUT);
             let error = format!("{:#}", result.unwrap_err());
             assert!(error.contains("kind=DirectoryNotEmpty"));
-            assert!(error.contains("Directory not empty"));
+            assert!(error.contains(&not_empty_message()));
             assert!(error.contains("Recursive deletion encountered"));
             assert!(error.contains("pending cleanup record retained at"));
             assert!(error.contains("post-failure snapshot"));
             assert!(error.contains(&record_path.display().to_string()));
             assert_eq!(std::fs::read(&record_path).unwrap(), record_bytes);
             let record: serde_json::Value = serde_json::from_slice(&record_bytes).unwrap();
-            let metadata = std::fs::metadata(&trash).unwrap();
-            assert_eq!(record["inode"], metadata.ino());
-            assert_eq!(record["device"], metadata.dev());
+            let recorded = identity(&trash);
+            assert_eq!(record["inode"], recorded.inode);
+            assert_eq!(record["device"], recorded.device);
             assert!(trash.join("churn/late").is_file());
             assert!(
                 !trash.join("crate-0").exists(),
@@ -318,9 +310,16 @@ mod tests {
         assert!(!trash.exists());
     }
 
+    /// The platform's own wording for removing a non-empty directory, so the
+    /// assertion checks the real OS error instead of hard-coded Unix text.
+    fn not_empty_message() -> String {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file"), "x").unwrap();
+        std::fs::remove_dir(dir.path()).unwrap_err().to_string()
+    }
+
     #[test]
-    fn preserves_non_utf8_paths_and_refuses_unwritable_record_location() {
-        use std::os::unix::ffi::OsStringExt;
+    fn refuses_unwritable_record_location() {
         let root = tempfile::tempdir().unwrap();
         let original = root.path().join("worktree");
         std::fs::create_dir(&original).unwrap();
@@ -333,7 +332,18 @@ mod tests {
         );
         assert!(original.is_dir());
         assert!(!trash.exists());
-        std::fs::remove_file(&state).unwrap();
+    }
+
+    /// Windows cannot represent a name that is not valid UTF-16.
+    #[cfg(unix)]
+    #[test]
+    fn preserves_non_utf8_paths_in_records() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("worktree");
+        std::fs::create_dir(&original).unwrap();
+        let trash = root.path().join(".workmux_trash_test");
+        let state = root.path().join("state");
         // Record serialization must preserve OS paths even on filesystems that
         // cannot themselves create non-UTF-8 names.
         let non_utf8 = root

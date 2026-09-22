@@ -41,6 +41,9 @@ fn write_atomic_with_durability(path: &Path, content: &[u8], durable: bool) -> R
     tmp.persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("Failed to rename temp file for {}", path.display()))?;
+    // A rename is only durable once the parent directory entry is flushed, which
+    // requires opening the directory as a file -- possible on Unix only.
+    #[cfg(unix)]
     if durable {
         File::open(parent)
             .and_then(|directory| directory.sync_all())
@@ -90,6 +93,30 @@ fn atomic_temp_prefix(path: &Path) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("atomic");
     format!(".{file_name}.tmp.")
+}
+
+/// Held exclusive advisory lock on a lock file.
+///
+/// Maps to `flock(2)` on Unix and `LockFileEx` on Windows, so callers do not
+/// need a platform-specific `flock` binding.
+pub(crate) struct FileLock {
+    _file: File,
+}
+
+impl FileLock {
+    /// Open (creating if needed) and exclusively lock `path`, blocking until available.
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("Failed to open lock file: {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("Failed to acquire lock: {}", path.display()))?;
+        Ok(Self { _file: file })
+    }
 }
 
 /// Canonicalize a path, falling back to the original if canonicalization fails.

@@ -608,8 +608,15 @@ pub trait Multiplexer: Send + Sync {
     }
 
     /// Create a handshake mechanism for synchronizing shell startup
+    #[cfg(unix)]
     fn create_handshake(&self) -> Result<Box<dyn PaneHandshake>> {
         util::unix_pipe_handshake()
+    }
+
+    /// Create a handshake mechanism for synchronizing shell startup
+    #[cfg(windows)]
+    fn create_handshake(&self) -> Result<Box<dyn PaneHandshake>> {
+        util::windows_marker_handshake()
     }
 
     // === Status ===
@@ -1002,7 +1009,8 @@ pub trait Multiplexer: Send + Sync {
 /// 3. `$WEZTERM_PANE` set → WezTerm
 /// 4. `$ZELLIJ`, `$ZELLIJ_PANE_ID`, or `$ZELLIJ_SESSION_NAME` set → Zellij
 /// 5. `$KITTY_WINDOW_ID` set → Kitty
-/// 6. None → defaults to tmux (for backward compatibility)
+/// 6. None → tmux on Unix (for backward compatibility), WezTerm on Windows,
+///    where tmux is not available natively.
 ///
 /// This ordering ensures that running tmux inside kitty (or wezterm) correctly
 /// selects the innermost multiplexer.
@@ -1063,7 +1071,21 @@ fn resolve_backend(tmux: bool, wezterm: bool, zellij: bool, kitty: bool) -> Back
         return BackendType::Kitty;
     }
 
+    default_backend()
+}
+
+/// Backend to use when nothing in the environment identifies a multiplexer.
+///
+/// tmux has no native Windows build, so WezTerm -- which does -- is the only
+/// backend that can work outside a multiplexer there.
+#[cfg(unix)]
+fn default_backend() -> BackendType {
     BackendType::Tmux
+}
+
+#[cfg(windows)]
+fn default_backend() -> BackendType {
+    BackendType::WezTerm
 }
 
 /// Create a backend instance based on the backend type.
@@ -1160,11 +1182,14 @@ mod tests {
     }
 
     #[test]
-    fn no_env_defaults_to_tmux() {
-        assert_eq!(
-            resolve_backend(false, false, false, false),
+    fn no_env_uses_the_platform_default() {
+        // tmux has no native Windows build, so WezTerm is the fallback there.
+        let expected = if cfg!(windows) {
+            BackendType::WezTerm
+        } else {
             BackendType::Tmux
-        );
+        };
+        assert_eq!(resolve_backend(false, false, false, false), expected);
     }
 
     #[test]

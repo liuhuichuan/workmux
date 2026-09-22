@@ -1,15 +1,13 @@
 use anyhow::{Context, Result, anyhow};
-use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use tracing::debug;
 
-use crate::util::write_atomic;
+use crate::util::{FileLock, write_atomic};
 
 #[derive(Debug, Deserialize)]
 pub struct PrDetails {
@@ -1254,18 +1252,7 @@ pub fn save_pr_cache(statuses: &HashMap<PathBuf, HashMap<String, PrSummary>>) {
         return;
     };
     let lock_path = path.with_extension("json.lock");
-    let lock_file = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-    {
-        Ok(file) => file,
-        Err(_) => return,
-    };
-    let Ok(_lock) = Flock::lock(lock_file, FlockArg::LockExclusive).map_err(|(_file, errno)| errno)
-    else {
+    let Ok(_lock) = FileLock::acquire(&lock_path) else {
         return;
     };
 
@@ -1304,18 +1291,7 @@ pub fn save_check_cache(statuses: &HashMap<PathBuf, HashMap<String, CheckSummary
         return;
     };
     let lock_path = path.with_extension("json.lock");
-    let lock_file = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-    {
-        Ok(file) => file,
-        Err(_) => return,
-    };
-    let Ok(_lock) = Flock::lock(lock_file, FlockArg::LockExclusive).map_err(|(_file, errno)| errno)
-    else {
+    let Ok(_lock) = FileLock::acquire(&lock_path) else {
         return;
     };
 

@@ -101,7 +101,10 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("remaining"), "private file contents").unwrap();
         std::fs::write(outside.path().join("outside-marker"), "secret").unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        if !super::super::cleanup::test_symlink_dir(outside.path(), &root.path().join("link")) {
+            eprintln!("skipping: this host cannot create directory links");
+            return;
+        }
         let snapshot = remaining_entries(root.path());
         assert!(snapshot.contains("remaining"));
         assert!(snapshot.contains("type=file bytes=21"));

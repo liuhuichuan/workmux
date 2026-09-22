@@ -5,8 +5,18 @@
 
 use anyhow::{Context, Result};
 use std::fs;
-use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+
+/// Link a shim command to the `_shim` dispatcher.
+///
+/// The shim directory is shared with a Linux guest, so on Windows the link is a
+/// file symlink created with developer mode or the symlink privilege.
+fn symlink(original: &str, link: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(original, link);
+    #[cfg(windows)]
+    return std::os::windows::fs::symlink_file(original, link);
+}
 
 /// Commands that are always available as shims, regardless of
 /// user `host_commands` config. Includes both host-exec commands (e.g., `afplay`)

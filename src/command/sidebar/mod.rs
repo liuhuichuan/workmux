@@ -18,36 +18,60 @@
 //! - `snapshot` - snapshot data types and builder
 //! - `ui` - ratatui rendering (compact and tile layouts)
 
+#[cfg(unix)]
 mod app;
+#[cfg(unix)]
 mod client;
+#[cfg(unix)]
 mod daemon;
+#[cfg(unix)]
 mod daemon_ctrl;
+#[cfg(unix)]
 mod hooks;
+#[cfg(unix)]
 mod layout_tree;
+#[cfg(unix)]
 mod panes;
+#[cfg(unix)]
 mod runtime;
+#[cfg(unix)]
 mod snapshot;
+#[cfg(unix)]
 mod template;
+#[cfg(unix)]
 mod ui;
 
+#[cfg(unix)]
 use crate::cmd::Cmd;
+#[cfg(unix)]
 use crate::config::{SidebarHeight, SidebarPosition, SidebarWidth};
+#[cfg(unix)]
 use anyhow::{Result, anyhow, bail};
 
+#[cfg(unix)]
 use self::daemon_ctrl::{ensure_daemon_running, kill_daemon, signal_daemon, signal_daemon_for};
+#[cfg(unix)]
 use self::hooks::{install_hooks, remove_hooks};
+#[cfg(unix)]
 use self::panes::{
     create_sidebar_in_window, create_sidebars_in_all_windows, create_sidebars_in_session,
     find_sidebar_in_window, kill_all_sidebars_and_restore_layouts, kill_sidebars_in_session,
 };
 
+#[cfg(unix)]
 const SIDEBAR_ROLE_VALUE: &str = "sidebar";
+#[cfg(unix)]
 const MIN_WIDTH: u16 = 25;
+#[cfg(unix)]
 const MAX_WIDTH: u16 = 50;
+#[cfg(unix)]
 const MAX_SANE_WIDTH: u16 = 80;
+#[cfg(unix)]
 const MIN_HEIGHT: u16 = 1;
+#[cfg(unix)]
 const MAX_HEIGHT: u16 = 5;
 
+#[cfg(unix)]
 /// Global tmux options set while the sidebar is active.
 const SIDEBAR_GLOBAL_OPTIONS: &[&str] = &[
     "@workmux_sidebar_enabled",
@@ -60,6 +84,7 @@ const SIDEBAR_GLOBAL_OPTIONS: &[&str] = &[
     "@workmux_sidebar_optout_sessions",
 ];
 
+#[cfg(unix)]
 /// Active sidebar scope on this tmux server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SidebarScope {
@@ -71,6 +96,7 @@ pub(super) enum SidebarScope {
     Sessions(std::collections::HashSet<String>),
 }
 
+#[cfg(unix)]
 fn parse_scope(raw: &str, enabled: bool) -> SidebarScope {
     match raw.trim() {
         "" if enabled => SidebarScope::Global,
@@ -84,6 +110,7 @@ fn parse_scope(raw: &str, enabled: bool) -> SidebarScope {
     }
 }
 
+#[cfg(unix)]
 /// Read the current sidebar scope from tmux.
 pub(super) fn current_scope() -> SidebarScope {
     let raw = Cmd::new("tmux")
@@ -100,6 +127,7 @@ pub(super) fn current_scope() -> SidebarScope {
     parse_scope(&raw, enabled)
 }
 
+#[cfg(unix)]
 /// Set the sidebar scope in tmux.
 fn set_scope(scope: &SidebarScope) {
     match scope {
@@ -123,16 +151,19 @@ fn set_scope(scope: &SidebarScope) {
     }
 }
 
+#[cfg(unix)]
 fn parse_session_id_set(raw: &str) -> std::collections::HashSet<String> {
     raw.split_whitespace().map(String::from).collect()
 }
 
+#[cfg(unix)]
 fn serialize_session_id_set(ids: &std::collections::HashSet<String>) -> String {
     let mut val: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
     val.sort_unstable();
     val.join(" ")
 }
 
+#[cfg(unix)]
 fn current_optout_sessions() -> std::collections::HashSet<String> {
     Cmd::new("tmux")
         .args(&["show-option", "-gqv", "@workmux_sidebar_optout_sessions"])
@@ -142,6 +173,7 @@ fn current_optout_sessions() -> std::collections::HashSet<String> {
         .unwrap_or_default()
 }
 
+#[cfg(unix)]
 fn set_optout_sessions(ids: &std::collections::HashSet<String>) {
     if ids.is_empty() {
         let _ = Cmd::new("tmux")
@@ -155,10 +187,12 @@ fn set_optout_sessions(ids: &std::collections::HashSet<String>) {
     }
 }
 
+#[cfg(unix)]
 fn session_opted_out(session_id: &str) -> bool {
     current_optout_sessions().contains(session_id)
 }
 
+#[cfg(unix)]
 /// Get the current tmux session's stable ID (e.g., "$0").
 /// Check whether a window passes the sidebar scope filter.
 ///
@@ -179,6 +213,7 @@ fn apply_scope_filter(scope: &SidebarScope, window_id: &str) -> bool {
     }
 }
 
+#[cfg(unix)]
 /// Get the current tmux session's stable ID (e.g., "$0").
 fn get_current_session_id() -> Result<String> {
     let s = Cmd::new("tmux")
@@ -192,6 +227,7 @@ fn get_current_session_id() -> Result<String> {
     Ok(s)
 }
 
+#[cfg(unix)]
 /// Get the session_id a window belongs to.
 fn get_window_session_id(window_id: &str) -> Option<String> {
     Cmd::new("tmux")
@@ -202,6 +238,7 @@ fn get_window_session_id(window_id: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+#[cfg(unix)]
 /// Unset all sidebar global tmux options.
 fn clear_sidebar_globals() {
     for opt in SIDEBAR_GLOBAL_OPTIONS {
@@ -209,6 +246,7 @@ fn clear_sidebar_globals() {
     }
 }
 
+#[cfg(unix)]
 fn configured_position(
     config: &crate::config::Config,
     position: Option<SidebarPosition>,
@@ -216,6 +254,7 @@ fn configured_position(
     position.or(config.sidebar.position).unwrap_or_default()
 }
 
+#[cfg(unix)]
 pub(super) fn read_sidebar_position(config: &crate::config::Config) -> SidebarPosition {
     if let Ok(output) = Cmd::new("tmux")
         .args(&["show-option", "-gqv", "@workmux_sidebar_position"])
@@ -231,6 +270,7 @@ pub(super) fn read_sidebar_position(config: &crate::config::Config) -> SidebarPo
     configured_position(config, None)
 }
 
+#[cfg(unix)]
 fn set_sidebar_position(position: SidebarPosition) {
     let value = match position {
         SidebarPosition::Left => "left",
@@ -241,6 +281,7 @@ fn set_sidebar_position(position: SidebarPosition) {
         .run();
 }
 
+#[cfg(unix)]
 fn default_width_for(tw: u16) -> u16 {
     if tw == 0 {
         return MIN_WIDTH;
@@ -248,10 +289,12 @@ fn default_width_for(tw: u16) -> u16 {
     (tw * 10 / 100).clamp(MIN_WIDTH, MAX_WIDTH)
 }
 
+#[cfg(unix)]
 pub(super) fn width_exceeds_defensive_max(width: u16) -> bool {
     width > MAX_SANE_WIDTH
 }
 
+#[cfg(unix)]
 /// Resolve sidebar width for a given terminal/window width.
 ///
 /// Priority: explicit config > synced (persisted resize) > default (10%).
@@ -275,6 +318,7 @@ fn resolve_width_for(config: &crate::config::Config, tw: u16, synced_width: Opti
     default_width_for(tw)
 }
 
+#[cfg(unix)]
 fn resolve_height_for(config: &crate::config::Config, th: u16, synced_height: Option<u16>) -> u16 {
     let max_h = th.saturating_sub(3).max(1);
     if let Some(ref h) = config.sidebar.height {
@@ -293,6 +337,7 @@ fn resolve_height_for(config: &crate::config::Config, th: u16, synced_height: Op
     default.clamp(1, max_h)
 }
 
+#[cfg(unix)]
 /// Read the synced sidebar width from tmux global option, falling back to settings.
 fn read_sidebar_width() -> Option<u16> {
     if let Ok(output) = Cmd::new("tmux")
@@ -313,6 +358,7 @@ fn read_sidebar_width() -> Option<u16> {
     None
 }
 
+#[cfg(unix)]
 fn read_sidebar_height() -> Option<u16> {
     if let Ok(output) = Cmd::new("tmux")
         .args(&["show-option", "-gqv", "@workmux_sidebar_height"])
@@ -332,6 +378,7 @@ fn read_sidebar_height() -> Option<u16> {
     None
 }
 
+#[cfg(unix)]
 /// Set the synced sidebar width in tmux global option and persist to settings.
 fn set_sidebar_width(width: u16) {
     let _ = Cmd::new("tmux")
@@ -351,6 +398,7 @@ fn set_sidebar_width(width: u16) {
     }
 }
 
+#[cfg(unix)]
 fn set_sidebar_height(height: u16) {
     let _ = Cmd::new("tmux")
         .args(&[
@@ -369,17 +417,20 @@ fn set_sidebar_height(height: u16) {
     }
 }
 
+#[cfg(unix)]
 /// Resolve effective sidebar width, checking synced width first.
 fn effective_width_for(config: &crate::config::Config, window_w: u16) -> u16 {
     let synced = read_sidebar_width();
     resolve_width_for(config, window_w, synced)
 }
 
+#[cfg(unix)]
 fn effective_height_for(config: &crate::config::Config, window_h: u16) -> u16 {
     let synced = read_sidebar_height();
     resolve_height_for(config, window_h, synced)
 }
 
+#[cfg(unix)]
 fn effective_size_for(
     config: &crate::config::Config,
     position: SidebarPosition,
@@ -391,6 +442,7 @@ fn effective_size_for(
     }
 }
 
+#[cfg(unix)]
 /// Reflow all sidebar windows except the given one.
 pub(super) fn reflow_all_sidebars_except(exclude_window_id: &str) {
     let config = crate::config::Config::load(None).unwrap_or_default();
@@ -422,6 +474,7 @@ pub(super) fn reflow_all_sidebars_except(exclude_window_id: &str) {
     }
 }
 
+#[cfg(unix)]
 /// Reflow sidebar layouts in all windows. Called by the window-resized hook
 /// so inactive windows get their sidebar widths corrected without waiting for
 /// the user to visit them.
@@ -429,6 +482,7 @@ pub fn reflow_all(exclude_window: Option<&str>) -> Result<()> {
     reflow_all_to_window_extent(None, exclude_window)
 }
 
+#[cfg(unix)]
 pub(super) fn reflow_all_to_window_extent(
     window_extent: Option<u16>,
     exclude_window: Option<&str>,
@@ -486,6 +540,7 @@ pub(super) fn reflow_all_to_window_extent(
     Ok(())
 }
 
+#[cfg(unix)]
 fn apply_cli_dimensions(
     config: &mut crate::config::Config,
     width: Option<SidebarWidth>,
@@ -499,6 +554,7 @@ fn apply_cli_dimensions(
     }
 }
 
+#[cfg(unix)]
 fn require_tmux() -> Result<()> {
     if std::env::var("TMUX").is_err() {
         return Err(anyhow!("Sidebar requires tmux"));
@@ -506,6 +562,7 @@ fn require_tmux() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn stop_all() {
     kill_all_sidebars_and_restore_layouts();
     kill_daemon();
@@ -513,6 +570,7 @@ fn stop_all() {
     clear_sidebar_globals();
 }
 
+#[cfg(unix)]
 /// Ensure the sidebar is running globally across all tmux windows.
 pub fn on(
     position: Option<SidebarPosition>,
@@ -548,6 +606,7 @@ pub fn on(
     Ok(())
 }
 
+#[cfg(unix)]
 /// Ensure the global sidebar is stopped.
 pub fn off() -> Result<()> {
     require_tmux()?;
@@ -555,6 +614,7 @@ pub fn off() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 /// Toggle the sidebar globally across all tmux windows.
 pub fn toggle(
     position: Option<SidebarPosition>,
@@ -579,6 +639,7 @@ pub fn toggle(
     }
 }
 
+#[cfg(unix)]
 /// Ensure the sidebar is running for the current tmux session.
 pub fn on_session(
     position: Option<SidebarPosition>,
@@ -631,6 +692,7 @@ pub fn on_session(
     Ok(())
 }
 
+#[cfg(unix)]
 /// Ensure the sidebar is stopped for the current tmux session.
 pub fn off_session() -> Result<()> {
     require_tmux()?;
@@ -657,6 +719,7 @@ pub fn off_session() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 /// Toggle the sidebar for the current tmux session only.
 pub fn toggle_session(
     position: Option<SidebarPosition>,
@@ -691,6 +754,7 @@ pub fn toggle_session(
     }
 }
 
+#[cfg(unix)]
 fn get_sidebar_position_and_size(target: &str) -> Result<(SidebarPosition, u16)> {
     let config = crate::config::Config::load(None).unwrap_or_default();
     let position = read_sidebar_position(&config);
@@ -708,6 +772,7 @@ fn get_sidebar_position_and_size(target: &str) -> Result<(SidebarPosition, u16)>
     Ok((position, size))
 }
 
+#[cfg(unix)]
 /// Resolve window ID from an optional argument, falling back to current window.
 fn resolve_target_window(window_id: Option<&str>) -> Result<String> {
     match window_id {
@@ -720,6 +785,7 @@ fn resolve_target_window(window_id: Option<&str>) -> Result<String> {
     }
 }
 
+#[cfg(unix)]
 /// Sync sidebar into a window (called by tmux hooks for new windows/sessions).
 pub fn sync(window_id: Option<&str>) -> Result<()> {
     let scope = current_scope();
@@ -751,6 +817,7 @@ pub fn sync(window_id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 /// Reflow sidebar layout after a window resize (called by tmux hook).
 ///
 /// Finds the sidebar pane in the target window and runs the layout tree
@@ -797,21 +864,25 @@ pub fn reflow(window_id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 /// Request a sidebar refresh if the daemon is running.
 pub(crate) fn request_refresh_for(mux: &dyn crate::multiplexer::Multiplexer) {
     signal_daemon_for(mux);
 }
 
+#[cfg(unix)]
 /// Run the sidebar daemon (called by the hidden `_sidebar-daemon` command).
 pub fn run_daemon() -> Result<()> {
     daemon::run()
 }
 
+#[cfg(unix)]
 /// Run the sidebar TUI (called by the hidden `_sidebar-run` command).
 pub fn run_sidebar() -> Result<()> {
     runtime::run_sidebar()
 }
 
+#[cfg(unix)]
 /// Navigation action for sidebar hotkeys.
 pub enum NavAction {
     Next,
@@ -819,6 +890,7 @@ pub enum NavAction {
     Jump(usize),
 }
 
+#[cfg(unix)]
 /// Compute the target index for a navigation action given the current index and list length.
 fn compute_nav_target(action: &NavAction, current_idx: Option<usize>, len: usize) -> Option<usize> {
     if len == 0 {
@@ -843,6 +915,7 @@ fn compute_nav_target(action: &NavAction, current_idx: Option<usize>, len: usize
     })
 }
 
+#[cfg(unix)]
 fn pane_window_ids() -> std::collections::HashMap<String, String> {
     Cmd::new("tmux")
         .args(&["list-panes", "-a", "-F", "#{pane_id}\t#{window_id}"])
@@ -860,6 +933,7 @@ fn pane_window_ids() -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
+#[cfg(unix)]
 fn pane_session_ids() -> std::collections::HashMap<String, String> {
     Cmd::new("tmux")
         .args(&["list-panes", "-a", "-F", "#{pane_id}\t#{session_name}"])
@@ -877,6 +951,7 @@ fn pane_session_ids() -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
+#[cfg(unix)]
 fn parse_sidebar_filter_mode(raw: &str) -> Result<app::SidebarFilterMode> {
     match raw.trim().to_lowercase().as_str() {
         "none" | "all" => Ok(app::SidebarFilterMode::None),
@@ -885,6 +960,7 @@ fn parse_sidebar_filter_mode(raw: &str) -> Result<app::SidebarFilterMode> {
     }
 }
 
+#[cfg(unix)]
 fn read_sidebar_filter_mode() -> app::SidebarFilterMode {
     if let Ok(output) = Cmd::new("tmux")
         .args(&["show-option", "-gqv", "@workmux_sidebar_filter"])
@@ -906,6 +982,7 @@ fn read_sidebar_filter_mode() -> app::SidebarFilterMode {
     app::SidebarFilterMode::default()
 }
 
+#[cfg(unix)]
 fn current_listed_window_pane<'a>(
     panes: &'a [&str],
     current_pane_id: &'a str,
@@ -923,6 +1000,7 @@ fn current_listed_window_pane<'a>(
     })
 }
 
+#[cfg(unix)]
 fn navigation_anchor_pane<'a>(
     panes: &'a [&str],
     current_pane_id: &'a str,
@@ -933,6 +1011,7 @@ fn navigation_anchor_pane<'a>(
         .or(Some(current_pane_id).filter(|pane_id| panes.contains(pane_id)))
 }
 
+#[cfg(unix)]
 /// Navigate to an agent by reading the daemon's ordered agent list from tmux.
 /// Respects the sidebar filter mode: when set to "session", only navigates
 /// among agents in the current tmux session.
@@ -1012,6 +1091,7 @@ pub fn navigate(action: NavAction) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 /// Set sidebar filter mode from CLI. Toggles if no mode is given.
 pub fn set_filter_mode(mode: Option<&str>) -> Result<()> {
     let new_mode = match mode {
@@ -1039,7 +1119,9 @@ pub fn set_filter_mode(mode: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+// The sidebar tests exercise tmux user options and hooks, which have no Windows
+// equivalent, so they only run where the sidebar itself does.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -1295,3 +1377,110 @@ mod tests {
         );
     }
 }
+
+
+// ============================================================================
+// Windows stubs
+// ============================================================================
+//
+// The sidebar is built on tmux: it renders into tmux panes, reflows through
+// tmux hooks, and keeps its state in tmux global options. Windows has no tmux,
+// and WezTerm exposes no equivalent pane/hook API, so the sidebar cannot run
+// there. These stubs keep the CLI surface identical and fail loudly with an
+// actionable message rather than appearing to work.
+
+#[cfg(windows)]
+const UNSUPPORTED: &str = "the sidebar requires tmux, which is unavailable on Windows";
+
+/// Navigation action for sidebar hotkeys.
+#[cfg(windows)]
+pub enum NavAction {
+    Next,
+    Prev,
+    Jump(usize),
+}
+
+#[cfg(windows)]
+pub fn on(
+    _position: Option<crate::config::SidebarPosition>,
+    _width: Option<crate::config::SidebarWidth>,
+    _height: Option<crate::config::SidebarHeight>,
+) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(UNSUPPORTED))
+}
+
+#[cfg(windows)]
+pub fn off() -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(UNSUPPORTED))
+}
+
+#[cfg(windows)]
+pub fn toggle(
+    _position: Option<crate::config::SidebarPosition>,
+    _width: Option<crate::config::SidebarWidth>,
+    _height: Option<crate::config::SidebarHeight>,
+) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(UNSUPPORTED))
+}
+
+#[cfg(windows)]
+pub fn on_session(
+    _position: Option<crate::config::SidebarPosition>,
+    _width: Option<crate::config::SidebarWidth>,
+    _height: Option<crate::config::SidebarHeight>,
+) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(UNSUPPORTED))
+}
+
+#[cfg(windows)]
+pub fn off_session() -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(UNSUPPORTED))
+}
+
+#[cfg(windows)]
+pub fn toggle_session(
+    _position: Option<crate::config::SidebarPosition>,
+    _width: Option<crate::config::SidebarWidth>,
+    _height: Option<crate::config::SidebarHeight>,
+) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(UNSUPPORTED))
+}
+
+#[cfg(windows)]
+pub fn navigate(_action: NavAction) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(UNSUPPORTED))
+}
+
+#[cfg(windows)]
+pub fn set_filter_mode(_mode: Option<&str>) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(UNSUPPORTED))
+}
+
+#[cfg(windows)]
+pub fn run_sidebar() -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(UNSUPPORTED))
+}
+
+#[cfg(windows)]
+pub fn run_daemon() -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(UNSUPPORTED))
+}
+
+#[cfg(windows)]
+pub fn sync(_window_id: Option<&str>) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(UNSUPPORTED))
+}
+
+#[cfg(windows)]
+pub fn reflow(_window_id: Option<&str>) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(UNSUPPORTED))
+}
+
+#[cfg(windows)]
+pub fn reflow_all(_exclude_window: Option<&str>) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(UNSUPPORTED))
+}
+
+/// No sidebar means nothing to refresh; status changes stay cheap on Windows.
+#[cfg(windows)]
+pub(crate) fn request_refresh_for(_mux: &dyn crate::multiplexer::Multiplexer) {}

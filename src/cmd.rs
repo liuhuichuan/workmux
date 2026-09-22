@@ -1,8 +1,25 @@
 use anyhow::{Context, Result, anyhow};
-use std::os::fd::AsFd;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use tracing::{debug, trace};
+
+/// Duplicate the current process's stderr so it can be given to a child as stdout.
+///
+/// Unix duplicates the file descriptor; Windows duplicates the console handle.
+#[cfg(unix)]
+fn dup_stderr() -> std::io::Result<Stdio> {
+    use std::os::fd::AsFd;
+    std::io::stderr().as_fd().try_clone_to_owned().map(Stdio::from)
+}
+
+#[cfg(windows)]
+fn dup_stderr() -> std::io::Result<Stdio> {
+    use std::os::windows::io::AsHandle;
+    std::io::stderr()
+        .as_handle()
+        .try_clone_to_owned()
+        .map(Stdio::from)
+}
 
 /// A builder for executing shell commands with unified error handling
 pub struct Cmd<'a> {
@@ -179,12 +196,8 @@ pub fn shell_command_with_env_mode(
             cmd.stdout(Stdio::null()).stderr(Stdio::null());
         }
         ShellOutput::RedirectToStderr => {
-            let stderr = std::io::stderr();
-            let stdout = stderr
-                .as_fd()
-                .try_clone_to_owned()
-                .context("Failed to redirect hook output to stderr")?;
-            cmd.stdout(Stdio::from(stdout)).stderr(Stdio::inherit());
+            let stdout = dup_stderr().context("Failed to redirect hook output to stderr")?;
+            cmd.stdout(stdout).stderr(Stdio::inherit());
         }
     }
 

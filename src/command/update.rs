@@ -153,7 +153,6 @@ fn verify_checksum(file: &std::path::Path, expected_line: &str) -> Result<()> {
 
 /// Replace the current binary with the new one, with rollback on failure.
 fn replace_binary(new_binary: &std::path::Path, current_exe: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
 
     let exe_dir = current_exe
         .parent()
@@ -162,7 +161,13 @@ fn replace_binary(new_binary: &std::path::Path, current_exe: &std::path::Path) -
     // Copy to destination directory to avoid EXDEV (cross-device rename)
     let staged = exe_dir.join(".workmux.new");
     std::fs::copy(new_binary, &staged).context("Failed to copy new binary to install directory")?;
-    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+    // Windows has no executable bit; the file mode only matters on unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+    }
+
 
     // Rename current -> .old, then staged -> current
     let backup = exe_dir.join(".workmux.old");

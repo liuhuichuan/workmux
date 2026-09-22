@@ -1,11 +1,11 @@
 //! Filesystem-based state persistence for agent state.
 
 use anyhow::{Context, Result, anyhow};
-use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,7 +14,7 @@ use tracing::{info, trace, warn};
 use super::types::{AgentState, GlobalSettings, PaneKey};
 use crate::agent_identity::AgentKind;
 use crate::config::SandboxRuntime;
-use crate::util::{write_atomic, write_atomic_durable};
+use crate::util::{FileLock, write_atomic, write_atomic_durable};
 
 /// Manages filesystem-based state persistence for workmux agents.
 ///
@@ -31,7 +31,7 @@ pub struct StateStore {
 }
 
 struct AgentStateLock {
-    _lock: Flock<File>,
+    _lock: FileLock,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,20 +187,14 @@ fn unambiguous_pane_key_from_filename(filename: &str) -> Option<PaneKey> {
 impl AgentStateLock {
     fn acquire(base_path: &Path) -> Result<Self> {
         let path = base_path.join("agent-state.lock");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("Failed to open agent state lock: {}", path.display()))?;
-        let lock = Flock::lock(file, FlockArg::LockExclusive)
-            .map_err(|(_file, errno)| errno)
+        let lock = FileLock::acquire(&path)
             .with_context(|| format!("Failed to acquire agent state lock: {}", path.display()))?;
         Ok(Self { _lock: lock })
     }
 }
 
+/// Snapshot of the on-disk state used to detect concurrent modification.
+#[cfg(unix)]
 fn file_revision(metadata: &fs::Metadata) -> FileRevision {
     FileRevision {
         dev: metadata.dev(),
@@ -210,6 +204,24 @@ fn file_revision(metadata: &fs::Metadata) -> FileRevision {
         mtime_nsec: metadata.mtime_nsec(),
         ctime_sec: metadata.ctime(),
         ctime_nsec: metadata.ctime_nsec(),
+    }
+}
+
+/// Snapshot of the on-disk state used to detect concurrent modification.
+///
+/// Windows exposes no stable device/inode pair through std, so identity falls
+/// back to the creation timestamp while `mtime`/`len` still catch in-place edits.
+#[cfg(windows)]
+fn file_revision(metadata: &fs::Metadata) -> FileRevision {
+    use std::os::windows::fs::MetadataExt;
+    FileRevision {
+        dev: metadata.file_attributes() as u64,
+        ino: metadata.creation_time(),
+        len: metadata.len(),
+        mtime_sec: metadata.last_write_time() as i64,
+        mtime_nsec: 0,
+        ctime_sec: metadata.creation_time() as i64,
+        ctime_nsec: 0,
     }
 }
 

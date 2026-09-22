@@ -1,15 +1,28 @@
-//! Descriptor-relative recursive deletion that continues after individual failures.
+//! Recursive deletion that continues after individual failures.
+//!
+//! Unix removes through held directory descriptors, so a path swapped mid-delete
+//! is never followed. Windows has no descriptor-relative delete, so it removes by
+//! path and never descends into reparse points.
 
-use std::ffi::{CStr, OsStr};
-use std::fs::File;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+#[cfg(unix)]
+use std::ffi::{CStr, OsStr};
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+
+#[cfg(unix)]
 use nix::dir::Dir;
+#[cfg(unix)]
 use nix::errno::Errno;
+#[cfg(unix)]
 use nix::fcntl::{AtFlags, OFlag, open, openat};
+#[cfg(unix)]
 use nix::sys::stat::{Mode, fstat, fstatat};
+#[cfg(unix)]
 use nix::unistd::{UnlinkatFlags, unlinkat};
 
 use super::cleanup::{DirectoryIdentity, metadata_matches};
@@ -17,12 +30,14 @@ use super::cleanup::{DirectoryIdentity, metadata_matches};
 const MAX_DEPTH: usize = 64;
 const MAX_ERROR_BYTES: usize = 16 * 1024;
 
+#[cfg(unix)]
 fn directory_flags() -> OFlag {
     OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC
 }
 
 /// Open and validate the quarantine root before touching its contents. All child
 /// traversal and deletion is relative to held descriptors, never joined paths.
+#[cfg(unix)]
 pub(super) fn remove(path: &Path, expected: DirectoryIdentity) -> io::Result<()> {
     let parent_path = path
         .parent()
@@ -51,6 +66,7 @@ pub(super) fn remove(path: &Path, expected: DirectoryIdentity) -> io::Result<()>
     failures.finish()
 }
 
+#[cfg(unix)]
 fn clear_directory(directory: &File, path: &Path, depth: usize, failures: &mut Failures) {
     if depth >= MAX_DEPTH {
         failures.record(
@@ -86,6 +102,7 @@ fn clear_directory(directory: &File, path: &Path, depth: usize, failures: &mut F
     }
 }
 
+#[cfg(unix)]
 fn remove_entry(parent: &File, name: &CStr, path: &Path, depth: usize, failures: &mut Failures) {
     match openat(parent, name, directory_flags(), Mode::empty()) {
         Ok(fd) => {
@@ -107,6 +124,7 @@ fn remove_entry(parent: &File, name: &CStr, path: &Path, depth: usize, failures:
     }
 }
 
+#[cfg(unix)]
 fn unlink_directory(parent: &File, name: &OsStr, directory: &File) -> io::Result<()> {
     let opened = fstat(directory)?;
     let current = fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
@@ -118,6 +136,146 @@ fn unlink_directory(parent: &File, name: &OsStr, directory: &File) -> io::Result
     #[cfg(test)]
     before_rmdir::fire(name);
     unlinkat(parent, name, UnlinkatFlags::RemoveDir).map_err(Into::into)
+}
+
+/// Remove the quarantine root and everything below it without following reparse
+/// points, so a linked directory outside the quarantine is never deleted.
+#[cfg(windows)]
+pub(super) fn remove(path: &Path, expected: DirectoryIdentity) -> io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other(
+            "Quarantined worktree is not a directory",
+        ));
+    }
+    if !metadata_matches(path, &metadata, expected) {
+        return Err(io::Error::other(
+            "Quarantined worktree identity changed before deletion",
+        ));
+    }
+    let mut failures = Failures::default();
+    clear_directory(path, 0, &mut failures);
+    failures.record(path, remove_directory(path));
+    failures.finish()
+}
+
+/// True for symlinks, junctions, and every other reparse point. `file_type()`
+/// alone misses junctions, whose targets must never be traversed.
+#[cfg(windows)]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// `Metadata::is_dir` reports false for a junction, so ask the attributes.
+#[cfg(windows)]
+fn is_directory(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0
+}
+
+/// Read-only entries -- common in Git object stores and copied trees -- cannot be
+/// unlinked until their attribute is cleared.
+#[cfg(windows)]
+fn clear_readonly(path: &Path) {
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+    use std::os::windows::fs::MetadataExt;
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_attributes() & FILE_ATTRIBUTE_READONLY == 0 {
+        return;
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(false);
+    let _ = std::fs::set_permissions(path, permissions);
+}
+
+#[cfg(windows)]
+fn clear_directory(directory: &Path, depth: usize, failures: &mut Failures) {
+    if depth >= MAX_DEPTH {
+        failures.record(
+            directory,
+            Err(io::Error::other("Directory nesting exceeds cleanup limit")),
+        );
+        return;
+    }
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            failures.record(directory, Err(error));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.record(directory, Err(error));
+                break;
+            }
+        };
+        remove_entry(&entry.path(), depth + 1, failures);
+    }
+}
+
+#[cfg(windows)]
+fn remove_entry(path: &Path, depth: usize, failures: &mut Failures) {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            failures.record(path, Err(error));
+            return;
+        }
+    };
+    // A reparse point is removed as the link it is; descending would delete the
+    // contents of whatever it points at.
+    if is_reparse_point(&metadata) {
+        let result = if is_directory(&metadata) {
+            remove_directory(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        failures.record(path, result);
+        return;
+    }
+    if metadata.is_dir() {
+        clear_directory(path, depth, failures);
+        #[cfg(test)]
+        before_rmdir::fire(&name_of(path));
+        failures.record(path, remove_directory(path));
+    } else {
+        clear_readonly(path);
+        failures.record(path, std::fs::remove_file(path));
+    }
+}
+
+#[cfg(windows)]
+fn remove_directory(path: &Path) -> io::Result<()> {
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Windows refuses to unlink a read-only directory or a reparse point
+            // whose target is gone, so clear the attribute and retry once.
+            clear_readonly(path);
+            match std::fs::remove_dir(path) {
+                Ok(()) => Ok(()),
+                Err(_) => Err(error),
+            }
+        }
+    }
+}
+
+#[cfg(all(windows, test))]
+fn name_of(path: &Path) -> std::ffi::OsString {
+    path.file_name().unwrap_or_default().to_os_string()
 }
 
 /// Keep diagnostics bounded while remembering whether any non-transient error
@@ -205,15 +363,8 @@ pub(super) mod before_rmdir {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
-
-    fn identity(path: &Path) -> DirectoryIdentity {
-        let metadata = std::fs::metadata(path).unwrap();
-        DirectoryIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
-    }
+    use super::super::cleanup::test_identity as identity;
+    use super::super::cleanup::test_symlink_dir;
 
     #[test]
     fn removes_nested_files_without_following_symlinks() {
@@ -223,7 +374,13 @@ mod tests {
         std::fs::create_dir_all(tree.join("a/b")).unwrap();
         std::fs::write(tree.join("a/b/file"), "remove").unwrap();
         std::fs::write(outside.path().join("sentinel"), "keep").unwrap();
-        std::os::unix::fs::symlink(outside.path(), tree.join("link")).unwrap();
+        if !test_symlink_dir(outside.path(), &tree.join("link")) {
+            eprintln!("skipping: this host cannot create directory links");
+            return;
+        }
+        // A dangling link is a Unix-only fixture: Windows needs a privilege to
+        // create one and the traversal guard is identical for both kinds.
+        #[cfg(unix)]
         std::os::unix::fs::symlink("missing", tree.join("broken-link")).unwrap();
         remove(&tree, identity(&tree)).unwrap();
         assert!(!tree.exists());
@@ -266,7 +423,10 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("sentinel"), "keep").unwrap();
         let link = root.path().join("link");
-        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        if !test_symlink_dir(outside.path(), &link) {
+            eprintln!("skipping: this host cannot create directory links");
+            return;
+        }
         assert!(remove(&link, identity(outside.path())).is_err());
         assert!(link.is_symlink());
         assert!(outside.path().join("sentinel").exists());

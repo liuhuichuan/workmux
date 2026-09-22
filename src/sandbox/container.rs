@@ -736,8 +736,12 @@ fn build_docker_run_args_inner(
     let worktree_root_str = worktree_root.to_string_lossy();
     let pane_cwd_str = pane_cwd.to_string_lossy();
 
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+    // Docker Desktop on Windows hands bind mounts to the VM's file sharing layer,
+    // so the host user has no numeric uid/gid to map into the container.
+    #[cfg(unix)]
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    #[cfg(windows)]
+    let (uid, gid) = (0u32, 0u32);
 
     let runtime = config.runtime();
 

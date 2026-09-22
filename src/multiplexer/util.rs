@@ -12,7 +12,10 @@ use super::agent::SelectedAgent;
 use crate::config::Config;
 
 use super::PaneHandshake;
+#[cfg(unix)]
 use super::handshake::UnixPipeHandshake;
+#[cfg(windows)]
+use super::handshake::MarkerFileHandshake;
 use super::types::LivePaneInfo;
 
 /// Helper function to add prefix to window name.
@@ -109,9 +112,22 @@ pub fn default_shell(fallback: &str) -> Result<String> {
     std::env::var("SHELL").or_else(|_| Ok(fallback.to_string()))
 }
 
-/// Create a Unix pipe handshake for shell startup synchronization.
+/// Create a named-pipe (FIFO) handshake for shell startup synchronization.
+///
+/// Unix only: the shell writes to a FIFO when it is ready. Windows has no FIFO,
+/// so `windows_marker_handshake` is used there instead.
+#[cfg(unix)]
 pub fn unix_pipe_handshake() -> Result<Box<dyn PaneHandshake>> {
     Ok(Box::new(UnixPipeHandshake::new()?))
+}
+
+/// Create a marker-file handshake for shell startup synchronization.
+///
+/// Windows only: neither FIFOs nor tmux `wait-for` are available, so the pane
+/// shell writes a file that the parent polls.
+#[cfg(windows)]
+pub fn windows_marker_handshake() -> Result<Box<dyn PaneHandshake>> {
+    Ok(Box::new(MarkerFileHandshake::new()?))
 }
 
 /// Run a shell script detached via `nohup sh -c`.

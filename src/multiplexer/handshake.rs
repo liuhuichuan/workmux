@@ -297,3 +297,84 @@ impl Drop for UnixPipeHandshake {
         let _ = std::fs::remove_file(&self.pipe_path);
     }
 }
+
+/// Marker-file handshake for Windows, where neither FIFOs nor `tmux wait-for`
+/// exist.
+///
+/// The pane shell writes a marker file before handing over to the interactive
+/// shell, and `wait` polls for that file. Signalling through the filesystem
+/// keeps `wait` independent of the backend that owns the pane.
+#[cfg(windows)]
+pub struct MarkerFileHandshake {
+    marker_path: PathBuf,
+}
+
+#[cfg(windows)]
+impl MarkerFileHandshake {
+    /// Create a new handshake with a unique, not-yet-existing marker path.
+    pub fn new() -> Result<Self> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let pid = std::process::id();
+
+        let marker_path = std::env::temp_dir().join(format!("workmux_ready_{}_{}.marker", pid, nanos));
+        // A leftover marker would report readiness before the pane ever starts.
+        let _ = std::fs::remove_file(&marker_path);
+
+        Ok(Self { marker_path })
+    }
+}
+
+#[cfg(windows)]
+impl PaneHandshake for MarkerFileHandshake {
+    fn wrapper_command(&self, shell: &str) -> String {
+        format!("cmd /c \"{}\"", self.script_content(shell))
+    }
+
+    /// `cmd.exe` dialect: write the marker, then hand the pane to the shell.
+    ///
+    /// The redirect must follow `echo` with no space so the marker file contains
+    /// no leading blank, and the shell is quoted so paths with spaces still run.
+    fn script_content(&self, shell: &str) -> String {
+        format!(
+            "echo ready> \"{}\" & \"{}\"",
+            self.marker_path.display(),
+            shell
+        )
+    }
+
+    fn wait(self: Box<Self>) -> Result<()> {
+        debug!(marker = %self.marker_path.display(), "windows:handshake start");
+
+        let start = Instant::now();
+        let timeout = Duration::from_secs(HANDSHAKE_TIMEOUT_SECS);
+
+        loop {
+            if self.marker_path.exists() {
+                debug!(marker = %self.marker_path.display(), "windows:handshake success");
+                return Ok(());
+            }
+            if start.elapsed() >= timeout {
+                warn!(
+                    marker = %self.marker_path.display(),
+                    timeout_secs = HANDSHAKE_TIMEOUT_SECS,
+                    "windows:handshake timeout"
+                );
+                return Err(anyhow!(
+                    "Pane handshake timed out after {}s - shell may have failed to start",
+                    HANDSHAKE_TIMEOUT_SECS
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for MarkerFileHandshake {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.marker_path);
+    }
+}

@@ -272,7 +272,17 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 
         if file_type.is_symlink() {
             let target = fs::read_link(&src_path)?;
+            #[cfg(unix)]
             std::os::unix::fs::symlink(&target, &dst_path)?;
+            #[cfg(windows)]
+            {
+                // Windows has no "unknown" symlink kind, so mirror the target type.
+                if src_path.is_dir() {
+                    std::os::windows::fs::symlink_dir(&target, &dst_path)?
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &dst_path)?
+                }
+            }
         } else if file_type.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else if file_type.is_file() {
