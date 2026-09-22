@@ -39,6 +39,20 @@ pub const fn default_interactive_shell() -> &'static str {
     }
 }
 
+/// Suffix that discards a command's output in the interpreter that runs
+/// deferred scripts, which is `sh` on Unix and PowerShell on Windows (see
+/// `multiplexer::util::deferred_script_command`).
+///
+/// The null device is part of the dialect: PowerShell parsed `>/dev/null` as a
+/// file named `null` under a `\dev` directory and failed the statement.
+pub const fn silent_output_suffix() -> &'static str {
+    if cfg!(windows) {
+        "> $null 2>&1"
+    } else {
+        ">/dev/null 2>&1"
+    }
+}
+
 /// Default `hook_shell` config: the interpreter lifecycle hooks run through.
 pub fn default_hook_argv() -> Vec<String> {
     if cfg!(windows) {
@@ -164,6 +178,26 @@ mod tests {
         assert_eq!(dialect_of("powershell"), ShellDialect::PowerShell);
         // Unknown shells keep the POSIX default so existing configs behave.
         assert_eq!(dialect_of("nu"), ShellDialect::Posix);
+    }
+
+    /// The null-device suffix is only valid for the interpreter that reads the
+    /// deferred script, so keep the two in sync.
+    #[test]
+    fn silent_output_suffix_matches_the_deferred_interpreter() {
+        let program = crate::multiplexer::util::deferred_script_command("echo hi")
+            .get_program()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        if cfg!(windows) {
+            assert!(
+                program.starts_with("powershell"),
+                "unexpected deferred interpreter: {program}"
+            );
+            assert_eq!(silent_output_suffix(), "> $null 2>&1");
+        } else {
+            assert_eq!(program, "nohup");
+            assert_eq!(silent_output_suffix(), ">/dev/null 2>&1");
+        }
     }
 
     #[test]

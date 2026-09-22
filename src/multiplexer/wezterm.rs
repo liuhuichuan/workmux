@@ -381,7 +381,7 @@ impl Multiplexer for WezTermBackend {
         let kill_cmds: String = tab_panes
             .iter()
             .rev()
-            .map(|p| format!("wezterm cli kill-pane --pane-id {}", p.pane_id))
+            .map(|p| deferred_wezterm_cmd(&["kill-pane", "--pane-id", &p.pane_id.to_string()]))
             .collect::<Vec<_>>()
             .join("; ");
 
@@ -417,10 +417,11 @@ impl Multiplexer for WezTermBackend {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("Window '{}' not found", full_name))?;
-        Ok(format!(
-            "wezterm cli activate-tab --tab-id {} >/dev/null 2>&1",
-            target.tab_id
-        ))
+        Ok(deferred_wezterm_cmd(&[
+            "activate-tab",
+            "--tab-id",
+            &target.tab_id.to_string(),
+        ]))
     }
 
     fn shell_kill_window_cmd(&self, full_name: &str) -> Result<String> {
@@ -434,12 +435,7 @@ impl Multiplexer for WezTermBackend {
         let kill_cmds: String = tab_panes
             .iter()
             .rev()
-            .map(|p| {
-                format!(
-                    "wezterm cli kill-pane --pane-id {} >/dev/null 2>&1",
-                    p.pane_id
-                )
-            })
+            .map(|p| deferred_wezterm_cmd(&["kill-pane", "--pane-id", &p.pane_id.to_string()]))
             .collect::<Vec<_>>()
             .join("; ");
         Ok(kill_cmds)
@@ -761,6 +757,19 @@ impl Multiplexer for WezTermBackend {
     }
 }
 
+/// A `wezterm cli` invocation for a deferred script.
+///
+/// The script is handed to the platform interpreter (`sh` on Unix, PowerShell
+/// on Windows), so the output redirection has to use that interpreter's null
+/// device.
+fn deferred_wezterm_cmd(args: &[&str]) -> String {
+    format!(
+        "wezterm cli {} {}",
+        args.join(" "),
+        crate::shell::silent_output_suffix()
+    )
+}
+
 /// Send escape sequence to trigger cross-workspace pane switch via WezTerm's user-var-changed event.
 ///
 /// This requires the user to have a Lua handler in their wezterm.lua.
@@ -826,5 +835,18 @@ mod tests {
         };
 
         assert_eq!(pane.cwd_path(), PathBuf::from("/home/user/project"));
+    }
+
+    /// Deferred scripts run under the platform shell, so pane commands built
+    /// for them must redirect through that shell's null device.
+    #[test]
+    fn deferred_wezterm_cmd_uses_the_deferred_shells_null_device() {
+        assert_eq!(
+            deferred_wezterm_cmd(&["activate-tab", "--tab-id", "7"]),
+            format!(
+                "wezterm cli activate-tab --tab-id 7 {}",
+                crate::shell::silent_output_suffix()
+            )
+        );
     }
 }

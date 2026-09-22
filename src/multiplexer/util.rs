@@ -142,23 +142,25 @@ pub fn windows_marker_handshake() -> Result<Box<dyn PaneHandshake>> {
 ///
 /// The script text must match the platform shell: POSIX `sh` on Unix,
 /// PowerShell on Windows, where there is no `nohup`.
-pub fn run_detached_script(script: &str) -> Result<()> {
+pub fn deferred_script_command(script: &str) -> Command {
     #[cfg(unix)]
-    let mut command = {
+    {
         let mut command = Command::new("nohup");
         command.arg("sh").arg("-c").arg(script);
         command
-    };
+    }
     #[cfg(windows)]
-    let mut command = {
+    {
         let mut command = Command::new("powershell.exe");
         command
             .args(["-NoProfile", "-NonInteractive", "-Command"])
             .arg(script);
         command
-    };
+    }
+}
 
-    command
+pub fn run_detached_script(script: &str) -> Result<()> {
+    deferred_script_command(script)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
