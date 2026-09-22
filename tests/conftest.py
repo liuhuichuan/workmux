@@ -1575,6 +1575,17 @@ def pane_env_lines(env_vars: Dict[str, str]) -> str:
     )
 
 
+def pane_home_env(env: MuxEnvironment) -> Dict[str, str]:
+    """Variables that point a pane's workmux run at this test's own home.
+
+    On POSIX `$HOME` is what keeps a run's state and config inside the test.
+    Windows ignores it and reads the account's profile directory instead, so
+    the XDG variables are the only thing isolating a pane's run there.
+    """
+    keys = ("HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME")
+    return {key: env.env[key] for key in keys if env.env.get(key)}
+
+
 def pane_cd(path: Path) -> str:
     """A line that makes the pane's shell work relative to `path`."""
     if IS_WINDOWS:
@@ -1714,10 +1725,10 @@ def run_workmux_command(
     env_vars = {
         "PATH": env.env["PATH"],
         "TMPDIR": env.env.get("TMPDIR") or tempfile.gettempdir(),
-        "HOME": env.env.get("HOME", ""),
         "SHELL": env.env.get("SHELL", os.environ.get("SHELL", "/bin/sh")),
         "WORKMUX_TEST": "1",
     }
+    env_vars.update(pane_home_env(env))
     env_vars.update(pre_run_env or {})
 
     # Write the command to a script file to avoid tmux send-keys line length limits.

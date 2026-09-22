@@ -11,6 +11,7 @@ from ..conftest import (
     get_window_name,
     get_worktree_path,
     make_env_script,
+    pane_home_env,
     poll_until,
     run_workmux_add,
     wait_for_window_ready,
@@ -51,7 +52,7 @@ def build_status_cmd(
     env_vars: dict[str, str] | None = None,
 ) -> str:
     command = f"{workmux_exe} set-window-status {status}"
-    script_env = {"XDG_STATE_HOME": env.env["XDG_STATE_HOME"]}
+    script_env = pane_home_env(env)
     if env_vars:
         script_env.update(env_vars)
     return make_env_script(env, command, script_env)
@@ -65,7 +66,7 @@ def build_status_cmd_with_marker(
     env_vars: dict[str, str] | None = None,
 ) -> str:
     command = f"{workmux_exe} set-window-status {status}; touch {shlex.quote(str(marker_path))}"
-    script_env = {"XDG_STATE_HOME": env.env["XDG_STATE_HOME"]}
+    script_env = pane_home_env(env)
     if env_vars:
         script_env.update(env_vars)
     return make_env_script(env, command, script_env)
