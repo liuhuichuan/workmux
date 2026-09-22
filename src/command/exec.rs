@@ -5,13 +5,10 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
 
 use anyhow::{Context, Result};
 
@@ -74,7 +71,12 @@ fn try_run(run_dir: &Path) -> Result<()> {
     let child_pid = child.id();
     let running = Arc::new(AtomicBool::new(true));
 
-    // Setup signal handler to forward SIGINT to child
+    // Keep this process alive through an interrupt so the child's exit status
+    // still reaches the `workmux run` that waits on the result file.
+    //
+    // Unix has to forward SIGINT itself. Windows delivers Ctrl+C to every
+    // process attached to the console, so the child is interrupted without
+    // help and absorbing the event here is all that is needed.
     #[cfg(unix)]
     {
         let r = running.clone();
@@ -86,6 +88,9 @@ fn try_run(run_dir: &Path) -> Result<()> {
             }
         });
     }
+
+    #[cfg(windows)]
+    let _ = ctrlc::set_handler(|| {});
 
     // Take ownership of child's stdout/stderr
     let child_stdout = child.stdout.take().unwrap();
@@ -110,19 +115,49 @@ fn try_run(run_dir: &Path) -> Result<()> {
     let _ = stderr_handle.join();
 
     // Write result
-    #[cfg(unix)]
-    let signal = status.signal();
-    #[cfg(not(unix))]
-    let signal = None;
-
-    let result = RunResult {
-        exit_code: status.code(),
-        signal,
-    };
+    let result = run_result(status);
     write_result(run_dir, &result)?;
 
     // Exit with same code as child
-    std::process::exit(status.code().unwrap_or(1));
+    std::process::exit(result.exit_code.unwrap_or(1));
+}
+
+/// The status of a finished child, in the shape `workmux run` reports.
+///
+/// Unix names the signal that killed the child. Windows has no signals: a
+/// console process that dies from Ctrl+C exits with `STATUS_CONTROL_C_EXIT`,
+/// which is what `SIGINT` means on Unix, so the two platforms agree on the
+/// result.
+fn run_result(status: ExitStatus) -> RunResult {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        RunResult {
+            exit_code: status.code(),
+            signal: status.signal(),
+        }
+    }
+    #[cfg(windows)]
+    {
+        /// `STATUS_CONTROL_C_EXIT`: the Windows counterpart of dying to
+        /// `SIGINT`.
+        const STATUS_CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
+        /// `SIGINT`, the signal Unix reports for an interrupt.
+        const SIGINT: i32 = 2;
+
+        if status.code() == Some(STATUS_CONTROL_C_EXIT) {
+            RunResult {
+                exit_code: None,
+                signal: Some(SIGINT),
+            }
+        } else {
+            RunResult {
+                exit_code: status.code(),
+                signal: None,
+            }
+        }
+    }
 }
 
 fn pump_output<R: Read, F: Write, T: Write>(mut reader: R, mut file: F, mut terminal: T) {
@@ -139,5 +174,42 @@ fn pump_output<R: Read, F: Write, T: Write>(mut reader: R, mut file: F, mut term
             }
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A child killed by an interrupt is reported the way Unix reports it: no
+    /// exit code, `SIGINT` as the signal.
+    #[cfg(unix)]
+    #[test]
+    fn run_result_reports_the_signal_that_killed_the_child() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let interrupted = run_result(ExitStatus::from_raw(2));
+        assert_eq!(interrupted.exit_code, None);
+        assert_eq!(interrupted.signal, Some(2));
+
+        let completed = run_result(ExitStatus::from_raw(3 << 8));
+        assert_eq!(completed.exit_code, Some(3));
+        assert_eq!(completed.signal, None);
+    }
+
+    /// Windows has no signals, so the status a Ctrl+C'd console process exits
+    /// with is translated into the same result.
+    #[cfg(windows)]
+    #[test]
+    fn run_result_translates_the_windows_control_exit_status() {
+        use std::os::windows::process::ExitStatusExt;
+
+        let interrupted = run_result(ExitStatus::from_raw(0xC000_013A));
+        assert_eq!(interrupted.exit_code, None);
+        assert_eq!(interrupted.signal, Some(2));
+
+        let completed = run_result(ExitStatus::from_raw(3));
+        assert_eq!(completed.exit_code, Some(3));
+        assert_eq!(completed.signal, None);
     }
 }
