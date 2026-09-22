@@ -621,7 +621,7 @@ impl WezTermBackend {
         Ok(())
     }
 
-    /// Split a pane with optional command.
+    /// Split a pane, running `argv` in the new one.
     fn split_pane_internal(
         &self,
         target_pane_id: &str,
@@ -629,7 +629,7 @@ impl WezTermBackend {
         cwd: &Path,
         size: Option<u16>,
         percentage: Option<u8>,
-        command: Option<&str>,
+        argv: Option<Vec<String>>,
     ) -> Result<String> {
         let direction_arg = match direction {
             SplitDirection::Horizontal => "--horizontal",
@@ -641,34 +641,16 @@ impl WezTermBackend {
             }
         };
 
-        let cwd_str = cwd.to_string_lossy();
-        let mut args = vec![
-            "cli",
-            "split-pane",
-            "--pane-id",
-            target_pane_id,
-            "--cwd",
-            &*cwd_str,
-            direction_arg,
-        ];
-
-        let percent_arg;
-        if let Some(p) = percentage {
-            percent_arg = format!("{}", p);
-            args.push("--percent");
-            args.push(&percent_arg);
-        }
         let _ = size; // WezTerm doesn't support absolute sizes via CLI
-
-        // Route the command through the platform shell so simple commands and
-        // multi-statement scripts are handled the same way.
-        let snippet = command.map(crate::shell::snippet_argv);
-        if let Some(snippet) = &snippet {
-            args.push("--");
-            for arg in snippet {
-                args.push(arg.as_str());
-            }
-        }
+        let cwd_str = cwd.to_string_lossy();
+        let args = split_args(
+            target_pane_id,
+            &cwd_str,
+            direction_arg,
+            percentage,
+            argv.as_deref(),
+        );
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
         let output = self
             .cli(&args)
@@ -677,6 +659,43 @@ impl WezTermBackend {
 
         Ok(output.trim().to_string())
     }
+}
+
+/// The `wezterm cli` arguments that split a pane and run `argv` in the new one.
+///
+/// The words after `--` are the pane's program and its own arguments, and
+/// WezTerm hands them on as they stand: nothing in the trip re-reads them, so a
+/// word keeps its spaces and its quotes. A command string is a different thing
+/// -- it goes through the platform shell first, which is why `split_pane` asks
+/// for it to be handed over as one.
+fn split_args(
+    target_pane_id: &str,
+    cwd: &str,
+    direction_arg: &str,
+    percentage: Option<u8>,
+    argv: Option<&[String]>,
+) -> Vec<String> {
+    let mut args = vec![
+        "cli".to_string(),
+        "split-pane".to_string(),
+        "--pane-id".to_string(),
+        target_pane_id.to_string(),
+        "--cwd".to_string(),
+        cwd.to_string(),
+        direction_arg.to_string(),
+    ];
+
+    if let Some(percentage) = percentage {
+        args.push("--percent".to_string());
+        args.push(percentage.to_string());
+    }
+
+    if let Some(argv) = argv {
+        args.push("--".to_string());
+        args.extend(argv.iter().cloned());
+    }
+
+    args
 }
 
 /// What WezTerm reports about the pane a process runs in.
@@ -1154,7 +1173,7 @@ impl Multiplexer for WezTermBackend {
                 cwd,
                 None,
                 None,
-                cmd,
+                cmd.map(crate::shell::snippet_argv),
             )?;
 
             Ok(new_pane_id)
@@ -1329,13 +1348,35 @@ impl Multiplexer for WezTermBackend {
         percentage: Option<u8>,
         command: Option<&str>,
     ) -> Result<String> {
+        // A pane command arrives as a command string, so it goes through the
+        // platform shell, which takes a simple command and a multi-statement
+        // script the same way.
         self.split_pane_internal(
             target_pane_id,
             direction.clone(),
             cwd,
             size,
             percentage,
-            command,
+            command.map(crate::shell::snippet_argv),
+        )
+    }
+
+    fn split_pane_argv(
+        &self,
+        target_pane_id: &str,
+        direction: &SplitDirection,
+        cwd: &Path,
+        size: Option<u16>,
+        percentage: Option<u8>,
+        argv: &[String],
+    ) -> Result<String> {
+        self.split_pane_internal(
+            target_pane_id,
+            direction.clone(),
+            cwd,
+            size,
+            percentage,
+            Some(argv.to_vec()),
         )
     }
 }
@@ -1863,6 +1904,53 @@ mod tests {
                 "'/tmp/it'\\''s/wezterm'"
             );
         }
+    }
+
+    /// A pane's program and its arguments travel as themselves: WezTerm passes
+    /// the words after `--` on as they stand, so a word keeps the space in it
+    /// and keeps the quote in it, neither of which a command string could carry
+    /// without being quoted for a shell first.
+    #[test]
+    fn a_pane_is_given_the_argv_it_was_asked_for() {
+        let argv = vec![
+            r"C:\Program Files\workmux.exe".to_string(),
+            "_exec".to_string(),
+            "--run-dir".to_string(),
+            r"C:\Temp\workmux runs\42".to_string(),
+        ];
+
+        assert_eq!(
+            split_args("12", r"C:\work", "--horizontal", Some(30), Some(&argv)),
+            [
+                "cli",
+                "split-pane",
+                "--pane-id",
+                "12",
+                "--cwd",
+                r"C:\work",
+                "--horizontal",
+                "--percent",
+                "30",
+                "--",
+                r"C:\Program Files\workmux.exe",
+                "_exec",
+                "--run-dir",
+                r"C:\Temp\workmux runs\42",
+            ]
+        );
+    }
+
+    /// A pane command that is a command string still runs under a shell: the
+    /// words after `--` are the platform shell and the script it is to read.
+    #[test]
+    fn a_command_string_is_run_by_the_shell() {
+        let argv = crate::shell::snippet_argv("echo hi");
+
+        let args = split_args("12", "cwd", "--top-level", None, Some(&argv));
+
+        assert_eq!(args[args.len() - argv.len() - 1], "--");
+        assert!(args.ends_with(&argv), "{args:?}");
+        assert_eq!(args.len(), 8 + argv.len());
     }
 
     /// Panes die with the server and their ids are handed out again, so the
