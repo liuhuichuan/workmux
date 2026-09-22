@@ -36,32 +36,166 @@ const WEZTERM_CLI: &str = if cfg!(windows) {
 /// mux while staying bounded.
 const WEZTERM_CLI_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Shell the running-WezTerm probe asks, and the question it puts to it.
+///
+/// `Get-Process` names the image a process was started from, which is the one
+/// thing about an unpacked install that the environment cannot say. The mux
+/// server is asked for as well: a session started without a GUI is still
+/// started from the install that has the CLI.
+#[cfg(windows)]
+const POWERSHELL: &str = "powershell";
+#[cfg(windows)]
+const RUNNING_WEZTERM_IMAGES: &str = concat!(
+    "Get-Process wezterm-gui,wezterm-mux-server -ErrorAction SilentlyContinue ",
+    "| Select-Object -ExpandProperty Path",
+);
+
+/// How long that probe may take before workmux works on without it.
+#[cfg(windows)]
+const WEZTERM_PROBE_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Program that speaks `wezterm cli`.
 ///
 /// A Windows install is often portable and never reaches `PATH`, so the bare
-/// name is not enough. Every pane inherits `WEZTERM_EXECUTABLE`, naming the
-/// binary that owns it -- the GUI, or the mux server -- and the CLI sits next
-/// to that one.
+/// name is not enough. Four places can name the CLI, and the first one that
+/// has it wins:
+///
+/// 1. beside `WEZTERM_EXECUTABLE`, the binary that owns the pane this process
+///    runs in -- the GUI, or the mux server;
+/// 2. `PATH`, where an install that registers itself puts it;
+/// 3. the directory a Windows install is laid out in;
+/// 4. beside the WezTerm that is running now.
+///
+/// The answer is kept for the run: what a process can resolve does not change
+/// while it runs, and every call asks the same question.
 fn wezterm_program() -> &'static str {
     static PROGRAM: OnceLock<String> = OnceLock::new();
 
     PROGRAM.get_or_init(|| {
-        wezterm_program_from(std::env::var_os("WEZTERM_EXECUTABLE").map(PathBuf::from))
+        let owner = std::env::var_os("WEZTERM_EXECUTABLE").map(PathBuf::from);
+        wezterm_program_from(owner, &install_directories())
+            .or_else(wezterm_program_on_path)
+            .or_else(wezterm_cli_beside_running_wezterm)
+            .map_or_else(
+                || WEZTERM_CLI.to_string(),
+                |cli| cli.to_string_lossy().into_owned(),
+            )
     })
 }
 
-fn wezterm_program_from(executable: Option<PathBuf>) -> String {
-    let Some(executable) = executable else {
-        return WEZTERM_CLI.to_string();
-    };
+/// The CLI beside `executable`, or in one of `directories`.
+///
+/// A binary that is not the CLI, with nothing beside it, names an install that
+/// does not own this process: that is no reason to stop looking.
+fn wezterm_program_from(executable: Option<PathBuf>, directories: &[PathBuf]) -> Option<PathBuf> {
+    let beside_owner = executable.map(|binary| binary.with_file_name(WEZTERM_CLI));
+    beside_owner
+        .into_iter()
+        .chain(directories.iter().map(|dir| dir.join(WEZTERM_CLI)))
+        .find(|cli| cli.is_file())
+}
 
-    let cli = executable.with_file_name(WEZTERM_CLI);
-    if cli.is_file() {
-        return cli.to_string_lossy().into_owned();
+/// The CLI an install on `PATH` provides.
+fn wezterm_program_on_path() -> Option<PathBuf> {
+    which::which(WEZTERM_CLI).ok()
+}
+
+/// Directories a Windows install is laid out in.
+///
+/// Each is where an installer or a package manager puts `wezterm.exe`, so a
+/// machine that never added WezTerm to `PATH` still answers for itself.
+#[cfg(windows)]
+fn install_directories() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+
+    // An installer's layout: a `WezTerm` folder under a program-files root.
+    for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(root) = std::env::var_os(variable) {
+            directories.push(PathBuf::from(root).join("WezTerm"));
+        }
     }
-    // The named binary is not the CLI and nothing sits beside it, so the
-    // install is not the one that owns this pane; `PATH` decides.
-    WEZTERM_CLI.to_string()
+
+    // An unpacked download keeps the name of the release it came from, so its
+    // CLI is one level below wherever its owner unpacked it.
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let programs = PathBuf::from(local).join("Programs");
+        directories.push(programs.join("WezTerm"));
+        directories.extend(subdirectories(&programs.join("wezterm")));
+    }
+
+    // Scoop names the version it holds installed `current`.
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        directories.push(
+            PathBuf::from(home)
+                .join("scoop")
+                .join("apps")
+                .join("wezterm")
+                .join("current"),
+        );
+    }
+
+    directories
+}
+
+#[cfg(not(windows))]
+fn install_directories() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// Every directory directly inside `parent`, or none when it cannot be read.
+#[cfg(windows)]
+fn subdirectories(parent: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// The CLI beside the WezTerm that is running now.
+///
+/// An unpacked download is neither on `PATH` nor in a directory named in
+/// advance: the folder it lives in is named after the build it came from. The
+/// running process is where that folder is known -- the CLI ships beside the
+/// image WezTerm was started from.
+///
+/// Asking Windows for another process's image path needs an API workmux does
+/// not otherwise call, so the platform shell answers instead, and only after
+/// the places above came up empty. A machine with no WezTerm at all pays that
+/// pause once per run and then reports the CLI missing.
+#[cfg(windows)]
+fn wezterm_cli_beside_running_wezterm() -> Option<PathBuf> {
+    let listed = Cmd::new(POWERSHELL)
+        .args(&[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            RUNNING_WEZTERM_IMAGES,
+        ])
+        .timeout(WEZTERM_PROBE_DEADLINE)
+        .run_and_capture_stdout()
+        .ok()?;
+    wezterm_cli_from_image_paths(&listed)
+}
+
+#[cfg(not(windows))]
+fn wezterm_cli_beside_running_wezterm() -> Option<PathBuf> {
+    None
+}
+
+/// The CLI named by a listing of WezTerm image paths, one to a line.
+#[cfg(windows)]
+fn wezterm_cli_from_image_paths(listed: &str) -> Option<PathBuf> {
+    listed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .map(|image| image.with_file_name(WEZTERM_CLI))
+        .find(|cli| cli.is_file())
 }
 
 /// The mux server's lifetime, read off the socket it binds.
@@ -1546,23 +1680,77 @@ mod tests {
     }
 
     /// A portable Windows install never reaches `PATH`, so the CLI is looked
-    /// up beside the binary `WEZTERM_EXECUTABLE` names.
+    /// up beside the binary `WEZTERM_EXECUTABLE` names, and in the directory an
+    /// install keeps it in when that binary has none.
     #[test]
     fn wezterm_program_prefers_the_cli_beside_the_named_binary() {
-        let dir = tempfile::tempdir().unwrap();
-        let mux_server = dir.path().join("wezterm-mux-server");
-        std::fs::write(&mux_server, "").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let installed = temp.path().join("WezTerm");
+        std::fs::create_dir(&installed).unwrap();
+        std::fs::write(installed.join(WEZTERM_CLI), "").unwrap();
+        let installed_cli = installed.join(WEZTERM_CLI);
 
-        // A binary that is not the CLI, with nothing beside it: `PATH`.
-        assert_eq!(wezterm_program_from(Some(mux_server.clone())), WEZTERM_CLI);
-
-        let cli = dir.path().join(WEZTERM_CLI);
-        std::fs::write(&cli, "").unwrap();
+        // Nothing named by the environment: the install directory answers.
         assert_eq!(
-            wezterm_program_from(Some(mux_server)),
-            cli.to_string_lossy()
+            wezterm_program_from(None, &[installed.clone()]),
+            Some(installed_cli.clone())
         );
-        assert_eq!(wezterm_program_from(None), WEZTERM_CLI);
+
+        // A named binary that is not the CLI, with nothing beside it, still
+        // leaves the install directory to answer.
+        let mux_server = temp.path().join("wezterm-mux-server");
+        std::fs::write(&mux_server, "").unwrap();
+        assert_eq!(
+            wezterm_program_from(Some(mux_server.clone()), &[installed]),
+            Some(installed_cli)
+        );
+
+        // The named binary's own directory is the closer answer, so it wins.
+        let beside = temp.path().join(WEZTERM_CLI);
+        std::fs::write(&beside, "").unwrap();
+        assert_eq!(
+            wezterm_program_from(Some(mux_server), &[temp.path().join("WezTerm")]),
+            Some(beside)
+        );
+
+        // Nowhere is answered as nowhere, not as the bare name: whether a CLI
+        // can be reached at all is something the caller has to be able to tell.
+        assert_eq!(wezterm_program_from(None, &[]), None);
+    }
+
+    /// An unpacked download keeps the name of the release it came from, so the
+    /// install directory is a level below where its owner unpacked it.
+    #[cfg(windows)]
+    #[test]
+    fn subdirectories_are_where_an_unpacked_download_unrolled() {
+        let temp = tempfile::tempdir().unwrap();
+        let unpacked = temp.path().join("WezTerm-windows-20240203-110809");
+        std::fs::create_dir(&unpacked).unwrap();
+        std::fs::write(temp.path().join("README.md"), "").unwrap();
+
+        assert_eq!(subdirectories(temp.path()), vec![unpacked]);
+        assert!(subdirectories(&temp.path().join("absent")).is_empty());
+    }
+
+    /// The WezTerm that is running is the one that owns the mux, so the CLI
+    /// beside its image is the one to call -- and a listing with no CLI beside
+    /// any of the paths in it says nothing about where the CLI is.
+    #[cfg(windows)]
+    #[test]
+    fn a_running_wezterm_names_the_cli_beside_its_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let gui = temp.path().join("wezterm-gui.exe");
+        std::fs::write(&gui, "").unwrap();
+        let elsewhere = temp.path().join("elsewhere").join("wezterm-gui.exe");
+        let listed = format!("{}\r\n{}\n", elsewhere.display(), gui.display());
+
+        assert_eq!(wezterm_cli_from_image_paths(""), None);
+        assert_eq!(wezterm_cli_from_image_paths("\r\n"), None);
+        assert_eq!(wezterm_cli_from_image_paths(&listed), None);
+
+        let cli = temp.path().join(WEZTERM_CLI);
+        std::fs::write(&cli, "").unwrap();
+        assert_eq!(wezterm_cli_from_image_paths(&listed), Some(cli));
     }
 
     /// The program goes into a script the platform shell reads, so a path with
