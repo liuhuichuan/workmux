@@ -36,9 +36,11 @@ mod xdg;
 use anyhow::Result;
 use tracing::{error, info};
 
-// Windows gives the main thread a 1 MiB stack, which is not always enough for
-// the debug-build call chain that builds the CLI and configuration. Unix keeps
-// the plain `main` so signal and thread semantics stay untouched.
+// Windows gives the main thread a 1 MiB stack, but clap's generated
+// `augment_subcommands` needs about 1.2 MiB of it in a debug build: without this
+// worker the process dies in `__chkstk` with "thread 'main' has overflowed its
+// stack" before it reads an argument. Unix keeps the plain `main` so signal and
+// thread semantics stay untouched.
 #[cfg(unix)]
 fn main() -> Result<()> {
     real_main()
