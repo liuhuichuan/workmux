@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::cmd::Cmd;
@@ -15,6 +16,41 @@ use crate::config::SplitDirection;
 use super::Multiplexer;
 use super::types::*;
 use super::util;
+
+/// File name of the WezTerm CLI, which ships beside WezTerm's other binaries.
+const WEZTERM_CLI: &str = if cfg!(windows) {
+    "wezterm.exe"
+} else {
+    "wezterm"
+};
+
+/// Program that speaks `wezterm cli`.
+///
+/// A Windows install is often portable and never reaches `PATH`, so the bare
+/// name is not enough. Every pane inherits `WEZTERM_EXECUTABLE`, naming the
+/// binary that owns it -- the GUI, or the mux server -- and the CLI sits next
+/// to that one.
+fn wezterm_program() -> &'static str {
+    static PROGRAM: OnceLock<String> = OnceLock::new();
+
+    PROGRAM.get_or_init(|| {
+        wezterm_program_from(std::env::var_os("WEZTERM_EXECUTABLE").map(PathBuf::from))
+    })
+}
+
+fn wezterm_program_from(executable: Option<PathBuf>) -> String {
+    let Some(executable) = executable else {
+        return WEZTERM_CLI.to_string();
+    };
+
+    let cli = executable.with_file_name(WEZTERM_CLI);
+    if cli.is_file() {
+        return cli.to_string_lossy().into_owned();
+    }
+    // The named binary is not the CLI and nothing sits beside it, so the
+    // install is not the one that owns this pane; `PATH` decides.
+    WEZTERM_CLI.to_string()
+}
 
 /// WezTerm pane information from `wezterm cli list --format json`
 #[derive(Debug, Deserialize)]
@@ -88,7 +124,7 @@ impl WezTermBackend {
     /// Create a wezterm CLI command.
     /// Uses inherited WEZTERM_UNIX_SOCKET from environment.
     fn wezterm_cmd(&self) -> Cmd<'static> {
-        Cmd::new("wezterm")
+        Cmd::new(wezterm_program())
     }
 
     /// Query all panes from WezTerm.
@@ -764,10 +800,28 @@ impl Multiplexer for WezTermBackend {
 /// device.
 fn deferred_wezterm_cmd(args: &[&str]) -> String {
     format!(
-        "wezterm cli {} {}",
+        "{} cli {} {}",
+        deferred_wezterm_program(),
         args.join(" "),
         crate::shell::silent_output_suffix()
     )
+}
+
+/// The CLI as the interpreter that reads a deferred script must spell it.
+///
+/// PowerShell runs the Windows scripts and `sh` the Unix ones; both take a
+/// single-quoted path, and PowerShell needs `&` to run a command named by one.
+fn deferred_wezterm_program() -> String {
+    quote_for_deferred_script(wezterm_program())
+}
+
+/// Quote a program path for the interpreter that reads a deferred script.
+fn quote_for_deferred_script(program: &str) -> String {
+    if cfg!(windows) {
+        format!("& '{}'", program.replace('\'', "''"))
+    } else {
+        format!("'{}'", program.replace('\'', "'\\''"))
+    }
 }
 
 /// Send escape sequence to trigger cross-workspace pane switch via WezTerm's user-var-changed event.
@@ -841,12 +895,57 @@ mod tests {
     /// for them must redirect through that shell's null device.
     #[test]
     fn deferred_wezterm_cmd_uses_the_deferred_shells_null_device() {
+        let cmd = deferred_wezterm_cmd(&["activate-tab", "--tab-id", "7"]);
+        assert!(cmd.starts_with(&deferred_wezterm_program()));
+        assert!(cmd.contains(" cli activate-tab --tab-id 7 "));
+        assert!(cmd.ends_with(crate::shell::silent_output_suffix()));
+    }
+
+    /// A portable Windows install never reaches `PATH`, so the CLI is looked
+    /// up beside the binary `WEZTERM_EXECUTABLE` names.
+    #[test]
+    fn wezterm_program_prefers_the_cli_beside_the_named_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mux_server = dir.path().join("wezterm-mux-server");
+        std::fs::write(&mux_server, "").unwrap();
+
+        // A binary that is not the CLI, with nothing beside it: `PATH`.
+        assert_eq!(wezterm_program_from(Some(mux_server.clone())), WEZTERM_CLI);
+
+        let cli = dir.path().join(WEZTERM_CLI);
+        std::fs::write(&cli, "").unwrap();
         assert_eq!(
-            deferred_wezterm_cmd(&["activate-tab", "--tab-id", "7"]),
-            format!(
-                "wezterm cli activate-tab --tab-id 7 {}",
-                crate::shell::silent_output_suffix()
-            )
+            wezterm_program_from(Some(mux_server)),
+            cli.to_string_lossy()
         );
+        assert_eq!(wezterm_program_from(None), WEZTERM_CLI);
+    }
+
+    /// The program goes into a script the platform shell reads, so a path with
+    /// a space survives and a quote in it cannot break out of the string.
+    #[test]
+    fn deferred_wezterm_program_quotes_the_path_for_its_interpreter() {
+        let spaced = "C:\\Program Files\\WezTerm\\wezterm.exe";
+        let quoted_quote = "/tmp/it's/wezterm";
+
+        if cfg!(windows) {
+            assert_eq!(
+                quote_for_deferred_script(spaced),
+                "& 'C:\\Program Files\\WezTerm\\wezterm.exe'"
+            );
+            assert_eq!(
+                quote_for_deferred_script(quoted_quote),
+                "& '/tmp/it''s/wezterm'"
+            );
+        } else {
+            assert_eq!(
+                quote_for_deferred_script(spaced),
+                "'C:\\Program Files\\WezTerm\\wezterm.exe'"
+            );
+            assert_eq!(
+                quote_for_deferred_script(quoted_quote),
+                "'/tmp/it'\\''s/wezterm'"
+            );
+        }
     }
 }
