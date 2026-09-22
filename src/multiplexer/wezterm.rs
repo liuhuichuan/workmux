@@ -4,6 +4,7 @@
 //! and exposes them through the Multiplexer trait interface.
 
 use anyhow::{Context, Result, anyhow};
+use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -82,18 +83,69 @@ struct WezTermPane {
 impl WezTermPane {
     /// Parse cwd from "file://hostname/path" format to PathBuf
     fn cwd_path(&self) -> PathBuf {
-        // Format: "file://hostname/path" or "file:///path" (empty hostname)
-        self.cwd
-            .strip_prefix("file://")
-            .and_then(|s| {
-                // Find first / after hostname
-                s.find('/').map(|idx| PathBuf::from(&s[idx..]))
-            })
-            .unwrap_or_else(|| {
-                // Fallback: try parsing as plain path
-                PathBuf::from(&self.cwd)
-            })
+        file_url_to_path(&self.cwd)
     }
+}
+
+/// The path named by a pane's `cwd`.
+///
+/// The field is a `file://` URL, so its text is not the path. A Windows cwd
+/// arrives as `file:///C:/Users/me/project/`: forward slashes, a `/` ahead of
+/// the drive letter, a trailing separator the directory name does not have,
+/// and anything outside the URL's unreserved set escaped -- the space in
+/// `wm%20e2e`, say. Text that is not a `file://` URL is taken as a path
+/// already.
+fn file_url_to_path(url: &str) -> PathBuf {
+    let Some(rest) = url.strip_prefix("file://") else {
+        return PathBuf::from(url);
+    };
+
+    // The authority runs up to the first separator, and names the machine the
+    // pane runs on.
+    let (authority, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+
+    let path = percent_decode_str(path).decode_utf8_lossy();
+    drop_url_trailing_separator(url_path(authority, &path))
+}
+
+/// Turn the decoded path half of a `file://` URL into the path it names, given
+/// the authority that preceded it.
+#[cfg(windows)]
+fn url_path(authority: &str, path: &str) -> PathBuf {
+    // A named authority is the UNC host of a share. WezTerm normally reaches a
+    // share through a drive letter (the one `pushd` maps), so this covers a URL
+    // that names the host outright.
+    if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+        return PathBuf::from(format!(
+            "\\\\{}\\{}",
+            authority,
+            path.trim_start_matches('/').replace('/', "\\")
+        ));
+    }
+
+    // A URL path always begins with "/"; a drive path never does.
+    let path = path.strip_prefix('/').unwrap_or(path);
+    PathBuf::from(path.replace('/', "\\"))
+}
+
+#[cfg(unix)]
+fn url_path(_authority: &str, path: &str) -> PathBuf {
+    // The authority names the machine the pane runs on, and it is this one.
+    PathBuf::from(path)
+}
+
+/// Drop the separator a URL path ends with, unless it is all that keeps the
+/// path a drive root (`C:\`) rather than a drive name (`C:`, which is relative).
+fn drop_url_trailing_separator(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    let trimmed = text.trim_end_matches(std::path::MAIN_SEPARATOR);
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        return path;
+    }
+    PathBuf::from(trimmed)
 }
 
 /// WezTerm backend implementation.
@@ -851,44 +903,108 @@ fn send_pane_switch_signal(workspace: &str, tab_title: &str) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_cwd_path_parsing() {
-        let pane = WezTermPane {
+    /// A pane carrying `cwd`, with the other fields at values nothing reads.
+    fn pane_at(cwd: &str) -> WezTermPane {
+        WezTermPane {
             window_id: 0,
             tab_id: 0,
             pane_id: 0,
             workspace: "default".to_string(),
-            title: "".to_string(),
+            title: String::new(),
             tab_title: "test".to_string(),
-            cwd: "file://hostname/home/user/project".to_string(),
+            cwd: cwd.to_string(),
             tty_name: None,
             is_active: true,
             is_zoomed: false,
             cursor_x: 0,
             cursor_y: 0,
-        };
-
-        assert_eq!(pane.cwd_path(), PathBuf::from("/home/user/project"));
+        }
     }
 
+    /// A cwd that is not a URL is a path already.
     #[test]
-    fn test_cwd_path_parsing_empty_hostname() {
-        let pane = WezTermPane {
-            window_id: 0,
-            tab_id: 0,
-            pane_id: 0,
-            workspace: "default".to_string(),
-            title: "".to_string(),
-            tab_title: "test".to_string(),
-            cwd: "file:///home/user/project".to_string(),
-            tty_name: None,
-            is_active: true,
-            is_zoomed: false,
-            cursor_x: 0,
-            cursor_y: 0,
-        };
+    fn cwd_path_passes_through_a_plain_path() {
+        assert_eq!(
+            pane_at(r"C:\Users\me\project").cwd_path(),
+            PathBuf::from(r"C:\Users\me\project")
+        );
+    }
 
-        assert_eq!(pane.cwd_path(), PathBuf::from("/home/user/project"));
+    /// `wezterm cli list` reports a Windows cwd as `file:///C:/Users/me/x/`:
+    /// the drive keeps a leading `/` and the URL form appends a separator that
+    /// the directory name does not have.
+    #[cfg(windows)]
+    #[test]
+    fn cwd_path_parses_a_windows_cwd() {
+        let pane = pane_at(
+            "file:///C:/Users/Administrator/AppData/Local/Temp/wm-e2e/demo__worktrees/track-a/",
+        );
+        assert_eq!(
+            pane.cwd_path(),
+            PathBuf::from(
+                r"C:\Users\Administrator\AppData\Local\Temp\wm-e2e\demo__worktrees\track-a"
+            )
+        );
+    }
+
+    /// WezTerm escapes characters a URL cannot carry bare, such as the space in
+    /// a worktree path.
+    #[cfg(windows)]
+    #[test]
+    fn cwd_path_decodes_an_escaped_windows_cwd() {
+        let pane = pane_at("file:///C:/Users/Administrator/AppData/Local/Temp/wm%20e2e/");
+        assert_eq!(
+            pane.cwd_path(),
+            PathBuf::from(r"C:\Users\Administrator\AppData\Local\Temp\wm e2e")
+        );
+    }
+
+    /// Stripping the trailing separator must not turn a drive root into a drive
+    /// name, which would be a relative path.
+    #[cfg(windows)]
+    #[test]
+    fn cwd_path_keeps_a_windows_drive_root() {
+        assert_eq!(pane_at("file:///C:/").cwd_path(), PathBuf::from(r"C:\"));
+    }
+
+    /// An authority naming a machine is a UNC host. `localhost` is this machine,
+    /// so it keeps the plain drive path.
+    #[cfg(windows)]
+    #[test]
+    fn cwd_path_reads_a_windows_authority() {
+        assert_eq!(
+            pane_at("file://server/share/project").cwd_path(),
+            PathBuf::from(r"\\server\share\project")
+        );
+        assert_eq!(
+            pane_at("file://localhost/C:/Users/me").cwd_path(),
+            PathBuf::from(r"C:\Users\me")
+        );
+    }
+
+    /// On Unix the authority is the machine the pane runs on, which is this one,
+    /// so only the path half matters.
+    #[cfg(unix)]
+    #[test]
+    fn cwd_path_parses_a_unix_cwd() {
+        assert_eq!(
+            pane_at("file://hostname/home/user/project").cwd_path(),
+            PathBuf::from("/home/user/project")
+        );
+        assert_eq!(
+            pane_at("file:///home/user/project").cwd_path(),
+            PathBuf::from("/home/user/project")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cwd_path_decodes_and_trims_a_unix_cwd() {
+        assert_eq!(
+            pane_at("file:///home/user/my%20project/").cwd_path(),
+            PathBuf::from("/home/user/my project")
+        );
+        assert_eq!(pane_at("file:///").cwd_path(), PathBuf::from("/"));
     }
 
     /// Deferred scripts run under the platform shell, so pane commands built
