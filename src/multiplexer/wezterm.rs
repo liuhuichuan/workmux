@@ -53,6 +53,26 @@ fn wezterm_program_from(executable: Option<PathBuf>) -> String {
     WEZTERM_CLI.to_string()
 }
 
+/// The mux server's lifetime, read off the socket it binds.
+///
+/// WezTerm reports nothing about the server, and every pane is the server's
+/// child: when it goes down its panes go with it, and the next server hands out
+/// the same small pane ids again. Without an identity per server, state written
+/// for the pane that used to hold a given id would be read back as the agent in
+/// whichever unrelated pane inherits it. The socket file is created when the
+/// server starts and is never written to afterwards, so its creation time is
+/// the boot time; a setup that talks over a named pipe instead has no file to
+/// read and keeps the previous behavior.
+fn socket_boot_id(socket: Option<PathBuf>) -> Option<String> {
+    let socket = socket.filter(|path| !path.as_os_str().is_empty())?;
+    let metadata = std::fs::metadata(socket).ok()?;
+    // Linux does not record a creation time for every filesystem, and for a
+    // bound socket the last write is the bind.
+    let boot = metadata.created().or_else(|_| metadata.modified()).ok()?;
+    let since_epoch = boot.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(format!("wezterm:{}", since_epoch.as_millis()))
+}
+
 /// WezTerm pane information from `wezterm cli list --format json`
 #[derive(Debug, Deserialize)]
 struct WezTermPane {
@@ -910,6 +930,12 @@ impl Multiplexer for WezTermBackend {
             })
     }
 
+    fn server_boot_id(&self) -> Result<Option<String>> {
+        Ok(socket_boot_id(
+            std::env::var_os("WEZTERM_UNIX_SOCKET").map(PathBuf::from),
+        ))
+    }
+
     fn active_pane_id(&self) -> Option<String> {
         // Query WezTerm for the active pane
         self.list_panes().ok().and_then(|panes| {
@@ -1280,5 +1306,39 @@ mod tests {
                 "'/tmp/it'\\''s/wezterm'"
             );
         }
+    }
+
+    /// Panes die with the server and their ids are handed out again, so the
+    /// server's own lifetime has to be readable from something that survives
+    /// neither restarts nor clients coming and going.
+    #[test]
+    fn server_boot_id_is_the_socket_age_and_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("sock");
+        std::fs::write(&socket, "").unwrap();
+
+        let first = socket_boot_id(Some(socket.clone())).expect("a bound socket has an age");
+        assert!(first.starts_with("wezterm:"), "{first}");
+        // Asking again must answer the same, or every state write would look
+        // like a restart.
+        assert_eq!(socket_boot_id(Some(socket.clone())), Some(first.clone()));
+        // A second socket written later is a different server, and reads
+        // differently, so the id follows the file rather than the clock.
+        std::thread::sleep(Duration::from_millis(5));
+        let restarted = dir.path().join("sock2");
+        std::fs::write(&restarted, "").unwrap();
+        assert_ne!(socket_boot_id(Some(restarted)), Some(first));
+    }
+
+    /// A setup without a socket file keeps the behavior it had before there was
+    /// any server identity to read.
+    #[test]
+    fn no_socket_means_no_server_lifetime() {
+        assert_eq!(socket_boot_id(None), None);
+        assert_eq!(socket_boot_id(Some(PathBuf::new())), None);
+        assert_eq!(
+            socket_boot_id(Some(PathBuf::from("/nonexistent/workmux/wezterm/sock"))),
+            None
+        );
     }
 }
