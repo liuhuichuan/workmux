@@ -1525,7 +1525,7 @@ pub fn on(
     let cells = effective_size_for(&config, position, window_extent);
 
     let _ = std::thread::spawn(crate::tips::mark_sidebar_used);
-    for target in windows::tabs_without_sidebar(&host.workspace)? {
+    for target in windows::tabs_without_sidebar(&host.workspace, position)? {
         windows::open(&target, position, cells)?;
     }
     // Every split took the focus, and the last one may have been in another
