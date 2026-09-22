@@ -25,7 +25,7 @@ use crate::config::{Config, SidebarPosition};
 use crate::git::{self, GitStatus};
 use crate::multiplexer::wezterm;
 use crate::multiplexer::{AgentPane, Multiplexer, create_backend, detect_backend};
-use crate::state::StateStore;
+use crate::state::{GlobalSettings, StateStore};
 
 use super::app::{SidebarApp, SidebarFilterMode};
 use super::input::{LastPaneCheck, apply_input, quit_for_last_pane};
@@ -38,8 +38,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// runs git once per agent and git answers in tens of milliseconds.
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Title this pane claims, and the only way to find it again: WezTerm has no
-/// per-pane user option to hang a role on, but it does report pane titles.
+/// Title this pane claims, so a human can tell a sidebar pane from a shell.
+///
+/// It is not the pane's identity: WezTerm applies a title only while the pane's
+/// tab has the focus, which is exactly when nobody is reading a sidebar. The
+/// ids the settings store remembers are the identity; a title is a second,
+/// best-effort signal for panes no id covers.
 const SIDEBAR_PANE_TITLE: &str = "workmux-sidebar";
 
 /// Restores the console however the loop leaves.
@@ -117,7 +121,8 @@ fn spawn_git_worker(
 
 pub(super) fn tabs_without_sidebar(workspace: &str) -> Result<Vec<String>> {
     let panes = wezterm::panes()?;
-    Ok(plan_tabs(&panes, workspace))
+    let sidebars = live_sidebar_ids(&panes);
+    Ok(plan_tabs(&panes, &sidebars, workspace))
 }
 
 /// One pane per tab of `workspace` that has no sidebar yet.
@@ -125,14 +130,18 @@ pub(super) fn tabs_without_sidebar(workspace: &str) -> Result<Vec<String>> {
 /// Whatever pane is found first in a tab is the one to split; `--top-level`
 /// makes the new pane span the tab regardless of which pane it was aimed at.
 /// Tabs are visited in id order so a run is reproducible.
-fn plan_tabs(panes: &[wezterm::PaneSummary], workspace: &str) -> Vec<String> {
+fn plan_tabs(
+    panes: &[wezterm::PaneSummary],
+    sidebars: &HashSet<String>,
+    workspace: &str,
+) -> Vec<String> {
     let mut tabs: BTreeMap<u64, (String, bool)> = BTreeMap::new();
 
     for pane in panes.iter().filter(|pane| pane.workspace == workspace) {
         let entry = tabs
             .entry(pane.tab_id)
             .or_insert_with(|| (pane.pane_id.clone(), false));
-        entry.1 |= pane.title == SIDEBAR_PANE_TITLE;
+        entry.1 |= sidebars.contains(&pane.pane_id);
     }
 
     tabs
@@ -142,15 +151,109 @@ fn plan_tabs(panes: &[wezterm::PaneSummary], workspace: &str) -> Vec<String> {
         .collect()
 }
 
-/// Pane ids of the running sidebars, optionally only those of one workspace.
-pub(super) fn sidebar_panes(workspace: Option<&str>) -> Result<Vec<String>> {
-    Ok(sidebar_pane_ids(&wezterm::panes()?, workspace))
+/// The panes that are sidebars right now.
+///
+/// Read from the ids the store remembers rather than from the panes' titles,
+/// and resolved against the live panes: an id whose pane is gone is dropped
+/// rather than naming whichever unrelated pane holds that id next.
+fn live_sidebar_ids(panes: &[wezterm::PaneSummary]) -> HashSet<String> {
+    live_sidebar_ids_from(panes, &recorded_sidebar_ids())
 }
 
-fn sidebar_pane_ids(panes: &[wezterm::PaneSummary], workspace: Option<&str>) -> Vec<String> {
+/// `live_sidebar_ids` with the record handed in, so a test can drive it.
+fn live_sidebar_ids_from(panes: &[wezterm::PaneSummary], recorded: &[String]) -> HashSet<String> {
     panes
         .iter()
-        .filter(|pane| pane.title == SIDEBAR_PANE_TITLE)
+        .filter(|pane| {
+            recorded.iter().any(|id| id == &pane.pane_id) || pane.title == SIDEBAR_PANE_TITLE
+        })
+        .map(|pane| pane.pane_id.clone())
+        .collect()
+}
+
+/// The sidebar ids the store recorded, or none when the WezTerm server that
+/// recorded them is no longer the one running.
+///
+/// A restarted server hands the same small pane ids out again, so an id from
+/// before the restart names an unrelated pane now, and `off` must not kill that
+/// pane on the strength of it.
+fn recorded_sidebar_ids() -> Vec<String> {
+    let Ok(store) = StateStore::new() else {
+        return Vec::new();
+    };
+    let Ok(settings) = store.load_settings() else {
+        return Vec::new();
+    };
+    sidebar_ids_from_settings(&settings, wezterm_boot_id().as_deref())
+}
+
+/// Split out of `recorded_sidebar_ids` so a test can read both sides of the
+/// server-identity check without a store and a mux.
+fn sidebar_ids_from_settings(settings: &GlobalSettings, boot_id: Option<&str>) -> Vec<String> {
+    if settings.sidebar_boot_id.as_deref() != boot_id {
+        return Vec::new();
+    }
+    settings.sidebar_panes.clone()
+}
+
+/// The running WezTerm server's identity, when it can be had at all.
+fn wezterm_boot_id() -> Option<String> {
+    wezterm::WezTermBackend::new()
+        .server_boot_id()
+        .ok()
+        .flatten()
+}
+
+/// Remember a pane as a sidebar, so that a later `off` can find it again.
+fn record_sidebar_pane(pane_id: &str) {
+    let boot_id = wezterm_boot_id();
+    super::update_sidebar_settings(|settings| {
+        record_sidebar(settings, pane_id, boot_id.as_deref())
+    });
+}
+
+/// The mutation behind `record_sidebar_pane`.
+fn record_sidebar(settings: &mut GlobalSettings, pane_id: &str, boot_id: Option<&str>) {
+    // Ids from another server name other panes now.
+    if settings.sidebar_boot_id.as_deref() != boot_id {
+        settings.sidebar_panes.clear();
+        settings.sidebar_boot_id = boot_id.map(str::to_string);
+    }
+    if !settings.sidebar_panes.iter().any(|id| id == pane_id) {
+        settings.sidebar_panes.push(pane_id.to_string());
+    }
+}
+
+/// Drop panes from the record, for the ones that are gone or going.
+fn forget_sidebar_panes(pane_ids: &[String]) {
+    if pane_ids.is_empty() {
+        return;
+    }
+    super::update_sidebar_settings(|settings| drop_sidebar_panes(settings, pane_ids));
+}
+
+/// The mutation behind `forget_sidebar_panes`.
+fn drop_sidebar_panes(settings: &mut GlobalSettings, pane_ids: &[String]) {
+    settings
+        .sidebar_panes
+        .retain(|id| !pane_ids.iter().any(|gone| gone == id));
+}
+
+/// Pane ids of the running sidebars, optionally only those of one workspace.
+pub(super) fn sidebar_panes(workspace: Option<&str>) -> Result<Vec<String>> {
+    let panes = wezterm::panes()?;
+    let sidebars = live_sidebar_ids(&panes);
+    Ok(sidebar_pane_ids(&panes, &sidebars, workspace))
+}
+
+fn sidebar_pane_ids(
+    panes: &[wezterm::PaneSummary],
+    sidebars: &HashSet<String>,
+    workspace: Option<&str>,
+) -> Vec<String> {
+    panes
+        .iter()
+        .filter(|pane| sidebars.contains(&pane.pane_id))
         .filter(|pane| workspace.is_none_or(|workspace| pane.workspace == workspace))
         .map(|pane| pane.pane_id.clone())
         .collect()
@@ -183,6 +286,9 @@ pub(super) fn open(target_pane_id: &str, position: SidebarPosition, cells: u16) 
     if pane_id.is_empty() {
         bail!("wezterm cli split-pane returned no pane id");
     }
+    // Recorded before the pane is handed back: the pane exists either way, and
+    // an unrecorded sidebar is one no `off` can turn off.
+    record_sidebar_pane(&pane_id);
 
     // Every split takes the focus, and the sidebar is a monitor: the user was
     // looking at the pane we split, so hand it back.
@@ -207,18 +313,24 @@ pub(super) fn close(workspace: Option<&str>) -> Result<()> {
 /// first is the one whose process is running the loop: it has to keep its own
 /// pane out of the list and kill it after everything else.
 pub(super) fn close_except(workspace: Option<&str>, keep: Option<&str>) -> Result<()> {
-    for pane_id in panes_to_close(&wezterm::panes()?, workspace, keep) {
+    let panes = wezterm::panes()?;
+    let sidebars = live_sidebar_ids(&panes);
+    let mut killed: Vec<String> = Vec::new();
+    for pane_id in panes_to_close(&panes, &sidebars, workspace, keep) {
         kill(&pane_id)?;
+        killed.push(pane_id);
     }
+    forget_sidebar_panes(&killed);
     Ok(())
 }
 
 fn panes_to_close(
     panes: &[wezterm::PaneSummary],
+    sidebars: &HashSet<String>,
     workspace: Option<&str>,
     keep: Option<&str>,
 ) -> Vec<String> {
-    sidebar_pane_ids(panes, workspace)
+    sidebar_pane_ids(panes, sidebars, workspace)
         .into_iter()
         .filter(|pane_id| Some(pane_id.as_str()) != keep)
         .collect()
@@ -521,6 +633,10 @@ pub(super) fn run_sidebar() -> Result<()> {
     drop(terminal);
     drop(guard);
     let host_pane_id = host_identity.pane_id.to_string();
+    // Dropped before the kill rather than after: killing this pane ends this
+    // process, so nothing after it runs, and an id left behind would name
+    // whichever pane inherits it.
+    forget_sidebar_panes(std::slice::from_ref(&host_pane_id));
     let _ = match quit {
         Quit::Silent => kill(&host_pane_id),
         // Ourselves last: killing this pane takes this process with it, so
@@ -550,6 +666,11 @@ mod tests {
         }
     }
 
+    /// The sidebar record, as the settings store keeps it.
+    fn ids(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
     fn agent(pane_id: &str, workspace: &str) -> AgentPane {
         AgentPane {
             session: workspace.to_string(),
@@ -574,32 +695,48 @@ mod tests {
     fn tabs_are_planned_in_id_order_and_skip_the_ones_that_have_a_sidebar() {
         let panes = vec![
             pane("1", 10, "default", "cmd.exe"),
-            pane("2", 10, "default", "workmux-sidebar"),
+            pane("2", 10, "default", "cmd.exe"),
             pane("3", 11, "default", "cmd.exe"),
             pane("5", 12, "default", "cmd.exe"),
-            pane("4", 13, "other", "workmux-sidebar"),
+            pane("4", 13, "other", "cmd.exe"),
         ];
+        let sidebars = ids(&["2", "4"]);
 
         assert_eq!(
-            plan_tabs(&panes, "default"),
+            plan_tabs(&panes, &sidebars, "default"),
             vec!["3".to_string(), "5".to_string()]
         );
-        assert!(plan_tabs(&panes, "other").is_empty());
+        assert!(plan_tabs(&panes, &sidebars, "other").is_empty());
     }
 
-    /// A sidebar is found by the title it claims, and only within the
-    /// workspace being toggled.
+    /// A sidebar is the pane the record names -- WezTerm withholds the title of
+    /// every pane whose tab is unfocused, which is every sidebar doing its job
+    /// -- plus any pane claiming the title, and only within the workspace being
+    /// asked about. A recorded id whose pane is gone names nothing at all.
     #[test]
-    fn sidebars_are_found_by_title_within_a_workspace() {
+    fn sidebars_are_the_recorded_panes_and_any_pane_claiming_the_title() {
         let panes = vec![
             pane("1", 10, "default", "cmd.exe"),
-            pane("2", 10, "default", "workmux-sidebar"),
-            pane("3", 11, "other", "workmux-sidebar"),
+            pane("2", 10, "default", "cmd.exe"),
+            pane("3", 11, "default", "workmux-sidebar"),
+            pane("4", 11, "other", "cmd.exe"),
         ];
+        let recorded: Vec<String> = ["2", "4", "9"].iter().map(|id| id.to_string()).collect();
+        let sidebars = live_sidebar_ids_from(&panes, &recorded);
 
-        assert_eq!(sidebar_pane_ids(&panes, None), vec!["2", "3"]);
-        assert_eq!(sidebar_pane_ids(&panes, Some("default")), vec!["2"]);
-        assert!(sidebar_pane_ids(&panes, Some("missing")).is_empty());
+        assert_eq!(sidebars, ids(&["2", "3", "4"]));
+        assert_eq!(
+            sidebar_pane_ids(&panes, &sidebars, None),
+            vec!["2", "3", "4"]
+        );
+        assert_eq!(
+            sidebar_pane_ids(&panes, &sidebars, Some("default")),
+            vec!["2", "3"]
+        );
+        assert!(
+            sidebar_pane_ids(&panes, &sidebars, Some("missing")).is_empty(),
+            "a sidebar of another workspace is not one the caller can toggle"
+        );
     }
 
     /// A quitting sidebar must not be in its own kill list: killing that pane
@@ -612,19 +749,68 @@ mod tests {
             pane("4", 11, "other", "workmux-sidebar"),
             pane("5", 11, "default", "cmd.exe"),
         ];
+        let sidebars = ids(&["2", "3", "4"]);
 
         assert_eq!(
-            panes_to_close(&panes, Some("default"), Some("2")),
+            panes_to_close(&panes, &sidebars, Some("default"), Some("2")),
             vec!["3".to_string()]
         );
         assert_eq!(
-            panes_to_close(&panes, Some("default"), None),
+            panes_to_close(&panes, &sidebars, Some("default"), None),
             vec!["2".to_string(), "3".to_string()]
         );
         assert_eq!(
-            panes_to_close(&panes, None, Some("2")),
+            panes_to_close(&panes, &sidebars, None, Some("2")),
             vec!["3".to_string(), "4".to_string()]
         );
+    }
+
+    /// Pane ids come round again after WezTerm restarts, so ids recorded under
+    /// the server that is gone must not be read as sidebars of this one.
+    #[test]
+    fn recorded_ids_are_dropped_when_the_wezterm_server_is_not_the_same_one() {
+        let settings = GlobalSettings {
+            sidebar_panes: vec!["21".to_string()],
+            sidebar_boot_id: Some("wezterm:2".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            sidebar_ids_from_settings(&settings, Some("wezterm:2")),
+            vec!["21".to_string()]
+        );
+        assert!(sidebar_ids_from_settings(&settings, Some("wezterm:9")).is_empty());
+        assert!(sidebar_ids_from_settings(&settings, None).is_empty());
+    }
+
+    /// `open` records the pane it made, once, and a sidebar of a new server
+    /// replaces the ids of the old one rather than inheriting them.
+    #[test]
+    fn recording_a_sidebar_keeps_one_copy_and_follows_the_server() {
+        let mut settings = GlobalSettings::default();
+
+        record_sidebar(&mut settings, "21", Some("wezterm:2"));
+        record_sidebar(&mut settings, "21", Some("wezterm:2"));
+        record_sidebar(&mut settings, "22", Some("wezterm:2"));
+        assert_eq!(settings.sidebar_panes, vec!["21", "22"]);
+        assert_eq!(settings.sidebar_boot_id.as_deref(), Some("wezterm:2"));
+
+        record_sidebar(&mut settings, "3", Some("wezterm:7"));
+        assert_eq!(settings.sidebar_panes, vec!["3"]);
+        assert_eq!(settings.sidebar_boot_id.as_deref(), Some("wezterm:7"));
+    }
+
+    /// Killing a sidebar drops its id, so the record does not outlive it.
+    #[test]
+    fn forgetting_sidebars_keeps_the_ones_that_still_run() {
+        let mut settings = GlobalSettings {
+            sidebar_panes: ids(&["21", "22", "23"]).into_iter().collect(),
+            sidebar_boot_id: Some("wezterm:2".to_string()),
+            ..Default::default()
+        };
+
+        drop_sidebar_panes(&mut settings, &["21".to_string(), "23".to_string()]);
+        assert_eq!(settings.sidebar_panes, vec!["22"]);
     }
 
     /// `sidebar next` walks what the sidebar lists, so the session filter it

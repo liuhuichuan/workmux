@@ -222,6 +222,22 @@ pub struct GlobalSettings {
     /// it in workmux's own store.
     #[serde(default)]
     pub sidebar_sleeping: Option<String>,
+
+    /// Pane ids of the sidebars this machine is running.
+    ///
+    /// WezTerm applies a pane's title only while its tab has the focus, and a
+    /// sidebar is the pane the user is not looking at, so `off` cannot find one
+    /// by title. The ids are written where the pane is created instead and
+    /// dropped when it exits.
+    #[serde(default)]
+    pub sidebar_panes: Vec<String>,
+
+    /// The WezTerm server `sidebar_panes` was recorded under.
+    ///
+    /// A restarted server hands out the same small pane ids again, and an id
+    /// recorded before the restart names an unrelated pane now.
+    #[serde(default)]
+    pub sidebar_boot_id: Option<String>,
 }
 
 /// Tracks which pane last-done navigated to, so repeated presses cycle

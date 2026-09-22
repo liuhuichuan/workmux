@@ -96,6 +96,7 @@ Without this configuration, the dashboard can display agents from all workspaces
 
 - Cross-workspace jumping requires the Lua handler above
 - Agent status icons do not appear in tab titles; the dashboard (and, on Windows, the sidebar) shows the status instead
+- Sidebar panes are tracked by the ids workmux records in its settings file, not by title: WezTerm applies a pane's title only on its focused tab, so a sidebar started by hand (`_sidebar-run`) is found only while its tab is focused
 - On Windows, `wezterm cli list-clients` reports nothing, so host-window focus is read from the active tab: "the window is focused" and "the tab is active" are the same signal
 - Some edge cases may not be as thoroughly tested as the tmux backend
 

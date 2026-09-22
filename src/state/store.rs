@@ -1827,6 +1827,8 @@ mod tests {
             sidebar_height: None,
             sidebar_filter: None,
             sidebar_sleeping: None,
+            sidebar_panes: vec!["21".to_string()],
+            sidebar_boot_id: Some("wezterm:1".to_string()),
         };
 
         store.save_settings(&settings).unwrap();
@@ -1836,6 +1838,8 @@ mod tests {
         assert_eq!(loaded.hide_stale, settings.hide_stale);
         assert_eq!(loaded.preview_size, settings.preview_size);
         assert_eq!(loaded.last_pane_id, settings.last_pane_id);
+        assert_eq!(loaded.sidebar_panes, settings.sidebar_panes);
+        assert_eq!(loaded.sidebar_boot_id, settings.sidebar_boot_id);
     }
 
     #[test]
