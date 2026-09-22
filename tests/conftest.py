@@ -185,7 +185,9 @@ class MuxEnvironment(ABC):
 
         # Base environment setup
         self.env = os.environ.copy()
-        self.env["PATH"] = f"{self.fake_bin_dir}:{self.env.get('PATH', '')}"
+        self.env["PATH"] = os.pathsep.join(
+            [str(self.fake_bin_dir), self.env.get("PATH", "")]
+        )
         self.env["TMPDIR"] = str(self.tmp_path)
         self.env["HOME"] = str(self.home_path)
         # Explicitly set XDG_STATE_HOME to ensure state files are isolated
@@ -234,6 +236,8 @@ class MuxEnvironment(ABC):
             env=self.env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         if check and result.returncode != 0:
@@ -686,7 +690,12 @@ def skip_if_backend_unavailable(backend: str):
         if not shutil.which("tmux"):
             pytest.skip("tmux not installed")
         result = subprocess.run(
-            ["tmux", "-V"], capture_output=True, text=True, check=False
+            ["tmux", "-V"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
         )
         if result.returncode != 0:
             pytest.skip("tmux not available")
@@ -694,7 +703,12 @@ def skip_if_backend_unavailable(backend: str):
         if not shutil.which("wezterm"):
             pytest.skip("wezterm not installed")
         result = subprocess.run(
-            ["wezterm", "cli", "list"], capture_output=True, text=True, check=False
+            ["wezterm", "cli", "list"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
         )
         if result.returncode != 0:
             pytest.skip("wezterm not running or not available")
@@ -1339,10 +1353,22 @@ class WorkmuxCommandResult:
 def workmux_exe_path() -> Path:
     """
     Returns the path to the local workmux build for testing.
+
+    Set WORKMUX_BIN to test a build that lives outside the default cargo
+    output, which is what a separate target directory produces. The default
+    path carries a `.exe` suffix on Windows.
     """
-    local_path = Path(__file__).parent.parent / "target/debug/workmux"
+    name = "workmux.exe" if os.name == "nt" else "workmux"
+    override = os.environ.get("WORKMUX_BIN")
+    local_path = (
+        Path(override)
+        if override
+        else Path(__file__).parent.parent / "target/debug" / name
+    )
     if not local_path.exists():
-        pytest.fail("Could not find workmux executable. Run 'cargo build' first.")
+        pytest.fail(
+            f"Could not find workmux executable at {local_path}. Run 'cargo build' first."
+        )
     return local_path
 
 
@@ -1505,6 +1531,97 @@ def get_scripts_dir(env: MuxEnvironment) -> Path:
     return env._scripts_dir
 
 
+IS_WINDOWS = os.name == "nt"
+
+# A pane command on Windows starts cmd.exe, hands off to workmux and waits for
+# a handshake; that leg is a few seconds slower than the tmux one the POSIX
+# budget was tuned for, and a cold first run in a fresh temp repo is slower
+# still.
+WINDOWS_COMMAND_TIMEOUT = 30.0
+
+
+def pane_quote(value: Any) -> str:
+    """Quote a word for the shell that runs inside the pane."""
+    text = str(value)
+    if IS_WINDOWS:
+        return f'"{text}"'
+    return shlex.quote(text)
+
+
+def pane_script_path(env: MuxEnvironment, name: str) -> Path:
+    """Path of a helper script the pane's shell can run."""
+    suffix = ".cmd" if IS_WINDOWS else ".sh"
+    return get_scripts_dir(env) / f"{name}{suffix}"
+
+
+def pane_invocation(script: Path) -> str:
+    """The words that make the pane's shell run a helper script.
+
+    Invoke the interpreter directly: cold shebang execution on macOS can stall
+    before the script body starts, consuming the command's wait budget, and
+    cmd.exe has no shebang to execute at all.
+    """
+    if IS_WINDOWS:
+        return pane_quote(script)
+    return f"/bin/sh {shlex.quote(str(script))}"
+
+
+def pane_env_lines(env_vars: Dict[str, str]) -> str:
+    """Lines that set environment variables for the pane's shell."""
+    if IS_WINDOWS:
+        return "\n".join(f'set "{key}={value}"' for key, value in env_vars.items())
+    return "\n".join(
+        f"export {key}={shlex.quote(str(value))}" for key, value in env_vars.items()
+    )
+
+
+def pane_cd(path: Path) -> str:
+    """A line that makes the pane's shell work relative to `path`."""
+    if IS_WINDOWS:
+        return f"cd /d {pane_quote(path)}"
+    return f"cd {shlex.quote(str(path))}"
+
+
+def pane_echo(text: str, path: Path) -> str:
+    """A line that writes `text` to a file the test can poll for."""
+    if IS_WINDOWS:
+        return f"echo {text}> {pane_quote(path)}"
+    return f"echo {text} > {shlex.quote(str(path))}"
+
+
+def pane_exit_status(path: Path) -> str:
+    """A line that writes the previous command's exit code to a file."""
+    if IS_WINDOWS:
+        # The space before `>` matters: `echo 0> file` is a handle redirect,
+        # not an echo, and leaves the file empty.
+        return f"echo %ERRORLEVEL% > {pane_quote(path)}"
+    return f"echo $? > {shlex.quote(str(path))}"
+
+
+def pane_stdin_input(env: MuxEnvironment, text: str) -> str:
+    """Redirect `text` into the command's stdin, adding no newline."""
+    if IS_WINDOWS:
+        # cmd.exe has no printf, so hand the bytes over as a file.
+        stdin_file = get_scripts_dir(env) / "workmux_stdin.txt"
+        stdin_file.write_bytes(text.encode("utf-8"))
+        return f"< {pane_quote(stdin_file)} "
+    return f"printf %s {shlex.quote(text)} | "
+
+
+def norm_path(value: Any) -> str:
+    """A path in one form, for comparing it against workmux's own output.
+
+    Workmux reports the paths Git gives it, and Git writes `C:/dir` on Windows
+    while `Path` renders `C:\\dir`; both name the same directory.
+    """
+    return str(value).replace("\\", "/")
+
+
+def read_workmux_text(path: Path) -> str:
+    """Read a file workmux wrote: its output is UTF-8 whatever the locale."""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
 def make_env_script(env: MuxEnvironment, command: str, env_vars: dict[str, str]) -> str:
     """Create a script file that sets environment variables and runs a command.
 
@@ -1520,17 +1637,18 @@ def make_env_script(env: MuxEnvironment, command: str, env_vars: dict[str, str])
     """
     global _script_counter
     _script_counter += 1
-    script_file = get_scripts_dir(env) / f"env_cmd_{_script_counter}.sh"
+    script_file = pane_script_path(env, f"env_cmd_{_script_counter}")
 
-    exports = "\n".join(f"export {k}={shlex.quote(v)}" for k, v in env_vars.items())
-    script_content = f"""#!/bin/sh
+    if IS_WINDOWS:
+        script_content = f"@echo off\n{pane_env_lines(env_vars)}\n{command}\n"
+    else:
+        exports = "\n".join(f"export {k}={shlex.quote(v)}" for k, v in env_vars.items())
+        script_content = f"""#!/bin/sh
 {exports}
 {command}
 """
     script_file.write_text(script_content)
-    # Invoke the interpreter directly: cold shebang execution on macOS can
-    # stall before the script body starts, consuming the command's wait budget.
-    return f"/bin/sh {shlex.quote(str(script_file))}"
+    return pane_invocation(script_file)
 
 
 def get_session_name(branch_name: str) -> str:
@@ -1553,7 +1671,7 @@ def run_workmux_command(
     working_dir: Optional[Path] = None,
     stdin_input: Optional[str] = None,
     pre_run_env: Optional[dict] = None,
-    timeout: float = 10.0,
+    timeout: float = WINDOWS_COMMAND_TIMEOUT,
 ) -> WorkmuxCommandResult:
     """
     Helper to run a workmux command inside the isolated multiplexer session.
@@ -1576,7 +1694,7 @@ def run_workmux_command(
     stdout_file = scripts_dir / "workmux_stdout.txt"
     stderr_file = scripts_dir / "workmux_stderr.txt"
     exit_code_file = scripts_dir / "workmux_exit_code.txt"
-    script_file = scripts_dir / "workmux_run.sh"
+    script_file = pane_script_path(env, "workmux_run")
 
     for f in [stdout_file, stderr_file, exit_code_file]:
         if f.exists():
@@ -1588,37 +1706,42 @@ def run_workmux_command(
 
     workdir = working_dir if working_dir is not None else repo_path
 
-    # Handle stdin piping via printf
+    # Handle stdin piping: printf for sh, a file for cmd.exe.
     pipe_cmd = ""
     if stdin_input is not None:
-        pipe_cmd = f"printf %s {shlex.quote(stdin_input)} | "
+        pipe_cmd = pane_stdin_input(env, stdin_input)
 
-    # Build extra env exports
-    extra_env_lines = ""
-    if pre_run_env:
-        extra_env_lines = (
-            "\n".join(f"export {k}={shlex.quote(v)}" for k, v in pre_run_env.items())
-            + "\n"
-        )
+    env_vars = {
+        "PATH": env.env["PATH"],
+        "TMPDIR": env.env.get("TMPDIR") or tempfile.gettempdir(),
+        "HOME": env.env.get("HOME", ""),
+        "SHELL": env.env.get("SHELL", os.environ.get("SHELL", "/bin/sh")),
+        "WORKMUX_TEST": "1",
+    }
+    env_vars.update(pre_run_env or {})
 
     # Write the command to a script file to avoid tmux send-keys line length limits.
     # The PATH can be very long in test environments, causing command truncation.
-    exit_trap = f"echo $? > {shlex.quote(str(exit_code_file))}"
-    script_content = f"""#!/bin/sh
+    if IS_WINDOWS:
+        script_content = (
+            "@echo off\n"
+            f"{pane_env_lines(env_vars)}\n"
+            f"{pane_cd(workdir)}\n"
+            f"{pipe_cmd}{pane_quote(workmux_exe_path)} {command} "
+            f"> {pane_quote(stdout_file)} 2> {pane_quote(stderr_file)}\n"
+            f"{pane_exit_status(exit_code_file)}\n"
+        )
+    else:
+        exit_trap = f"echo $? > {shlex.quote(str(exit_code_file))}"
+        script_content = f"""#!/bin/sh
 trap {shlex.quote(exit_trap)} EXIT
-export PATH={shlex.quote(env.env["PATH"])}
-export TMPDIR={shlex.quote(env.env.get("TMPDIR", "/tmp"))}
-export HOME={shlex.quote(env.env.get("HOME", ""))}
-export SHELL={shlex.quote(env.env.get("SHELL", os.environ.get("SHELL", "/bin/sh")))}
-export WORKMUX_TEST=1
-{extra_env_lines}cd {shlex.quote(str(workdir))}
+{pane_env_lines(env_vars)}
+{pane_cd(workdir)}
 {pipe_cmd}{shlex.quote(str(workmux_exe_path))} {command} > {shlex.quote(str(stdout_file))} 2> {shlex.quote(str(stderr_file))}
 """
     script_file.write_text(script_content)
 
-    # Read the script through its interpreter, avoiding cold shebang startup
-    # delays before the command can execute (as in make_env_script).
-    env.send_keys("test:", f"/bin/sh {shlex.quote(str(script_file))}", enter=True)
+    env.send_keys("test:", pane_invocation(script_file), enter=True)
 
     if not poll_until_file_has_content(exit_code_file, timeout=timeout):
         # Capture pane content for debugging
@@ -1628,9 +1751,9 @@ export WORKMUX_TEST=1
         )
 
     result = WorkmuxCommandResult(
-        exit_code=int(exit_code_file.read_text().strip()),
-        stdout=stdout_file.read_text() if stdout_file.exists() else "",
-        stderr=stderr_file.read_text() if stderr_file.exists() else "",
+        exit_code=int(read_workmux_text(exit_code_file).strip()),
+        stdout=read_workmux_text(stdout_file) if stdout_file.exists() else "",
+        stderr=read_workmux_text(stderr_file) if stderr_file.exists() else "",
     )
 
     if expect_fail:

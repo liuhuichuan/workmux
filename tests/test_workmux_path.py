@@ -3,6 +3,7 @@ from pathlib import Path
 from .conftest import (
     MuxEnvironment,
     get_worktree_path,
+    norm_path,
     run_workmux_add,
     run_workmux_command,
     write_workmux_config,
@@ -23,7 +24,7 @@ def test_path_returns_worktree_path(
     )
 
     expected_path = get_worktree_path(mux_repo_path, branch_name)
-    assert result.stdout.strip() == str(expected_path)
+    assert norm_path(result.stdout.strip()) == norm_path(expected_path)
 
 
 def test_path_fails_for_nonexistent_worktree(
