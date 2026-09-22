@@ -54,6 +54,7 @@ def test_init_fails_if_config_exists(
     assert config_file_path.read_text() == preexisting_content
 
 
+@pytest.mark.posix_only  # a POSIX mode bit is how this makes a directory unwritable
 def test_init_fails_in_readonly_directory(
     mux_server: MuxEnvironment, workmux_exe_path: Path
 ):

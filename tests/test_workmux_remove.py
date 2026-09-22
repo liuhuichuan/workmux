@@ -16,6 +16,7 @@ from .conftest import (
     get_scripts_dir,
     get_window_name,
     get_worktree_path,
+    park_worktree,
     poll_until,
     run_workmux_add,
     run_workmux_command,
@@ -1500,7 +1501,7 @@ def test_absent_locked_worktree_keep_branch_removes_registration(
     worktree_path = get_worktree_path(mux_repo_path, branch_name)
     parked_path = worktree_path.with_name(f"{worktree_path.name}-parked")
     env.run_command(["git", "worktree", "lock", str(worktree_path)], cwd=mux_repo_path)
-    worktree_path.rename(parked_path)
+    park_worktree(env, branch_name, worktree_path, parked_path)
 
     run_workmux_remove(
         env,

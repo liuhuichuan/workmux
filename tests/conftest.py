@@ -1550,6 +1550,37 @@ def get_window_name(branch_name: str) -> str:
     return f"{DEFAULT_WINDOW_PREFIX}{handle}"
 
 
+def park_worktree(
+    env: MuxEnvironment,
+    branch_name: str,
+    worktree_path: Path,
+    parked_path: Path,
+) -> None:
+    """Move a worktree directory aside, leaving its git registration behind.
+
+    Windows will not move a directory a process is sitting in, and the pane the
+    worktree was opened in sits in it. Closing that window is what makes the
+    move possible, and the directory is released a moment after the process
+    holding it goes. POSIX holds no such handle: the window stays open there
+    and a test sees the worktree exactly as it did before.
+    """
+    if IS_WINDOWS:
+        window_name = get_window_name(branch_name)
+        if window_name in env.list_windows():
+            env.kill_window(window_name)
+            poll_until(lambda: window_name not in env.list_windows(), timeout=20.0)
+
+    deadline = time.monotonic() + 20.0
+    while True:
+        try:
+            worktree_path.rename(parked_path)
+            return
+        except PermissionError:
+            if not IS_WINDOWS or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.1)
+
+
 # Global counter to generate unique script names
 _script_counter = 0
 
