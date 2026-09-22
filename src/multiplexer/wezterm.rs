@@ -73,6 +73,19 @@ fn socket_boot_id(socket: Option<PathBuf>) -> Option<String> {
     Some(format!("wezterm:{}", since_epoch.as_millis()))
 }
 
+/// The pane this process runs in, as WezTerm publishes it in `WEZTERM_PANE`.
+///
+/// `wezterm cli list` cannot answer this: `is_active` marks the active pane of
+/// *every* tab, so the first active pane in that list belongs to whichever tab
+/// comes first, which is another window's pane whenever the caller's tab is not
+/// the first one. Whitespace-only counts as absent.
+fn pane_id_from_env(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 /// WezTerm pane information from `wezterm cli list --format json`
 #[derive(Debug, Deserialize)]
 struct WezTermPane {
@@ -504,9 +517,9 @@ impl Multiplexer for WezTermBackend {
     }
 
     fn current_pane_id(&self) -> Option<String> {
-        // WEZTERM_PANE is reliable when WezTerm is properly configured
-        // (default_gui_startup_args = { 'connect', 'unix' })
-        std::env::var("WEZTERM_PANE").ok()
+        // Every pane WezTerm spawns inherits WEZTERM_PANE, whether the GUI owns
+        // the pane directly or attached to a mux server first.
+        pane_id_from_env(std::env::var("WEZTERM_PANE").ok().as_deref())
     }
 
     fn get_client_active_pane_path(&self) -> Result<PathBuf> {
@@ -937,13 +950,7 @@ impl Multiplexer for WezTermBackend {
     }
 
     fn active_pane_id(&self) -> Option<String> {
-        // Query WezTerm for the active pane
-        self.list_panes().ok().and_then(|panes| {
-            panes
-                .into_iter()
-                .find(|p| p.is_active)
-                .map(|p| p.pane_id.to_string())
-        })
+        pane_id_from_env(std::env::var("WEZTERM_PANE").ok().as_deref())
     }
 
     fn get_live_pane_info(&self, pane_id: &str) -> Result<Option<LivePaneInfo>> {
@@ -1097,6 +1104,22 @@ mod tests {
             cursor_x: 0,
             cursor_y: 0,
         }
+    }
+
+    /// The caller's pane is the one WezTerm names in the environment. `cli list`
+    /// cannot stand in for it: `is_active` is set on the active pane of every
+    /// tab, so scanning that list picks a pane out of whichever tab is first.
+    #[test]
+    fn pane_id_from_env_reads_the_callers_own_pane() {
+        assert_eq!(pane_id_from_env(Some("12")), Some("12".to_string()));
+        assert_eq!(pane_id_from_env(Some(" 12 ")), Some("12".to_string()));
+    }
+
+    #[test]
+    fn pane_id_from_env_treats_blank_as_absent() {
+        assert_eq!(pane_id_from_env(None), None);
+        assert_eq!(pane_id_from_env(Some("")), None);
+        assert_eq!(pane_id_from_env(Some("   ")), None);
     }
 
     /// A pane of the given extent, placed at the given cell offset in `tab`.
