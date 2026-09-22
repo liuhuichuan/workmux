@@ -1,5 +1,8 @@
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
@@ -175,16 +178,85 @@ fn status_entry(
     }
 }
 
+/// Repository facts every worktree of one repository shares an answer to.
+///
+/// The default branch, the ref to compare against, and the branches not merged
+/// into it are the repository's, not the worktree's that asks for them. Asking
+/// per worktree spent four git processes on them per worktree -- a process
+/// measured about 140 ms here -- so a status covering twenty worktrees paid for
+/// the same answer twenty times.
+#[derive(Default)]
+struct RepositoryBranches {
+    unmerged: HashMap<PathBuf, HashSet<String>>,
+}
+
+impl RepositoryBranches {
+    /// The branches not merged into the base of `worktree`'s repository.
+    fn unmerged_in(&mut self, worktree: &Path) -> Result<&HashSet<String>> {
+        self.held_or_resolved(repository_root(worktree), resolve_unmerged)
+    }
+
+    /// The answer for `repository`, resolved by `resolve` when it is not held.
+    ///
+    /// Split out from `unmerged_in` so that asking twice can be counted, which
+    /// is the whole reason for holding the answer at all.
+    fn held_or_resolved(
+        &mut self,
+        repository: PathBuf,
+        resolve: impl FnOnce(&Path) -> Result<HashSet<String>>,
+    ) -> Result<&HashSet<String>> {
+        match self.unmerged.entry(repository) {
+            Entry::Occupied(held) => Ok(held.into_mut()),
+            Entry::Vacant(slot) => {
+                let resolved = resolve(slot.key())?;
+                Ok(slot.insert(resolved))
+            }
+        }
+    }
+}
+
+/// The repository a worktree belongs to, read off the worktree's `.git` entry.
+///
+/// A linked worktree's `.git` file names the administrative directory git keeps
+/// for it: `<repo>/.git/worktrees/<name>`, or `<bare>/worktrees/<name>` in a
+/// bare repository. Either way the repository is what holds that pair -- the
+/// `.git`'s parent when there is a `.git`, and the directory itself when the
+/// repository is bare. A main worktree has a `.git` directory of its own, and
+/// is the repository.
+fn repository_root(worktree: &Path) -> PathBuf {
+    let Some(admin) = git::linked_worktree_admin_dir(worktree) else {
+        return worktree.to_path_buf();
+    };
+    let worktrees = admin.parent();
+    let above = worktrees.and_then(Path::parent);
+    match above.and_then(Path::file_name) {
+        Some(name) if name == OsStr::new(".git") => above.and_then(Path::parent),
+        _ => above,
+    }
+    .map(Path::to_path_buf)
+    .unwrap_or_else(|| worktree.to_path_buf())
+}
+
+/// The branches of `repository` that are not merged into its base.
+fn resolve_unmerged(repository: &Path) -> Result<HashSet<String>> {
+    let main = git::get_default_branch_in(Some(repository))?;
+    let base = git::get_merge_base_in(Some(repository), &main)?;
+    git::get_unmerged_branches_in(Some(repository), &base)
+}
+
 /// Compute git info for a worktree path.
 ///
-/// Runs git commands with the worktree's directory as the working dir,
-/// so it works correctly for cross-project agents.
-fn compute_git_info(wt_path: &std::path::Path, branch: &str) -> Result<GitInfo> {
+/// Runs git commands with the worktree's directory as the working dir, so it
+/// works correctly for cross-project agents. The repository-wide questions go
+/// through `branches`, which answers each repository once.
+fn compute_git_info(
+    wt_path: &Path,
+    branch: &str,
+    branches: &mut RepositoryBranches,
+) -> Result<GitInfo> {
     let has_staged = git::has_staged_changes(wt_path)?;
     let has_unstaged = git::has_unstaged_changes(wt_path)?;
-    let main = git::get_default_branch_in(Some(wt_path))?;
-    let base = git::get_merge_base_in(Some(wt_path), &main)?;
-    let unmerged = git::get_unmerged_branches_in(Some(wt_path), &base)?;
+    let unmerged = branches.unmerged_in(wt_path)?;
 
     Ok(GitInfo {
         has_staged,
@@ -218,21 +290,12 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
     let mut entries: Vec<StatusEntry> = Vec::new();
     let mut target_errors = Vec::new();
     let repository;
+    let mut branches = RepositoryBranches::default();
 
     if worktrees.is_empty() {
         if !all && git::get_repo_root_if_present()?.is_some() {
             let all_worktrees = git::list_worktrees()?;
             repository = Some(git::get_main_worktree_root()?);
-            let has_scoped_agents = all_worktrees.iter().any(|(wt_path, _)| {
-                !workflow::match_agents_to_worktree(&agent_panes, wt_path).is_empty()
-            });
-            let unmerged_branches = if show_git && has_scoped_agents {
-                let main = git::get_default_branch()?;
-                let base = git::get_merge_base(&main)?;
-                git::get_unmerged_branches(&base)?
-            } else {
-                std::collections::HashSet::new()
-            };
 
             for (wt_path, branch) in &all_worktrees {
                 let matching = workflow::match_agents_to_worktree(&agent_panes, wt_path);
@@ -245,10 +308,11 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
                     .unwrap_or("unknown")
                     .to_string();
                 let git_info = if show_git {
+                    let unmerged = branches.unmerged_in(wt_path)?;
                     Some(GitInfo {
                         has_staged: git::has_staged_changes(wt_path)?,
                         has_unstaged: git::has_unstaged_changes(wt_path)?,
-                        has_unmerged_commits: unmerged_branches.contains(branch),
+                        has_unmerged_commits: unmerged.contains(branch),
                     })
                 } else {
                     None
@@ -280,7 +344,7 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
                     Err(_) => worktree_name.clone(),
                 };
                 let git_info = if show_git {
-                    Some(compute_git_info(&worktree_path, &branch)?)
+                    Some(compute_git_info(&worktree_path, &branch, &mut branches)?)
                 } else {
                     None
                 };
@@ -320,7 +384,7 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
                 Err(_) => worktree_name.clone(),
             };
             let git_info = if show_git {
-                Some(compute_git_info(&wt_path, &branch)?)
+                Some(compute_git_info(&wt_path, &branch, &mut branches)?)
             } else {
                 None
             };
@@ -423,11 +487,114 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     #[test]
     fn git_info_fails_for_non_repository_path() {
         let dir = tempfile::tempdir().unwrap();
+        let mut branches = RepositoryBranches::default();
 
-        assert!(compute_git_info(dir.path(), "feature").is_err());
+        assert!(compute_git_info(dir.path(), "feature", &mut branches).is_err());
+    }
+
+    /// Two worktrees of one repository ask the repository's questions, and the
+    /// answer is the repository's, so only the first worktree pays for it.
+    #[test]
+    fn a_repository_is_resolved_once_however_many_worktrees_ask() {
+        let mut branches = RepositoryBranches::default();
+        let resolutions = Rc::new(Cell::new(0));
+        let resolve = |repository: &Path| -> Result<HashSet<String>> {
+            resolutions.set(resolutions.get() + 1);
+            Ok(HashSet::from([repository.display().to_string()]))
+        };
+
+        let from_one = branches
+            .held_or_resolved(PathBuf::from("/repo"), &resolve)
+            .unwrap()
+            .clone();
+        let from_two = branches
+            .held_or_resolved(PathBuf::from("/repo"), &resolve)
+            .unwrap()
+            .clone();
+
+        assert_eq!(resolutions.get(), 1);
+        assert_eq!(from_one, from_two);
+    }
+
+    /// Two repositories are two answers, so the second one is asked for.
+    #[test]
+    fn another_repository_is_resolved_separately() {
+        let mut branches = RepositoryBranches::default();
+        let resolutions = Rc::new(Cell::new(0));
+        let resolve = |repository: &Path| -> Result<HashSet<String>> {
+            resolutions.set(resolutions.get() + 1);
+            Ok(HashSet::from([repository.display().to_string()]))
+        };
+
+        let from_one = branches
+            .held_or_resolved(PathBuf::from("/one"), &resolve)
+            .unwrap()
+            .clone();
+        let from_two = branches
+            .held_or_resolved(PathBuf::from("/two"), &resolve)
+            .unwrap()
+            .clone();
+
+        assert_eq!(resolutions.get(), 2);
+        assert_eq!(from_one, HashSet::from(["/one".to_string()]));
+        assert_eq!(from_two, HashSet::from(["/two".to_string()]));
+    }
+
+    /// A main worktree has the repository's `.git` directory itself, so it is
+    /// the repository.
+    #[test]
+    fn a_main_worktree_is_its_own_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        test_support::init_repo(dir.path());
+
+        assert_eq!(repository_root(dir.path()), dir.path());
+    }
+
+    /// A linked worktree is not a repository: the administrative directory it
+    /// points at is held inside the repository that added it.
+    #[test]
+    fn a_linked_worktree_reports_the_repository_that_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repository = dir.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        test_support::init_repo(&repository);
+        let worktree = dir.path().join("worktree");
+        test_support::run_git(
+            &repository,
+            &["worktree", "add", worktree.to_str().unwrap()],
+        );
+
+        assert_eq!(repository_root(&worktree), repository);
+    }
+
+    /// A bare repository keeps its worktrees where a main repository keeps
+    /// `.git`, and is still the repository of every worktree it added.
+    #[test]
+    fn a_worktree_of_a_bare_repository_reports_the_bare_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        test_support::init_repo(&source);
+        let bare = dir.path().join("bare");
+        test_support::run_git(
+            dir.path(),
+            &[
+                "clone",
+                "--bare",
+                source.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        let worktree = dir.path().join("worktree");
+        test_support::run_git(&bare, &["worktree", "add", worktree.to_str().unwrap()]);
+
+        assert_eq!(repository_root(&worktree), bare);
     }
 }
