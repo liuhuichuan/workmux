@@ -107,7 +107,7 @@ pub fn get_repo_root_in(workdir: Option<&Path>) -> Result<PathBuf> {
         };
         cmd.run_and_capture_stdout()
     })?;
-    Ok(PathBuf::from(path))
+    Ok(crate::util::path_from_git(&path))
 }
 
 /// Get the root directory of the git repository containing the given path.
@@ -125,7 +125,7 @@ pub fn get_repo_root_for(dir: &Path) -> Result<PathBuf> {
 
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     })?;
-    Ok(PathBuf::from(path))
+    Ok(crate::util::path_from_git(&path))
 }
 
 /// Get the common git directory (shared across all worktrees).

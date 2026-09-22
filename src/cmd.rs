@@ -93,7 +93,7 @@ impl<'a> Cmd<'a> {
         let mut cmd = if command == "git" {
             crate::git::unattended_git(workdir)?
         } else {
-            let mut command = Command::new(command);
+            let mut command = Command::new(crate::util::program_path(command));
             if let Some(dir) = workdir {
                 command.current_dir(dir);
             }
@@ -149,7 +149,7 @@ impl<'a> Cmd<'a> {
         let mut cmd = if command == "git" {
             crate::git::unattended_git(workdir)?
         } else {
-            let mut command = Command::new(command);
+            let mut command = Command::new(crate::util::program_path(command));
             if let Some(dir) = workdir {
                 command.current_dir(dir);
             }
@@ -274,7 +274,7 @@ pub fn shell_command_with_env_mode(
         return Err(anyhow!("'hook_shell' executable must not be empty"));
     }
 
-    let mut cmd = Command::new(executable);
+    let mut cmd = Command::new(crate::util::program_path(executable));
     cmd.args(args);
     crate::shell::append_snippet(&mut cmd, executable, command);
     cmd.current_dir(workdir);

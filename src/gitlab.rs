@@ -121,7 +121,7 @@ impl GlabContext {
     }
 
     fn json<T: serde::de::DeserializeOwned>(&self, args: &[&str]) -> Result<T> {
-        let mut command = Command::new("glab");
+        let mut command = Command::new(crate::util::program_path("glab"));
         git::clear_ambient_git_env(&mut command);
         let output = command
             .current_dir(self.directory.path())

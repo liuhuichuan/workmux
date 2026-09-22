@@ -9,6 +9,14 @@ use tracing::debug;
 
 use crate::util::{FileLock, write_atomic};
 
+/// The `gh` this machine has, as a shell would find it.
+///
+/// Windows starts what it has as an executable image, and an install that is a
+/// `.cmd` -- npm and scoop both make one -- reaches a direct spawn no other way.
+fn gh() -> Command {
+    Command::new(crate::util::program_path("gh"))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PrDetails {
     #[serde(rename = "headRefName")]
@@ -311,7 +319,7 @@ struct PrListResult {
 pub fn find_pr_by_head_ref(owner: &str, branch: &str) -> Result<Option<PrSummary>> {
     // gh pr list --head only matches branch name, not owner:branch format
     // So we query by branch and filter by owner in the results
-    let output = Command::new("gh")
+    let output = gh()
         .args([
             "pr",
             "list",
@@ -390,7 +398,7 @@ pub fn list_open_prs(repo_root: &Path) -> Result<Vec<PrListEntry>> {
         author: Author,
     }
 
-    let output = Command::new("gh")
+    let output = gh()
         .current_dir(repo_root)
         .args([
             "pr",
@@ -441,7 +449,7 @@ pub fn get_pr_details(pr_number: u32) -> Result<PrDetails> {
 pub fn get_pr_details_in(repo_root: Option<&Path>, pr_number: u32) -> Result<PrDetails> {
     // Fetch PR details using gh CLI
     // Note: We don't pre-check with 'which' because it doesn't respect test PATH modifications
-    let mut command = Command::new("gh");
+    let mut command = gh();
     if let Some(path) = repo_root {
         command.current_dir(path);
     }
@@ -495,7 +503,7 @@ fn run_pr_list(
     args: &[&str],
     json_fields: &str,
 ) -> std::io::Result<std::process::Output> {
-    let mut command = Command::new("gh");
+    let mut command = gh();
     if let Some(path) = repo_root {
         command.current_dir(path);
     }
@@ -751,7 +759,7 @@ fn get_repo_context(repo_root: &Path) -> Result<ResolvedRepoContext> {
         return Ok(context.clone());
     }
 
-    let output = Command::new("gh")
+    let output = gh()
         .current_dir(repo_root)
         .args(["repo", "view", "--json", "owner,name,url"])
         .output()
@@ -965,7 +973,7 @@ fn build_batch_body(remotes: &[RemoteQuery]) -> Result<Vec<u8>> {
 }
 
 fn run_graphql(hostname: &str, body: &[u8]) -> Result<GraphqlCommandResponse> {
-    let mut child = Command::new("gh")
+    let mut child = gh()
         .args(["api", "graphql", "--hostname", hostname, "--input", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

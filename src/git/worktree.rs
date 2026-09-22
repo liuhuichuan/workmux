@@ -252,7 +252,7 @@ pub(super) fn parse_worktree_list_porcelain(output: &str) -> Result<Vec<(PathBuf
 
         for line in block.lines() {
             if let Some(p) = line.strip_prefix("worktree ") {
-                path = Some(PathBuf::from(p));
+                path = Some(crate::util::path_from_git(p));
             } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
                 branch = Some(b.to_string());
             } else if line.trim() == "detached" {
@@ -638,7 +638,7 @@ pub fn get_main_worktree_root_in(workdir: Option<&Path>) -> Result<PathBuf> {
 
         for line in first_block.lines() {
             if let Some(p) = line.strip_prefix("worktree ") {
-                path = Some(PathBuf::from(p));
+                path = Some(crate::util::path_from_git(p));
             } else if line.trim() == "bare" {
                 is_bare = true;
             }
@@ -675,6 +675,23 @@ mod tests {
     use crate::test_support;
     use std::path::PathBuf;
     use std::process::Command;
+
+    /// Git prints a listing's paths with forward slashes on every platform.
+    /// They are read back as paths of this machine -- compared with the paths
+    /// workmux builds, printed in `workmux list --json`, opened on disk.
+    #[test]
+    fn a_listed_path_is_written_the_way_this_machine_writes_it() {
+        let listed = "worktree C:/repo/feature\nbranch refs/heads/feature\n";
+
+        let worktrees = parse_worktree_list_porcelain(listed).unwrap();
+
+        let expected = if cfg!(windows) {
+            r"C:\repo\feature"
+        } else {
+            "C:/repo/feature"
+        };
+        assert_eq!(worktrees[0].0.to_string_lossy(), expected);
+    }
 
     /// Every key a listing asks for comes out of one reading of git config.
     /// The keys used to be fetched one `git config` process at a time.

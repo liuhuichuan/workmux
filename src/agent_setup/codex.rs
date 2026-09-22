@@ -89,21 +89,13 @@ pub fn unreviewed_hooks() -> Option<Vec<UnreviewedHook>> {
 
 /// Command that starts a Codex app server speaking JSON-RPC on stdio.
 ///
-/// A Windows Codex is usually a `.cmd` shim, which `CreateProcess` will not
-/// start on its own, so the shell there does the lookup.
+/// A Windows Codex is usually a `.cmd` shim, which a direct spawn does not find
+/// by name: looking it up the way a shell does is what starts it, and taking
+/// the path back keeps the app server's arguments out of a shell's hands.
 fn app_server_command() -> Command {
-    #[cfg(windows)]
-    {
-        let mut command = Command::new("cmd");
-        command.args(["/c", "codex", "app-server"]);
-        command
-    }
-    #[cfg(not(windows))]
-    {
-        let mut command = Command::new("codex");
-        command.arg("app-server");
-        command
-    }
+    let mut command = Command::new(crate::util::program_path("codex"));
+    command.arg("app-server");
+    command
 }
 
 /// Ask an app server for its hook list, or `None` if it does not answer.

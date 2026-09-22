@@ -339,6 +339,83 @@ fn strip_verbatim_prefix(path: &Path) -> Option<std::ffi::OsString> {
     }))
 }
 
+/// The path a Git command printed, as this machine writes it.
+///
+/// Git prints paths the way it accepts them: with forward slashes on every
+/// platform. A path workmux read out of Git is a path on this machine -- it
+/// gets compared, opened and printed back to the user -- and Windows takes
+/// either slash when it is opened, but not when it is read: `C:/repo` in
+/// `workmux list --json` is a foreign-looking path in a Windows shell, and it
+/// is not the string the same path prints as anywhere else.
+pub fn path_from_git(text: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(text.replace('/', "\\"))
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(text)
+    }
+}
+
+/// Extensions Windows looks a bare name up with, in the order it tries them.
+#[cfg(any(windows, test))]
+const SHELL_PATH_EXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+/// The program this machine runs for a bare command name.
+///
+/// Windows starts what it has as an executable image, and `PATH` alone does not
+/// find a tool that npm or scoop installed as `NAME.cmd`: a shell finds it by
+/// name and a direct spawn does not. Looking the name up the way a shell does
+/// hands back a path to spawn, and `Command` runs a batch file given to it by
+/// path with the escaping that takes.
+#[cfg(windows)]
+pub fn program_path(name: &str) -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| SHELL_PATH_EXT.to_string());
+    look_up_program(name, &path, &extensions)
+}
+
+/// A program this machine starts by name, wherever `PATH` holds it.
+#[cfg(not(windows))]
+pub fn program_path(name: &str) -> PathBuf {
+    PathBuf::from(name)
+}
+
+/// Look a bare name up along `path` as a shell would: the name with each of
+/// `extensions`, directory by directory.
+///
+/// A name that already says where it is, or carries an extension of its own, is
+/// the answer, and a name nothing answers to stands as it came in -- the spawn
+/// that follows is what has to report that.
+///
+/// The bare name itself is not one of the candidates: Windows starts an image,
+/// and a file whose name has no extension is not one. Choosing such a file --
+/// a shell script a Git installation left in a directory on `PATH`, say --
+/// would answer with a path that cannot be started at all.
+#[cfg(any(windows, test))]
+fn look_up_program(name: &str, path: &OsStr, extensions: &str) -> PathBuf {
+    if name.contains(['\\', '/']) || Path::new(name).extension().is_some() {
+        return PathBuf::from(name);
+    }
+
+    let named: Vec<String> = extensions
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| format!("{name}{extension}"))
+        .collect();
+
+    for directory in std::env::split_paths(path) {
+        for candidate in &named {
+            let path = directory.join(candidate);
+            if path.is_file() {
+                return path;
+            }
+        }
+    }
+    PathBuf::from(name)
+}
+
 /// Lexically normalize a path by resolving `.` and `..` components without
 /// touching the filesystem.  Unlike `canonicalize()` this works even when the
 /// target path does not exist yet.
@@ -512,6 +589,66 @@ pub fn format_elapsed_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool Windows installed as a batch file is not something a direct
+    /// spawn finds, and a shell finds it by name: workmux looks it up the way
+    /// the shell does, extension by extension, as `PATHEXT` orders them.
+    #[test]
+    fn a_tool_that_is_a_batch_file_is_looked_up_like_a_shell_looks_it_up() {
+        /// A name the way Windows compares it: the disk answers either spelling.
+        fn named(path: &Path) -> String {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().as_os_str();
+        std::fs::write(dir.path().join("gh.cmd"), "@echo off\n").unwrap();
+
+        let found = look_up_program("gh", path, SHELL_PATH_EXT);
+        assert_eq!(named(&found), "gh.cmd");
+        assert!(found.is_file(), "{found:?} is not the tool that is there");
+
+        // An image outranks the batch file, as it does in a shell.
+        std::fs::write(dir.path().join("gh.exe"), "").unwrap();
+        assert_eq!(named(&look_up_program("gh", path, SHELL_PATH_EXT)), "gh.exe");
+
+        // A name that says where it is, or carries an extension, stands.
+        assert_eq!(
+            look_up_program(r"C:\tools\gh.cmd", path, SHELL_PATH_EXT),
+            PathBuf::from(r"C:\tools\gh.cmd")
+        );
+        // A file with no extension is not something Windows starts, so it does
+        // not answer for the name either.
+        std::fs::write(dir.path().join("extensionless"), "").unwrap();
+        assert_eq!(
+            look_up_program("extensionless", path, SHELL_PATH_EXT),
+            PathBuf::from("extensionless")
+        );
+        // And a name nothing answers to stands for the spawn to report.
+        assert_eq!(
+            look_up_program("nothing-by-this-name", path, SHELL_PATH_EXT),
+            PathBuf::from("nothing-by-this-name")
+        );
+    }
+
+    /// Git hands back `C:/repo` on Windows too, and a path workmux prints is
+    /// read in a Windows shell, where that is not a path anyone typed.
+    #[test]
+    fn a_path_git_printed_takes_this_platforms_separators() {
+        let expected = if cfg!(windows) {
+            r"C:\repo\worktree"
+        } else {
+            "C:/repo/worktree"
+        };
+
+        assert_eq!(
+            path_from_git("C:/repo/worktree").to_string_lossy(),
+            expected
+        );
+    }
 
     #[test]
     fn write_atomic_replaces_target_and_removes_temp() {
