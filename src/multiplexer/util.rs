@@ -37,6 +37,50 @@ pub fn is_posix_shell(shell: &str) -> bool {
     matches!(shell_name, "bash" | "zsh" | "sh" | "dash" | "ksh" | "ash")
 }
 
+/// Canonical spelling of a backend instance identity.
+///
+/// The instance identity is both the state file name and the context that every
+/// reconciliation is compared against, so two spellings of one socket fork into
+/// two independent identities: an agent registered under one spelling is
+/// invisible to a process that spells the socket the other way, which `workmux
+/// status` reports as "none match <backend> instance <path>" while the
+/// dashboard simply shows no agents.
+///
+/// Windows is where that bites, because its filesystem accepts `C:/a/b` and
+/// `C:\a\b` interchangeably and ignores case, while WezTerm injects its own
+/// spelling of `WEZTERM_UNIX_SOCKET` into panes that a user's shell may have
+/// exported differently. Unix identities are returned byte for byte as they
+/// are: there the raw value is authoritative, and folding it (resolving
+/// symlinks such as `/tmp` -> `/private/tmp`) would orphan the state of every
+/// existing install.
+pub fn normalize_instance_identity(instance: &str) -> String {
+    #[cfg(windows)]
+    {
+        fold_windows_instance_identity(instance)
+    }
+    #[cfg(not(windows))]
+    {
+        instance.to_string()
+    }
+}
+
+/// The Windows identity fold: unify separators, resolve `.`/`..`, and fold case,
+/// because the Windows filesystem treats all three spellings as one path.
+///
+/// Identities that are not paths (the `default` fallback, a zellij session
+/// name) are left alone.
+#[cfg(windows)]
+fn fold_windows_instance_identity(instance: &str) -> String {
+    let trimmed = instance.trim();
+    if !trimmed.contains(['/', '\\']) {
+        return trimmed.to_string();
+    }
+    crate::util::normalize_path(Path::new(trimmed))
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_lowercase()
+}
+
 /// The shell that evaluates a command workmux sends to a pane, and the launcher
 /// it needs when the pane's own shell cannot evaluate it.
 ///
@@ -442,6 +486,54 @@ pub fn wrap_for_non_posix_shell(command: &str) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_instance_identity_folds_socket_spellings() {
+        // Two spellings of one WezTerm socket: the pane environment injected by
+        // the mux server, and a shell that exported the same socket by hand.
+        assert_eq!(
+            normalize_instance_identity(r"C:\Users\Administrator\.local/share\wezterm\sock"),
+            normalize_instance_identity("C:/users/administrator/.local/share/wezterm/sock"),
+        );
+        assert_eq!(
+            normalize_instance_identity(r"C:\Users\Administrator\.local/share\wezterm\sock"),
+            r"c:\users\administrator\.local\share\wezterm\sock"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_instance_identity_resolves_relative_components() {
+        assert_eq!(
+            normalize_instance_identity(r"C:\sock\dir\..\wezterm\.\sock"),
+            r"c:\sock\wezterm\sock"
+        );
+        assert_eq!(
+            normalize_instance_identity("C:/sock/dir/../wezterm/"),
+            r"c:\sock\wezterm"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_instance_identity_leaves_non_path_identities_alone() {
+        // The `default` fallback and zellij session names are not paths.
+        assert_eq!(normalize_instance_identity("default"), "default");
+        assert_eq!(normalize_instance_identity("dev session"), "dev session");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_instance_identity_is_the_raw_value() {
+        // Folding here would resolve symlinks (`/tmp` -> `/private/tmp`) and
+        // orphan the state of existing installs.
+        assert_eq!(
+            normalize_instance_identity("/tmp/tmux-1000/default"),
+            "/tmp/tmux-1000/default"
+        );
+        assert_eq!(normalize_instance_identity("/tmp/a//b/"), "/tmp/a//b/");
+    }
 
     #[cfg(unix)]
     #[test]

@@ -775,13 +775,16 @@ impl Multiplexer for WezTermBackend {
     fn instance_id(&self) -> String {
         // Use the unix socket path as instance ID so all workspaces on the same
         // WezTerm server share one instance, matching tmux server scope.
-        std::env::var("WEZTERM_UNIX_SOCKET").unwrap_or_else(|_| "default".to_string())
+        std::env::var("WEZTERM_UNIX_SOCKET")
+            .map(|instance| util::normalize_instance_identity(&instance))
+            .unwrap_or_else(|_| "default".to_string())
     }
 
     fn resolve_instance_id(&self) -> Result<String> {
         std::env::var("WEZTERM_UNIX_SOCKET")
             .ok()
             .filter(|instance| !instance.trim().is_empty())
+            .map(|instance| util::normalize_instance_identity(&instance))
             .ok_or_else(|| {
                 anyhow!("WEZTERM_UNIX_SOCKET is required to resolve the WezTerm instance")
             })
