@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
@@ -414,12 +414,97 @@ pub(super) fn request_refresh(mux: &dyn Multiplexer) {
 
 /// What a poll reads, and what it keeps from one poll to the next.
 ///
+/// What a config file looked like the last time it was read.
+///
+/// A modification time is the whole point: the sidebar exists to show settings
+/// a user edits in a file, and it has to notice the edit. A file that is
+/// rewritten within the same timestamp and to the same length is the one case
+/// this misses, and editing a config by hand cannot hit it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+impl FileStamp {
+    /// The stamp of the file at `path`, or `None` if there is no such file.
+    fn read(path: &std::path::Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })
+    }
+}
+
+/// Whether the file at `path` no longer matches the stamp it was given.
+///
+/// A file that was not there and still is not has not changed; one that
+/// appeared, disappeared or was written to has.
+fn stamp_moved(stamp: Option<FileStamp>, path: &std::path::Path) -> bool {
+    FileStamp::read(path) != stamp
+}
+
+/// The config the sidebar renders with, loaded when it changes rather than
+/// when it is asked for.
+///
+/// A sidebar polls once a second for as long as it is open, and every poll used
+/// to load the config: a git process to find the project's, two file reads and
+/// a parse, a third of a second on Windows, spent to arrive at the same answer
+/// every second of every sidebar's life. The files it came from are stat'ed
+/// instead, which costs nothing, and a load only happens when one of them has
+/// moved.
+struct ConfigWatcher {
+    config: Config,
+    global_path: PathBuf,
+    global_stamp: Option<FileStamp>,
+    /// The project config the load settled on, and its stamp. A config that
+    /// appears closer to the working directory than this one is not noticed
+    /// until something else moves; settings a user edits are noticed at once.
+    project: Option<(PathBuf, Option<FileStamp>)>,
+}
+
+impl ConfigWatcher {
+    /// Load the config for this directory and remember what it came from.
+    fn load() -> Self {
+        let (config, location) = Config::load_with_location(None, None).unwrap_or_default();
+        let global_path = crate::config::global_config_path().unwrap_or_default();
+        Self {
+            global_stamp: FileStamp::read(&global_path),
+            global_path,
+            project: location.map(|location| {
+                let stamp = FileStamp::read(&location.config_path);
+                (location.config_path, stamp)
+            }),
+            config,
+        }
+    }
+
+    /// The config, loaded again first if one of its files has changed.
+    fn config(&mut self) -> &Config {
+        if self.stale() {
+            *self = Self::load();
+        }
+        &self.config
+    }
+
+    /// Whether one of the files the config came from has moved.
+    fn stale(&self) -> bool {
+        stamp_moved(self.global_stamp, &self.global_path)
+            || self
+                .project
+                .as_ref()
+                .is_some_and(|(path, stamp)| stamp_moved(*stamp, path))
+    }
+}
+
 /// The store and the cache of already-parsed state files outlive a poll:
 /// without the cache every poll re-reads every agent's file, which is what the
 /// tmux daemon's own cache is for.
 struct Reader<'a> {
     store: StateStore,
     cache: AgentStateCache,
+    config: ConfigWatcher,
     mux: &'a dyn Multiplexer,
 }
 
@@ -428,6 +513,7 @@ impl<'a> Reader<'a> {
         Ok(Self {
             store: StateStore::new()?,
             cache: AgentStateCache::default(),
+            config: ConfigWatcher::load(),
             mux,
         })
     }
@@ -442,10 +528,18 @@ impl<'a> Reader<'a> {
         panes: &wezterm::InstancePanes,
         git_statuses: HashMap<PathBuf, GitStatus>,
     ) -> Result<SidebarSnapshot> {
-        let config = Config::load(None).unwrap_or_default();
-        let position = super::read_sidebar_position(&config);
-        let layout_mode = super::read_sidebar_layout_mode();
-        let filter_mode = super::read_sidebar_filter_mode();
+        // Taken together, and before the store is read: the config borrow ends
+        // here so that the reading below can take the reader mutably.
+        let (position, layout_mode, filter_mode, sort, status_icons) = {
+            let config = self.config.config();
+            (
+                super::read_sidebar_position(config),
+                super::read_sidebar_layout_mode(),
+                super::read_sidebar_filter_mode(),
+                config.sidebar.sort.unwrap_or_default(),
+                config.status_icons.clone(),
+            )
+        };
         // Read per poll rather than once: a server that restarts mid-session
         // hands out pane ids that the state written before it no longer fits.
         let boot_id = self.mux.server_boot_id().ok().flatten();
@@ -487,8 +581,8 @@ impl<'a> Reader<'a> {
             position,
             layout_mode,
             filter_mode,
-            config.sidebar.sort.unwrap_or_default(),
-            &config.status_icons,
+            sort,
+            &status_icons,
             git_statuses,
             HashMap::new(),
             HashMap::new(),
@@ -798,6 +892,106 @@ mod tests {
             title: title.to_string(),
             is_active: false,
         }
+    }
+
+    /// A watcher over the given files, as a load would leave it.
+    fn watcher(global: &std::path::Path, project: Option<&std::path::Path>) -> ConfigWatcher {
+        ConfigWatcher {
+            config: Config::default(),
+            global_path: global.to_path_buf(),
+            global_stamp: FileStamp::read(global),
+            project: project.map(|path| (path.to_path_buf(), FileStamp::read(path))),
+        }
+    }
+
+    /// A config nobody has touched is not read again: this is what keeps a
+    /// poll from being a config load a second, per sidebar.
+    #[test]
+    fn a_config_nobody_touched_is_not_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("config.yaml");
+        let project = dir.path().join(".workmux.yaml");
+        std::fs::write(&global, "agent: claude\n").unwrap();
+        std::fs::write(&project, "agent: claude\n").unwrap();
+
+        let watcher = watcher(&global, Some(&project));
+
+        assert!(!watcher.stale());
+    }
+
+    /// An edit is noticed: the sidebar's settings live in this file.
+    #[test]
+    fn a_config_file_that_is_written_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("config.yaml");
+        std::fs::write(&global, "agent: claude\n").unwrap();
+        let watcher = watcher(&global, None);
+
+        std::fs::write(&global, "agent: claude\nsidebar:\n  sort: name\n").unwrap();
+
+        assert!(watcher.stale());
+    }
+
+    /// A project config written while the sidebar runs is noticed too, which is
+    /// what `workmux init` in that directory leaves behind.
+    #[test]
+    fn a_project_config_that_appears_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("config.yaml");
+        let project = dir.path().join(".workmux.yaml");
+        std::fs::write(&global, "agent: claude\n").unwrap();
+        let watcher = watcher(&global, Some(&project));
+        assert!(!watcher.stale());
+
+        std::fs::write(&project, "agent: claude\n").unwrap();
+
+        assert!(watcher.stale());
+    }
+
+    /// A project config that is removed falls back to the global one, so the
+    /// removal is a change like any other.
+    #[test]
+    fn a_project_config_that_disappears_is_read_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("config.yaml");
+        let project = dir.path().join(".workmux.yaml");
+        std::fs::write(&global, "agent: claude\n").unwrap();
+        std::fs::write(&project, "agent: claude\n").unwrap();
+        let watcher = watcher(&global, Some(&project));
+
+        std::fs::remove_file(&project).unwrap();
+
+        assert!(watcher.stale());
+    }
+
+    /// A user with no config file at all is not a user whose config changed on
+    /// every poll.
+    #[test]
+    fn a_config_file_that_was_never_there_does_not_age_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("config.yaml");
+        let project = dir.path().join(".workmux.yaml");
+
+        let watcher = watcher(&global, Some(&project));
+
+        assert!(!watcher.stale());
+    }
+
+    /// The global config moving is enough on its own, whatever the project
+    /// config is doing.
+    #[test]
+    fn the_global_config_alone_can_age_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("config.yaml");
+        let project = dir.path().join(".workmux.yaml");
+        std::fs::write(&global, "agent: claude\n").unwrap();
+        std::fs::write(&project, "agent: claude\n").unwrap();
+        let watcher = watcher(&global, Some(&project));
+        assert!(!watcher.stale());
+
+        std::fs::write(&global, "agent: claude\nwindow_prefix: wm-\n").unwrap();
+
+        assert!(watcher.stale());
     }
 
     /// The sidebar record, as the settings store keeps it.
