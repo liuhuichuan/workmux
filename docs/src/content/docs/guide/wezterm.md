@@ -17,6 +17,8 @@ That also defines what workmux can see. A pane belongs to exactly one instance, 
 
 Run workmux from inside a WezTerm pane instead of an unrelated terminal. `wezterm cli` needs `$WEZTERM_UNIX_SOCKET` and `$WEZTERM_PANE` from that pane; outside one it has to guess at a socket, and on Windows it fails with `failed to connect to Socket("gui-sock-<pid>")`.
 
+The CLI itself is looked for in four places, and the first that has one wins: beside `$WEZTERM_EXECUTABLE`, on `PATH`, in the directories a Windows install is laid out in, and beside the WezTerm that is running. A portable Windows install, which is in none of the first three, still answers -- the GUI that is running says where it was started from.
+
 ### Sharing one instance across GUI windows
 
 Optional, but useful if you keep several WezTerm windows open and want one workmux to see the agents in all of them: connect every GUI to a mux server so they share a single domain.
