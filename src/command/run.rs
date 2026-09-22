@@ -6,32 +6,29 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 
 use crate::config::SplitDirection;
 use crate::multiplexer::{create_backend, detect_backend};
 use crate::state::run::{RunSpec, cleanup_run, create_run, generate_run_id, read_result};
 use crate::workflow;
 
-/// The command the new pane runs, in the form the hand-off preserves.
+/// The command the new pane runs: this executable, told to execute the spec.
 ///
-/// A pane command reaches the terminal as one argument, and that trip escapes
-/// any `"` in it: `cmd.exe` would then look for a program whose name carries
-/// the backslashes. A script's path survives instead, because cmd accepts a
-/// path with spaces when it is the whole command, so Windows writes the command
-/// into a script in the run directory and hands the pane that path.
-#[cfg(windows)]
-fn pane_command(run_dir: &Path, exec_cmd: &str) -> Result<String> {
-    let script = run_dir.join("run.cmd");
-    std::fs::write(&script, format!("@echo off\r\n{exec_cmd}\r\n"))
-        .context("Failed to write the run script")?;
-    Ok(script.to_string_lossy().into_owned())
-}
-
-/// Unix hands the command over as it is: `sh -c` takes it verbatim.
-#[cfg(unix)]
-fn pane_command(_run_dir: &Path, exec_cmd: &str) -> Result<String> {
-    Ok(exec_cmd.to_string())
+/// The words are handed over as the pane's own program and arguments rather
+/// than as a command string. A command string has to survive a trip that
+/// escapes the quotes in it, which is why a Windows pane command naming an
+/// absolute path used to be written into a script and the script's path handed
+/// over instead -- and a script is a batch file, which a Ctrl+C stops at
+/// "Terminate batch job (Y/N)?" rather than exiting. Arguments are not re-read
+/// on the way, so they need no such care.
+fn pane_argv(exe: &str, run_dir: &Path) -> Vec<String> {
+    vec![
+        exe.to_string(),
+        "_exec".to_string(),
+        "--run-dir".to_string(),
+        run_dir.to_string_lossy().into_owned(),
+    ]
 }
 
 pub fn run(
@@ -70,21 +67,14 @@ pub fn run(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "workmux".to_string());
 
-    // Split pane with _exec command (pass absolute run_dir path)
-    let run_dir_arg = run_dir.to_string_lossy();
-    let exec_cmd = format!(
-        "{} _exec --run-dir {}",
-        crate::shell::snippet_quote(&exe_path),
-        crate::shell::snippet_quote(&run_dir_arg)
-    );
-    let pane_command = pane_command(&run_dir, &exec_cmd)?;
-    let new_pane_id = mux.split_pane(
+    // Split pane, running _exec on the absolute path of the run directory
+    let new_pane_id = mux.split_pane_argv(
         &agent.pane_id,
         &SplitDirection::Vertical,
         &worktree_path,
         None,
         Some(30), // 30% for the command pane
-        Some(&pane_command),
+        &pane_argv(&exe_path, &run_dir),
     )?;
 
     if background {
@@ -197,34 +187,23 @@ fn stream_new_content<W: Write>(file: &mut File, pos: u64, out: &mut W) -> u64 {
 mod tests {
     use super::*;
 
-    /// Windows cannot hand the pane a command naming an absolute path, so the
-    /// command goes into a script and the pane is given the script's path --
-    /// bare, since a quoted one arrives with the quotes escaped.
-    #[cfg(windows)]
+    /// The pane is handed this executable and its arguments, so the run
+    /// directory can name a path with spaces in it without being quoted for
+    /// anyone on the way.
     #[test]
-    fn pane_command_writes_the_exec_command_to_a_script() {
-        let dir = tempfile::tempdir().unwrap();
-        let exec_cmd = r#""C:\Program Files\workmux.exe" _exec --run-dir "C:\runs\1""#;
-
-        let command = pane_command(dir.path(), exec_cmd).unwrap();
-
-        let script = dir.path().join("run.cmd");
-        assert_eq!(command, script.to_string_lossy());
-        assert!(!command.contains('"'));
-        let content = std::fs::read_to_string(&script).unwrap();
-        assert!(
-            content.contains(exec_cmd),
-            "script lost the command: {content:?}"
+    fn the_run_pane_runs_this_executable_on_the_run_directory() {
+        assert_eq!(
+            pane_argv(
+                r"C:\Program Files\workmux.exe",
+                Path::new(r"C:\Temp\workmux runs\42")
+            ),
+            [
+                r"C:\Program Files\workmux.exe",
+                "_exec",
+                "--run-dir",
+                r"C:\Temp\workmux runs\42",
+            ]
         );
-    }
-
-    /// Unix hands the pane the command itself; `sh -c` takes it verbatim.
-    #[cfg(unix)]
-    #[test]
-    fn pane_command_is_the_exec_command_itself() {
-        let dir = tempfile::tempdir().unwrap();
-        let exec_cmd = "/tmp/workmux _exec --run-dir /tmp/runs/1";
-        assert_eq!(pane_command(dir.path(), exec_cmd).unwrap(), exec_cmd);
     }
 
     /// A command's output reaches the caller as the bytes it wrote: a Windows
