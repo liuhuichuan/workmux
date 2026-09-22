@@ -99,6 +99,7 @@ Without this configuration, the dashboard can display agents from all workspaces
 - The sidebar refreshes on events as well as on a timer. tmux wakes the daemon with a signal; here the pane polls, and a state change made by a workmux command leaves a wake-up token in the state store for that poll to read, so a new status does not sit behind the timer. A change made outside workmux (a pane appearing or closing) is noticed by the timer, about a second later
 - Sidebar panes are tracked by the ids workmux records in its settings file, not by title: WezTerm applies a pane's title only on its focused tab, so a sidebar started by hand (`_sidebar-run`) is found only while its tab is focused
 - On Windows, `wezterm cli list-clients` reports nothing, so host-window focus is read from the active tab: "the window is focused" and "the tab is active" are the same signal
+- `wezterm cli` waits on the mux server for as long as the server takes to answer, and a mux can stop answering for good -- this is what a wedged WezTerm GUI looks like. Every call workmux makes runs under a 20-second deadline instead: the call is killed and reported as an error, so a mux that is gone reads as "Failed to list WezTerm panes" rather than taking the caller down with it
 - Some edge cases may not be as thoroughly tested as the tmux backend
 
 ## Credits

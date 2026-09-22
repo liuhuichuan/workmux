@@ -25,6 +25,17 @@ const WEZTERM_CLI: &str = if cfg!(windows) {
     "wezterm"
 };
 
+/// How long a `wezterm cli` call may take before workmux gives up on it.
+///
+/// The CLI has no deadline of its own: it waits for a mux server to answer, and
+/// a mux can stop answering for good -- a wedged WezTerm GUI, which this machine
+/// does reproduce, leaves the caller waiting with no way to report, retry, or
+/// quit. Every call claims a deadline so that a mux which is gone reads as an
+/// error instead. Calls measured here are 69-230 ms idle and up to about five
+/// seconds with six sidebars polling at once, so this is well clear of a busy
+/// mux while staying bounded.
+const WEZTERM_CLI_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Program that speaks `wezterm cli`.
 ///
 /// A Windows install is often portable and never reaches `PATH`, so the bare
@@ -220,7 +231,7 @@ impl WezTermBackend {
     /// Create a wezterm CLI command.
     /// Uses inherited WEZTERM_UNIX_SOCKET from environment.
     fn wezterm_cmd(&self) -> Cmd<'static> {
-        Cmd::new(wezterm_program())
+        Cmd::new(wezterm_program()).timeout(WEZTERM_CLI_TIMEOUT)
     }
 
     /// Query all panes from WezTerm.
@@ -1346,6 +1357,17 @@ mod tests {
         assert!(cmd.starts_with(&deferred_wezterm_program()));
         assert!(cmd.contains(" cli activate-tab --tab-id 7 "));
         assert!(cmd.ends_with(crate::shell::silent_output_suffix()));
+    }
+
+    /// Every call to the CLI goes out under a deadline: the CLI waits for the
+    /// mux forever, and a mux that has stopped answering must not take workmux
+    /// with it.
+    #[test]
+    fn cli_calls_carry_a_deadline() {
+        assert_eq!(
+            WezTermBackend::new().wezterm_cmd().timeout,
+            Some(WEZTERM_CLI_TIMEOUT)
+        );
     }
 
     /// A portable Windows install never reaches `PATH`, so the CLI is looked

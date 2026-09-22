@@ -1,7 +1,12 @@
 use anyhow::{Context, Result, anyhow};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 use tracing::{debug, trace};
+
+/// How often a command with a deadline is checked while it runs.
+const DEADLINE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Duplicate the current process's stderr so it can be given to a child as stdout.
 ///
@@ -29,6 +34,8 @@ pub struct Cmd<'a> {
     command: &'a str,
     args: Vec<&'a str>,
     workdir: Option<&'a Path>,
+    /// The deadline this command runs under, if any.
+    pub(crate) timeout: Option<Duration>,
 }
 
 impl<'a> Cmd<'a> {
@@ -38,7 +45,18 @@ impl<'a> Cmd<'a> {
             command,
             args: Vec::new(),
             workdir: None,
+            timeout: None,
         }
+    }
+
+    /// Give the command a deadline, after which it is killed and fails.
+    ///
+    /// A program that can wait forever on a service stops being a program
+    /// workmux can report on: the caller waits with it. WezTerm's CLI is that
+    /// program, so every call to it carries a deadline.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 
     /// Add a single argument
@@ -66,6 +84,7 @@ impl<'a> Cmd<'a> {
             command,
             args,
             workdir,
+            timeout,
         } = self;
         let workdir_display = workdir.map(|p| p.display().to_string());
 
@@ -80,9 +99,14 @@ impl<'a> Cmd<'a> {
             }
             command
         };
-        let output = cmd.args(&args).output().with_context(|| {
-            format!("Failed to execute command: {} {}", command, args.join(" "))
-        })?;
+        cmd.args(&args);
+        let display = format!("{} {}", command, args.join(" "));
+        let output = match timeout {
+            Some(timeout) => run_with_deadline(cmd, timeout, &display)?,
+            None => cmd
+                .output()
+                .with_context(|| format!("Failed to execute command: {display}"))?,
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -117,6 +141,7 @@ impl<'a> Cmd<'a> {
             command,
             args,
             workdir,
+            timeout,
         } = self;
         let workdir_display = workdir.map(|p| p.display().to_string());
         trace!(command, args = ?args, workdir = ?workdir_display, "cmd:check start");
@@ -130,14 +155,73 @@ impl<'a> Cmd<'a> {
             }
             command
         };
-        let output = cmd.args(&args).output().with_context(|| {
-            format!("Failed to execute command: {} {}", command, args.join(" "))
-        })?;
+        cmd.args(&args);
+        let display = format!("{} {}", command, args.join(" "));
+        let output = match timeout {
+            Some(timeout) => run_with_deadline(cmd, timeout, &display)?,
+            None => cmd
+                .output()
+                .with_context(|| format!("Failed to execute command: {display}"))?,
+        };
 
         let success = output.status.success();
         trace!(command, success, "cmd:check result");
         Ok(success)
     }
+}
+
+/// Run a command to completion, killing it if it outlives `timeout`.
+///
+/// The pipes are drained on their own threads: a child that writes more than a
+/// pipe holds would otherwise block on that write while this side waits for the
+/// child to exit, which turns a deadline into a deadlock. A child killed at the
+/// deadline is reaped before this returns, so the caller can retry.
+fn run_with_deadline(mut cmd: Command, timeout: Duration, display: &str) -> Result<Output> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to execute command: {display}"))?;
+    let stdout = child.stdout.take().map(reader_thread);
+    let stderr = child.stderr.take().map(reader_thread);
+    let deadline = Instant::now() + timeout;
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("Command timed out after {timeout:?}: {display}"));
+            }
+            Ok(None) => std::thread::sleep(DEADLINE_POLL_INTERVAL),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to wait for command: {display}"));
+            }
+        }
+    };
+
+    Ok(Output {
+        status,
+        stdout: drain(stdout),
+        stderr: drain(stderr),
+    })
+}
+
+/// Read one of a child's pipes to the end, off the waiting thread.
+fn reader_thread(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = pipe.read_to_end(&mut buffer);
+        buffer
+    })
+}
+
+fn drain(reader: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    reader
+        .map(|reader| reader.join().unwrap_or_default())
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,6 +316,97 @@ pub fn shell_command_with_env_mode(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A command that stays up far longer than any test waits.
+    fn slow_command() -> Cmd<'static> {
+        if cfg!(windows) {
+            Cmd::new("powershell").args(&["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+        } else {
+            Cmd::new("sh").args(&["-c", "sleep 30"])
+        }
+    }
+
+    fn echo_command() -> Cmd<'static> {
+        if cfg!(windows) {
+            Cmd::new("cmd").args(&["/C", "echo hello"])
+        } else {
+            Cmd::new("sh").args(&["-c", "echo hello"])
+        }
+    }
+
+    fn failing_command() -> Cmd<'static> {
+        if cfg!(windows) {
+            Cmd::new("cmd").args(&["/C", "exit 3"])
+        } else {
+            Cmd::new("sh").args(&["-c", "exit 3"])
+        }
+    }
+
+    /// A command that outlives its deadline is killed and reported, not waited
+    /// on: `wezterm cli` against a mux that has stopped answering is what this
+    /// deadline exists for.
+    #[test]
+    fn a_command_that_outlives_its_deadline_is_killed() {
+        let started = Instant::now();
+        let error = slow_command()
+            .timeout(Duration::from_millis(200))
+            .run()
+            .unwrap_err()
+            .to_string();
+        let waited = started.elapsed();
+
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            waited < Duration::from_secs(15),
+            "the deadline was not honored: {waited:?}"
+        );
+    }
+
+    /// A deadline inside the command's runtime changes nothing about the run.
+    #[test]
+    fn a_command_inside_its_deadline_reports_what_it_wrote() {
+        let output = echo_command()
+            .timeout(Duration::from_secs(60))
+            .run_and_capture_stdout()
+            .unwrap();
+
+        assert_eq!(output, "hello");
+    }
+
+    /// A deadline must not turn a failure into a timeout: the exit status is
+    /// still what the caller reads.
+    #[test]
+    fn a_deadline_does_not_hide_a_failing_command() {
+        let error = failing_command()
+            .timeout(Duration::from_secs(60))
+            .run()
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Command failed"), "{error}");
+    }
+
+    /// More output than the pipes hold must not deadlock the wait: the pipes
+    /// are drained while the command runs, not after it exits.
+    #[test]
+    fn a_command_that_writes_more_than_a_pipe_holds_is_drained() {
+        let cmd = if cfg!(windows) {
+            Cmd::new("cmd").args(&[
+                "/C",
+                "for /L %i in (1,1,3000) do @echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            ])
+        } else {
+            Cmd::new("sh").args(&["-c", "yes x | head -c 200000"])
+        };
+
+        let output = cmd.timeout(Duration::from_secs(60)).run().unwrap();
+
+        assert!(
+            output.stdout.len() > 100_000,
+            "read {} bytes of it",
+            output.stdout.len()
+        );
+    }
 
     #[test]
     fn lifecycle_hook_default_is_the_platform_shell() {
