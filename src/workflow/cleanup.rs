@@ -21,101 +21,6 @@ const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TARGET_CLOSE_RETRIES: u32 = 20;
 const DEFERRED_TARGET_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Windows file identity through `GetFileInformationByHandle`.
-///
-/// `std` exposes no stable file id on Windows (`volume_serial_number` and
-/// `file_index` are still unstable), so the volume serial and file index are
-/// queried directly. The pair survives renames, matching Unix `dev`/`ino`.
-#[cfg(windows)]
-mod win_file_id {
-    use std::io;
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::Path;
-    use std::ptr;
-
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-    const OPEN_EXISTING: u32 = 3;
-    // Required to open a directory and to identify a link instead of its target.
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const INVALID_HANDLE_VALUE: *mut core::ffi::c_void = -1isize as *mut core::ffi::c_void;
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct FileTime {
-        low: u32,
-        high: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct FileInformation {
-        file_attributes: u32,
-        creation_time: FileTime,
-        last_access_time: FileTime,
-        last_write_time: FileTime,
-        volume_serial_number: u32,
-        file_size_high: u32,
-        file_size_low: u32,
-        number_of_links: u32,
-        file_index_high: u32,
-        file_index_low: u32,
-    }
-
-    unsafe extern "system" {
-        fn CreateFileW(
-            file_name: *const u16,
-            desired_access: u32,
-            share_mode: u32,
-            security_attributes: *mut core::ffi::c_void,
-            creation_disposition: u32,
-            flags_and_attributes: u32,
-            template_file: *mut core::ffi::c_void,
-        ) -> *mut core::ffi::c_void;
-        fn GetFileInformationByHandle(
-            handle: *mut core::ffi::c_void,
-            information: *mut FileInformation,
-        ) -> i32;
-        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
-    }
-
-    /// Volume serial number and file index for `path`.
-    pub(super) fn file_id(path: &Path) -> io::Result<(u64, u64)> {
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let handle = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                ptr::null_mut(),
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                ptr::null_mut(),
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-
-        let mut information = FileInformation::default();
-        let result = unsafe { GetFileInformationByHandle(handle, &mut information) };
-        let error = io::Error::last_os_error();
-        unsafe { CloseHandle(handle) };
-        if result == 0 {
-            return Err(error);
-        }
-
-        let index = ((information.file_index_high as u64) << 32) | information.file_index_low as u64;
-        Ok((information.volume_serial_number as u64, index))
-    }
-}
-
 /// Find all windows matching the base handle pattern (including duplicates).
 /// Matches: {prefix}{handle} and {prefix}{handle}-{N}
 /// Run pre-remove hooks with environment variables set.
@@ -403,7 +308,7 @@ pub(super) fn directory_identity(
     #[cfg(windows)]
     {
         let _ = metadata;
-        let (device, inode) = win_file_id::file_id(path)?;
+        let (device, inode) = crate::util::file_id(path)?;
         Ok(DirectoryIdentity { device, inode })
     }
 }

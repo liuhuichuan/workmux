@@ -303,11 +303,13 @@ pub fn snapshot_local_config(source: &Path, destination: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // Git rejects extended-length paths, which `canonicalize` produces on Windows.
+    let config_file = crate::util::git_path(source);
     let output = unattended_git(None)?
         .args([
             OsStr::new("config"),
             OsStr::new("--file"),
-            source.as_os_str(),
+            &*config_file,
             OsStr::new("--null"),
             OsStr::new("--list"),
         ])

@@ -383,11 +383,14 @@ fn config_include_paths(config: &Path) -> Result<Vec<PathBuf>> {
         if !visited.insert(config.clone()) {
             return Ok(());
         }
+        // Git rejects extended-length paths, which `canonicalize` produces on Windows.
+        let config_file = crate::util::git_path(&config);
+        let config_file = config_file.to_string_lossy();
         let output = crate::git::unattended_git(None)?
             .args([
                 "config",
                 "--file",
-                config.to_string_lossy().as_ref(),
+                config_file.as_ref(),
                 "--get-regexp",
                 "^include.*\\.path$",
             ])
@@ -431,7 +434,7 @@ fn config_include_paths(config: &Path) -> Result<Vec<PathBuf>> {
             .args([
                 "config",
                 "--file",
-                config.to_string_lossy().as_ref(),
+                config_file.as_ref(),
                 "--get-regexp",
                 "^(core\\.(hooksPath|fsmonitor)|diff\\..*\\.(command|textconv)|filter\\..*\\.(clean|smudge|process)|merge\\..*\\.driver)$",
             ])

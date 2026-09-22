@@ -14,7 +14,7 @@ use tracing::{info, trace, warn};
 use super::types::{AgentState, GlobalSettings, PaneKey};
 use crate::agent_identity::AgentKind;
 use crate::config::SandboxRuntime;
-use crate::util::{FileLock, write_atomic, write_atomic_durable};
+use crate::util::{FileLock, open_shared, read_shared, write_atomic, write_atomic_durable};
 
 /// Manages filesystem-based state persistence for workmux agents.
 ///
@@ -195,7 +195,7 @@ impl AgentStateLock {
 
 /// Snapshot of the on-disk state used to detect concurrent modification.
 #[cfg(unix)]
-fn file_revision(metadata: &fs::Metadata) -> FileRevision {
+fn file_revision(_path: &Path, metadata: &fs::Metadata) -> FileRevision {
     FileRevision {
         dev: metadata.dev(),
         ino: metadata.ino(),
@@ -209,14 +209,16 @@ fn file_revision(metadata: &fs::Metadata) -> FileRevision {
 
 /// Snapshot of the on-disk state used to detect concurrent modification.
 ///
-/// Windows exposes no stable device/inode pair through std, so identity falls
-/// back to the creation timestamp while `mtime`/`len` still catch in-place edits.
+/// Windows exposes no stable device/inode pair through std, so identity is read
+/// from the volume serial and file index. A replaced file keeps its creation
+/// time, so the file index is what makes an atomic replacement visible here.
 #[cfg(windows)]
-fn file_revision(metadata: &fs::Metadata) -> FileRevision {
+fn file_revision(path: &Path, metadata: &fs::Metadata) -> FileRevision {
     use std::os::windows::fs::MetadataExt;
+    let (dev, ino) = crate::util::file_id(path).unwrap_or_default();
     FileRevision {
-        dev: metadata.file_attributes() as u64,
-        ino: metadata.creation_time(),
+        dev,
+        ino,
         len: metadata.len(),
         mtime_sec: metadata.last_write_time() as i64,
         mtime_nsec: 0,
@@ -234,7 +236,7 @@ fn is_agent_json(path: &Path) -> bool {
 }
 
 fn read_agent_with_revision(path: &Path) -> Result<Option<(AgentState, FileRevision)>> {
-    let mut file = match File::open(path) {
+    let mut file = match open_shared(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -242,7 +244,7 @@ fn read_agent_with_revision(path: &Path) -> Result<Option<(AgentState, FileRevis
                 .with_context(|| format!("Failed to read agent state: {}", path.display()));
         }
     };
-    let revision = file_revision(&file.metadata()?);
+    let revision = file_revision(path, &file.metadata()?);
     let mut content = String::new();
     file.read_to_string(&mut content)?;
     match serde_json::from_str(&content) {
@@ -337,13 +339,13 @@ impl AgentStateCache {
             }
             seen.insert(path.clone());
 
-            let mut file = match File::open(&path) {
+            let mut file = match open_shared(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             };
             stats.metadata += 1;
-            let revision = file_revision(&file.metadata()?);
+            let revision = file_revision(&path, &file.metadata()?);
             let cached = self
                 .files
                 .get(&path)
@@ -516,7 +518,7 @@ impl StateStore {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error.into()),
             };
-            if file_revision(&metadata) != *expected {
+            if file_revision(&path, &metadata) != *expected {
                 return Ok(false);
             }
             let content = serde_json::to_string_pretty(state)?;
@@ -575,7 +577,7 @@ impl StateStore {
                 continue;
             }
 
-            let content = match fs::read_to_string(&path) {
+            let content = match read_shared(&path) {
                 Ok(content) => content,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => {
@@ -669,7 +671,7 @@ impl StateStore {
     }
 
     fn load_recovery_manifest_path_locked(&self, path: &Path) -> Result<RecoveryManifest> {
-        let content = fs::read_to_string(path).map_err(anyhow::Error::from)?;
+        let content = read_shared(path).map_err(anyhow::Error::from)?;
         let manifest: RecoveryManifest = serde_json::from_str(&content)
             .with_context(|| format!("Invalid recovery state: {}", path.display()))?;
         if manifest.version != 1
@@ -842,7 +844,7 @@ impl StateStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        if file_revision(&metadata) != *expected {
+        if file_revision(path, &metadata) != *expected {
             return Ok(false);
         }
         fs::remove_file(path)?;
@@ -984,7 +986,7 @@ impl StateStore {
     /// Returns defaults if the file is missing or corrupted.
     pub fn load_settings(&self) -> Result<GlobalSettings> {
         let path = self.settings_path();
-        match fs::read_to_string(&path) {
+        match read_shared(&path) {
             Ok(content) => match serde_json::from_str(&content) {
                 Ok(settings) => Ok(settings),
                 Err(e) => {
@@ -1059,7 +1061,7 @@ impl StateStore {
                 if name.starts_with('.') {
                     return None;
                 }
-                let runtime = fs::read_to_string(entry.path())
+                let runtime = read_shared(&entry.path())
                     .ok()
                     .and_then(|content| SandboxRuntime::from_serde_name(content.trim()))
                     .unwrap_or_default();
@@ -1245,7 +1247,7 @@ impl StateStore {
         let path = self
             .runtime_dir()
             .join(format!("{}__{}.json", backend, safe_instance));
-        match fs::read_to_string(&path) {
+        match read_shared(&path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
             Err(_) => super::types::RuntimeState::default(),
         }
@@ -1588,7 +1590,7 @@ fn remap_full_name(name: &str, old_base: &str, new_base: &str) -> String {
 ///
 /// Returns None if the file doesn't exist or cannot be decoded.
 fn read_agent_file(path: &Path) -> Result<Option<AgentState>> {
-    match fs::read_to_string(path) {
+    match read_shared(path) {
         Ok(content) => match serde_json::from_str(&content) {
             Ok(state) => Ok(Some(state)),
             Err(e) => {
