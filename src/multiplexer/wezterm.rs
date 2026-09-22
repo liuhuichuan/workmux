@@ -631,25 +631,15 @@ impl WezTermBackend {
         percentage: Option<u8>,
         argv: Option<Vec<String>>,
     ) -> Result<String> {
-        let direction_arg = match direction {
-            SplitDirection::Horizontal => "--horizontal",
-            SplitDirection::Vertical => "--top-level",
-            SplitDirection::Stacked => {
-                return Err(anyhow!(
-                    "split: stacked is only supported by the Zellij backend"
-                ));
-            }
-        };
-
-        let _ = size; // WezTerm doesn't support absolute sizes via CLI
         let cwd_str = cwd.to_string_lossy();
         let args = split_args(
             target_pane_id,
             &cwd_str,
-            direction_arg,
+            &direction,
+            size,
             percentage,
             argv.as_deref(),
-        );
+        )?;
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
         let output = self
@@ -659,6 +649,59 @@ impl WezTermBackend {
 
         Ok(output.trim().to_string())
     }
+}
+
+/// The `wezterm cli` argument that says where the new pane goes.
+///
+/// A vertical split is a split of the pane that was named, not of the tab.
+/// WezTerm spells a split of the whole tab `--top-level`, and that is what this
+/// used to ask for: it leaves the tab sized for the part the split did not take,
+/// and the only thing that lays a tab out again is `reflow`, which is Unix-only.
+/// On Windows every pane of such a tab draws inside a strip of the window while
+/// a band of it stays empty -- one tab of a 190-column window stayed 221 columns
+/// wide for the rest of the session after it was made that way. Splitting the
+/// named pane is also what the callers ask for: a `panes:` entry splits the pane
+/// it names, the way `tmux split-window -v -t <pane>` does.
+fn split_direction_arg(direction: &SplitDirection) -> Result<&'static str> {
+    Ok(match direction {
+        SplitDirection::Horizontal => "--horizontal",
+        #[cfg(windows)]
+        SplitDirection::Vertical => "--bottom",
+        #[cfg(not(windows))]
+        SplitDirection::Vertical => "--top-level",
+        SplitDirection::Stacked => {
+            return Err(anyhow!(
+                "split: stacked is only supported by the Zellij backend"
+            ));
+        }
+    })
+}
+
+/// How big the new pane is to be, if the caller named a size.
+///
+/// A `size` is the new pane's own count of lines for a vertical split, or cells
+/// for a horizontal one, and WezTerm counts either in cells. It comes before
+/// `percentage`, which the config makes it exclusive with anyway.
+#[cfg(windows)]
+fn split_size_args(size: Option<u16>, percentage: Option<u8>) -> Vec<String> {
+    if let Some(size) = size {
+        vec!["--cells".to_string(), size.to_string()]
+    } else if let Some(percentage) = percentage {
+        vec!["--percent".to_string(), percentage.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Unix asks for neither number it is given, as it always has: there a size
+/// lands in a split of the whole tab, which only `reflow` lays out, and the port
+/// has no Unix to check a change against.
+#[cfg(not(windows))]
+fn split_size_args(size: Option<u16>, percentage: Option<u8>) -> Vec<String> {
+    let _ = size;
+    percentage
+        .map(|percentage| vec!["--percent".to_string(), percentage.to_string()])
+        .unwrap_or_default()
 }
 
 /// The `wezterm cli` arguments that split a pane and run `argv` in the new one.
@@ -671,10 +714,11 @@ impl WezTermBackend {
 fn split_args(
     target_pane_id: &str,
     cwd: &str,
-    direction_arg: &str,
+    direction: &SplitDirection,
+    size: Option<u16>,
     percentage: Option<u8>,
     argv: Option<&[String]>,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let mut args = vec![
         "cli".to_string(),
         "split-pane".to_string(),
@@ -682,20 +726,16 @@ fn split_args(
         target_pane_id.to_string(),
         "--cwd".to_string(),
         cwd.to_string(),
-        direction_arg.to_string(),
+        split_direction_arg(direction)?.to_string(),
     ];
-
-    if let Some(percentage) = percentage {
-        args.push("--percent".to_string());
-        args.push(percentage.to_string());
-    }
+    args.extend(split_size_args(size, percentage));
 
     if let Some(argv) = argv {
         args.push("--".to_string());
         args.extend(argv.iter().cloned());
     }
 
-    args
+    Ok(args)
 }
 
 /// What WezTerm reports about the pane a process runs in.
@@ -1920,7 +1960,15 @@ mod tests {
         ];
 
         assert_eq!(
-            split_args("12", r"C:\work", "--horizontal", Some(30), Some(&argv)),
+            split_args(
+                "12",
+                r"C:\work",
+                &SplitDirection::Horizontal,
+                None,
+                Some(30),
+                Some(&argv)
+            )
+            .unwrap(),
             [
                 "cli",
                 "split-pane",
@@ -1940,13 +1988,77 @@ mod tests {
         );
     }
 
+    /// A size a caller names is the new pane's own: lines for a vertical split,
+    /// cells for a horizontal one, and WezTerm counts both in cells. Windows
+    /// asks for it -- the split measures against the pane that was named -- and
+    /// the config makes it exclusive with a percentage, so a size is asked for
+    /// first if both are there.
+    #[cfg(windows)]
+    #[test]
+    fn a_size_is_asked_for_as_the_cells_it_names() {
+        let placement = |size, percentage| {
+            let args = split_args(
+                "12",
+                "cwd",
+                &SplitDirection::Vertical,
+                size,
+                percentage,
+                None,
+            )
+            .unwrap();
+            args[7..].to_vec()
+        };
+
+        assert_eq!(placement(Some(6), None), ["--cells", "6"]);
+        assert_eq!(placement(None, Some(30)), ["--percent", "30"]);
+        assert_eq!(placement(Some(6), Some(30)), ["--cells", "6"]);
+        assert!(placement(None, None).is_empty());
+    }
+
+    /// A vertical split belongs to the pane it names, which is the pane the
+    /// caller asked to split. A split of the whole tab is what WezTerm's
+    /// `--top-level` does, and on Windows nothing lays the tab out again
+    /// afterwards: the tab keeps the size of the part its panes did not take.
+    #[cfg(windows)]
+    #[test]
+    fn a_vertical_split_is_a_split_of_the_pane_it_names() {
+        assert_eq!(
+            split_direction_arg(&SplitDirection::Vertical).unwrap(),
+            "--bottom"
+        );
+    }
+
+    /// Unix keeps the whole-tab split and the sizes it ignored: `reflow` is what
+    /// lays a whole-tab split out, and the port has no Unix to check a change
+    /// against.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_vertical_split_is_still_the_whole_tab_on_unix() {
+        assert_eq!(
+            split_direction_arg(&SplitDirection::Vertical).unwrap(),
+            "--top-level"
+        );
+        assert_eq!(
+            split_args("12", "cwd", &SplitDirection::Vertical, Some(6), None, None).unwrap(),
+            [
+                "cli",
+                "split-pane",
+                "--pane-id",
+                "12",
+                "--cwd",
+                "cwd",
+                "--top-level",
+            ]
+        );
+    }
+
     /// A pane command that is a command string still runs under a shell: the
     /// words after `--` are the platform shell and the script it is to read.
     #[test]
     fn a_command_string_is_run_by_the_shell() {
         let argv = crate::shell::snippet_argv("echo hi");
 
-        let args = split_args("12", "cwd", "--top-level", None, Some(&argv));
+        let args = split_args("12", "cwd", &SplitDirection::Vertical, None, None, Some(&argv)).unwrap();
 
         assert_eq!(args[args.len() - argv.len() - 1], "--");
         assert!(args.ends_with(&argv), "{args:?}");
