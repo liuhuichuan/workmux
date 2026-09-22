@@ -34,6 +34,11 @@ jobs:
             target: aarch64-unknown-linux-musl
             artifact: workmux-linux-arm64
             use_cross: true
+          # Windows builds
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: workmux-windows-amd64
+            use_cross: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +52,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build
+        # Git Bash on the Windows runner runs the same branch as macOS/Linux.
+        shell: bash
         run: |
           if [ "${{ matrix.use_cross }}" == "true" ]; then
             cross build --release --locked --target ${{ matrix.target }}
@@ -54,11 +61,23 @@ jobs:
             cargo build --release --locked --target ${{ matrix.target }}
           fi
       - name: Package
+        if: runner.os != 'Windows'
         run: |
           bin="target/${{ matrix.target }}/release/${BIN_NAME}"
           # Binary is already stripped via Cargo.toml profile.release.strip
           tar -C "$(dirname "$bin")" -czf ${{ matrix.artifact }}.tar.gz ${BIN_NAME}
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.sha256
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # The binary keeps the `.exe` Cargo gives it, and the checksum line
+          # matches the `<hash>  <file>` form `shasum` writes elsewhere.
+          $bin = "target/${{ matrix.target }}/release/$env:BIN_NAME.exe"
+          tar -C (Split-Path $bin) -czf "${{ matrix.artifact }}.tar.gz" "$env:BIN_NAME.exe"
+          $hash = (Get-FileHash "${{ matrix.artifact }}.tar.gz" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.artifact }}.tar.gz" |
+            Set-Content "${{ matrix.artifact }}.sha256" -NoNewline
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

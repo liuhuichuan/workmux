@@ -16,6 +16,7 @@ fn platform_suffix() -> Result<&'static str> {
         ("macos", "x86_64") => Ok("darwin-amd64"),
         ("linux", "x86_64") => Ok("linux-amd64"),
         ("linux", "aarch64") => Ok("linux-arm64"),
+        ("windows", "x86_64") => Ok("windows-amd64"),
         (os, arch) => bail!("Unsupported platform: {os}/{arch}"),
     }
 }
@@ -108,32 +109,68 @@ fn extract_tar(archive: &std::path::Path, dest: &std::path::Path) -> Result<()> 
 
 /// Compute SHA-256 hash of a file using system tools.
 fn sha256_of(path: &std::path::Path) -> Result<String> {
-    // Try sha256sum first (common on Linux)
-    if let Ok(output) = Command::new("sha256sum").arg(path).output()
-        && output.status.success()
+    #[cfg(windows)]
     {
-        let out = String::from_utf8_lossy(&output.stdout);
-        if let Some(hash) = out.split_whitespace().next() {
-            return Ok(hash.to_string());
+        // `certutil` is the only hasher Windows ships. Its labels are localized,
+        // so the hash is picked out by shape instead.
+        let output = Command::new("certutil")
+            .arg("-hashfile")
+            .arg(path)
+            .arg("SHA256")
+            .output()
+            .context("Failed to run certutil. Cannot verify checksum.")?;
+
+        if !output.status.success() {
+            bail!("Checksum command failed");
         }
+
+        let out = String::from_utf8_lossy(&output.stdout);
+        return certutil_hash(&out).context("Could not parse checksum output");
     }
 
-    // Fall back to shasum -a 256 (macOS)
-    let output = Command::new("shasum")
-        .args(["-a", "256"])
-        .arg(path)
-        .output()
-        .context("Neither sha256sum nor shasum found. Cannot verify checksum.")?;
+    #[cfg(not(windows))]
+    {
+        // Try sha256sum first (common on Linux)
+        if let Ok(output) = Command::new("sha256sum").arg(path).output()
+            && output.status.success()
+        {
+            let out = String::from_utf8_lossy(&output.stdout);
+            if let Some(hash) = out.split_whitespace().next() {
+                return Ok(hash.to_string());
+            }
+        }
 
-    if !output.status.success() {
-        bail!("Checksum command failed");
+        // Fall back to shasum -a 256 (macOS)
+        let output = Command::new("shasum")
+            .args(["-a", "256"])
+            .arg(path)
+            .output()
+            .context("Neither sha256sum nor shasum found. Cannot verify checksum.")?;
+
+        if !output.status.success() {
+            bail!("Checksum command failed");
+        }
+
+        let out = String::from_utf8_lossy(&output.stdout);
+        out.split_whitespace()
+            .next()
+            .map(|s| s.to_string())
+            .context("Could not parse checksum output")
     }
+}
 
-    let out = String::from_utf8_lossy(&output.stdout);
-    out.split_whitespace()
-        .next()
-        .map(|s| s.to_string())
-        .context("Could not parse checksum output")
+/// Pick the hash out of a `certutil -hashfile` report.
+///
+/// The lines around it are localized ("SHA256 hash of ..."), so the hash is the
+/// line shaped like one: 64 hexadecimal characters. The `.sha256` files carry
+/// lowercase, so lowercase this too.
+#[cfg(windows)]
+fn certutil_hash(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.len() == 64 && line.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
 }
 
 /// Verify SHA-256 checksum of a file against the expected checksum line.
@@ -169,6 +206,10 @@ fn replace_binary(new_binary: &std::path::Path, current_exe: &std::path::Path) -
 
     // Rename current -> .old, then staged -> current
     let backup = exe_dir.join(".workmux.old");
+    // An earlier update leaves the old binary here: Windows will not delete it
+    // while it is still the running image, and it refuses to rename onto a file
+    // that already exists -- so clear it now, before it can block this update.
+    let _ = std::fs::remove_file(&backup);
     std::fs::rename(current_exe, &backup).context("Failed to move current binary aside")?;
 
     if let Err(e) = std::fs::rename(&staged, current_exe) {
@@ -213,9 +254,16 @@ fn do_update(
     std::fs::create_dir(&extract_dir)?;
     extract_tar(&tar_path, &extract_dir)?;
 
-    let new_binary = extract_dir.join("workmux");
+    // The archive holds the binary under the name Cargo gives it, which carries
+    // an `.exe` suffix on Windows.
+    let binary_name = if cfg!(windows) {
+        "workmux.exe"
+    } else {
+        "workmux"
+    };
+    let new_binary = extract_dir.join(binary_name);
     if !new_binary.exists() {
-        bail!("Extracted archive does not contain 'workmux' binary");
+        bail!("Extracted archive does not contain '{binary_name}' binary");
     }
 
     replace_binary(&new_binary, current_exe)?;
@@ -414,14 +462,67 @@ pub fn run_background_check() -> Result<()> {
 mod tests {
     use super::*;
 
-    // Windows has no published release artifact, so `platform_suffix`
-    // correctly reports the platform as unsupported there.
     #[cfg(unix)]
     #[test]
     fn test_platform_suffix_current() {
         // Should succeed on any supported CI/dev platform
         let suffix = platform_suffix().unwrap();
         assert!(["darwin-arm64", "darwin-amd64", "linux-amd64", "linux-arm64"].contains(&suffix));
+    }
+
+    /// The suffix has to name the artifact the release workflow builds, since
+    /// that is the file `update` downloads.
+    #[cfg(windows)]
+    #[test]
+    fn platform_suffix_names_the_windows_artifact() {
+        assert_eq!(platform_suffix().unwrap(), "windows-amd64");
+    }
+
+    /// A leftover backup must not block the next update: Windows refuses to
+    /// rename onto a file that already exists.
+    #[test]
+    fn replace_binary_overwrites_a_leftover_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("workmux");
+        let staged = dir.path().join("staged");
+        std::fs::write(&current, "old binary").unwrap();
+        std::fs::write(&staged, "new binary").unwrap();
+        std::fs::write(dir.path().join(".workmux.old"), "leftover").unwrap();
+
+        replace_binary(&staged, &current).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), "new binary");
+        assert!(!dir.path().join(".workmux.old").exists());
+    }
+
+    /// `certutil` labels its report in the system language, so the hash is
+    /// found by shape; the `.sha256` files carry lowercase.
+    #[cfg(windows)]
+    #[test]
+    fn certutil_hash_reads_a_localized_report() {
+        let report = "SHA256 hash of C:\\tmp\\a.tar.gz:\\r\n\
+                      A288DFDCE8CFB589B2CA2948CE9E2551CAC6F0C6BB1BEC35D1429342954DA724\r\n\
+                      CertUtil: -hashfile command completed.\r\n";
+        assert_eq!(
+            certutil_hash(report).unwrap(),
+            "a288dfdce8cfb589b2ca2948ce9e2551cac6f0c6bb1bec35d1429342954da724"
+        );
+        assert_eq!(certutil_hash("CertUtil: -hashfile failed."), None);
+    }
+
+    /// The hash has to come out in the form the `.sha256` file carries, and
+    /// `certutil` reports uppercase.
+    #[cfg(windows)]
+    #[test]
+    fn sha256_of_returns_the_lowercase_digest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("payload");
+        std::fs::write(&file, "workmux").unwrap();
+
+        assert_eq!(
+            sha256_of(&file).unwrap(),
+            "01665446ed400f8b293f0b459802be43bc565eceb9acd13f0892e816afa329c7"
+        );
     }
 
     #[test]
