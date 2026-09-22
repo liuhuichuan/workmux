@@ -141,7 +141,7 @@ fn write_prompt(stdin: Option<ChildStdin>, full_prompt: &str) -> Result<()> {
 }
 
 fn run_custom_command(cmdline: &str, full_prompt: &str) -> Result<String> {
-    let parts = shlex::split(cmdline).ok_or_else(|| {
+    let parts = crate::shell::split_command_line(cmdline).ok_or_else(|| {
         anyhow!(
             "Failed to parse auto_name.command: mismatched quotes in '{}'",
             cmdline
@@ -161,7 +161,7 @@ fn run_custom_command(cmdline: &str, full_prompt: &str) -> Result<String> {
         "running custom generator command"
     );
 
-    let mut child = Command::new(program)
+    let mut child = Command::new(crate::util::program_path(program))
         .args(fixed_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -198,7 +198,7 @@ fn run_custom_command(cmdline: &str, full_prompt: &str) -> Result<String> {
 }
 
 fn run_llm_command(model: Option<&str>, full_prompt: &str) -> Result<String> {
-    let mut cmd = Command::new("llm");
+    let mut cmd = Command::new(crate::util::program_path("llm"));
     if let Some(m) = model {
         cmd.args(["-m", m]);
     }

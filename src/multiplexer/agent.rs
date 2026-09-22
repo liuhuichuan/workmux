@@ -433,7 +433,7 @@ pub struct AgentCommand {
 
 impl AgentCommand {
     pub fn parse(command: &str) -> Option<Self> {
-        let parts = shlex::split(command)?;
+        let parts = crate::shell::split_command_line(command)?;
         let mut iter = parts.into_iter();
         let first = iter.next()?;
         let env = BTreeMap::new();
@@ -509,29 +509,47 @@ impl AgentCommand {
     }
 
     pub fn shell_string(&self) -> String {
+        self.shell_string_for(None)
+    }
+
+    /// The command as a line for a shell, quoted the way `shell` reads it.
+    ///
+    /// `None` asks for no particular shell -- the form workmux compares
+    /// command strings in -- and the pane's own shell asks for the form it can
+    /// run: a program named by path is one word to a Windows shell, and
+    /// quoting it as a string is what makes it not one.
+    pub fn shell_string_for(&self, shell: Option<PaneCommandShell>) -> String {
+        let dialect = shell.map(PaneCommandShell::dialect).unwrap_or_else(|| {
+            if cfg!(windows) {
+                crate::shell::ShellDialect::Cmd
+            } else {
+                crate::shell::ShellDialect::Posix
+            }
+        });
+        let quote = |value: &str| crate::shell::word_quote(value, dialect, false);
         let mut parts = Vec::new();
         if !self.env_args.is_empty() || !self.env_assignments.is_empty() || !self.env.is_empty() {
             parts.push("env".to_string());
-            parts.extend(self.env_args.iter().map(|arg| shell_quote(arg)));
+            parts.extend(self.env_args.iter().map(|arg| quote(arg)));
             parts.extend(self.env_assignments.iter().cloned());
             for (key, value) in &self.env {
                 parts.push(format!("{}={}", key, value.shell_value()));
             }
         }
-        parts.push(shell_quote(&self.program));
-        parts.extend(self.args.iter().map(|arg| shell_quote(arg)));
+        parts.push(crate::shell::word_quote(&self.program, dialect, true));
+        parts.extend(self.args.iter().map(|arg| quote(arg)));
         parts.join(" ")
     }
 
     pub fn prepend_args_fragment(&mut self, fragment: &str) {
-        if let Some(mut args) = shlex::split(fragment) {
+        if let Some(mut args) = crate::shell::split_command_line(fragment) {
             args.extend(std::mem::take(&mut self.args));
             self.args = args;
         }
     }
 
     pub fn append_args_fragment(&mut self, fragment: &str) {
-        if let Some(args) = shlex::split(fragment) {
+        if let Some(args) = crate::shell::split_command_line(fragment) {
             self.args.extend(args);
         }
     }
@@ -568,6 +586,11 @@ impl SelectedAgent {
 
     pub fn shell_command(&self) -> String {
         self.command.shell_string()
+    }
+
+    /// The command as the pane's shell has to read it.
+    pub fn shell_command_for(&self, shell: PaneCommandShell) -> String {
+        self.command.shell_string_for(Some(shell))
     }
 
     pub fn from_raw(command: &str) -> Option<Self> {

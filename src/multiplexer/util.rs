@@ -114,6 +114,17 @@ impl PaneCommandShell {
         }
     }
 
+    /// The dialect this pane's command line is written in.
+    ///
+    /// A cmd.exe pane is handed a PowerShell wrapper, so the line it reads is
+    /// PowerShell whatever runs it.
+    pub fn dialect(self) -> crate::shell::ShellDialect {
+        match self {
+            Self::Posix | Self::PosixWrapped => crate::shell::ShellDialect::Posix,
+            Self::PowerShell | Self::PowerShellWrapped => crate::shell::ShellDialect::PowerShell,
+        }
+    }
+
     /// The contents of `path` as a single argument, in this shell's
     /// substitution syntax.
     ///
@@ -324,7 +335,7 @@ impl ResolvedCommand {
     pub fn renderable_command(&self) -> String {
         self.selected_agent
             .as_ref()
-            .map(SelectedAgent::shell_command)
+            .map(|agent| agent.shell_command_for(self.pane_shell))
             .unwrap_or_else(|| self.base_command.clone())
     }
 
@@ -335,7 +346,7 @@ impl ResolvedCommand {
         if !self.apply_agent_prefix {
             return self.base_command.clone();
         }
-        let mut prefix = agent.command.shell_string();
+        let mut prefix = agent.command.shell_string_for(Some(self.pane_shell));
         if prefix == self.base_command || !self.base_command.starts_with(&agent.command.program) {
             return self.base_command.clone();
         }
@@ -365,7 +376,7 @@ pub fn resolve_pane_command_with_config(
     let mut apply_agent_prefix = false;
     let command = if raw_command == "<agent>" {
         let agent = default_agent?;
-        let command = agent.shell_command();
+        let command = agent.shell_command_for(pane_shell);
         selected_agent = Some(agent);
         use_agent_command = true;
         command
@@ -375,7 +386,7 @@ pub fn resolve_pane_command_with_config(
             None => default_agent?,
         };
         agent.command.append_args_fragment(extra_args);
-        let command = agent.shell_command();
+        let command = agent.shell_command_for(pane_shell);
         selected_agent = Some(agent);
         use_agent_command = true;
         command
@@ -384,7 +395,7 @@ pub fn resolve_pane_command_with_config(
         .and_then(|rest| rest.strip_suffix('>'))
     {
         let agent = super::agent::resolve_selected_agent(config, Some(name))?;
-        let command = agent.shell_command();
+        let command = agent.shell_command_for(pane_shell);
         selected_agent = Some(agent);
         use_agent_command = true;
         command

@@ -1,6 +1,5 @@
 """Tests for agent configuration, prompts, and multi-agent scenarios."""
 
-import shlex
 from pathlib import Path
 
 
@@ -12,6 +11,7 @@ from ..conftest import (
     assert_window_exists,
     get_window_name,
     get_worktree_path,
+    pane_quote,
     poll_until,
     run_workmux_command,
     wait_for_file,
@@ -67,7 +67,7 @@ printf '%s' "$2" > "{output_filename}"
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt {shlex.quote(prompt_text)}",
+            extra_args=f"--prompt {pane_quote(prompt_text)}",
         )
 
         # Prompt file is now written to <worktree>/.workmux/
@@ -134,7 +134,7 @@ printf '%s' "$2" > "{output_filename}"
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt-file {shlex.quote(str(prompt_source))}",
+            extra_args=f"--prompt-file {pane_quote(str(prompt_source))}",
         )
 
         # Prompt file is now written to <worktree>/.workmux/
@@ -196,7 +196,7 @@ printf '%s' "$2" > "{output_filename}"
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt {shlex.quote(prompt_text)}",
+            extra_args=f"--prompt {pane_quote(prompt_text)}",
         )
 
         agent_output = worktree_path / output_filename
@@ -245,7 +245,7 @@ printf '%s' "$1" > omp_prompt.txt
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt {shlex.quote(prompt_text)}",
+            extra_args=f"--prompt {pane_quote(prompt_text)}",
         )
 
         agent_output = worktree_path / "omp_prompt.txt"
@@ -300,7 +300,7 @@ printf '%s' "$2" > "{agent_output}"
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--agent {shlex.quote(str(fake_gemini_path))} --prompt {shlex.quote(prompt_text)}",
+            extra_args=f"--agent {pane_quote(str(fake_gemini_path))} --prompt {pane_quote(prompt_text)}",
         )
 
         wait_for_file(
@@ -371,7 +371,7 @@ exit 1
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt {shlex.quote(prompt_text)}",
+            extra_args=f"--prompt {pane_quote(prompt_text)}",
         )
 
         agent_output = worktree_path / output_filename
@@ -456,7 +456,7 @@ printf '%s' "$prompt" > "{output_filename}"
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt {shlex.quote(prompt_text)}",
+            extra_args=f"--prompt {pane_quote(prompt_text)}",
         )
 
         agent_output = worktree_path / output_filename
@@ -538,7 +538,7 @@ printf '%s' "$prompt" > "{output_filename}"
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt {shlex.quote(prompt_text)}",
+            extra_args=f"--prompt {pane_quote(prompt_text)}",
         )
 
         agent_output = worktree_path / output_filename
@@ -591,7 +591,7 @@ class TestMultiAgent:
             env,
             workmux_exe_path,
             mux_repo_path,
-            f"add {base_name} -a {shlex.quote(str(claude_path))} -a {shlex.quote(str(gemini_path))} --prompt '{prompt_text}'",
+            f"add {base_name} -a {pane_quote(str(claude_path))} -a {pane_quote(str(gemini_path))} --prompt {pane_quote(prompt_text)}",
         )
 
         claude_branch = f"{base_name}-claude"
@@ -646,7 +646,7 @@ class TestMultiAgent:
             env,
             workmux_exe_path,
             mux_repo_path,
-            f"add {base_name} -a {shlex.quote(str(fake_gemini_path))} -n 2 --prompt '{prompt_text}'",
+            f"add {base_name} -a {pane_quote(str(fake_gemini_path))} -n 2 --prompt {pane_quote(prompt_text)}",
         )
 
         for idx in (1, 2):
@@ -695,8 +695,8 @@ class TestForeach:
             mux_repo_path,
             (
                 f"add {base_name} --foreach "
-                "'platform:ios,android;lang:swift,kotlin' "
-                f"--prompt '{prompt_text}'"
+                f"{pane_quote('platform:ios,android;lang:swift,kotlin')} "
+                f"--prompt {pane_quote(prompt_text)}"
             ),
         )
 
@@ -742,7 +742,7 @@ class TestBranchTemplate:
             env,
             workmux_exe_path,
             mux_repo_path,
-            f"add {base_name} -a Gemini -n 2 --branch-template '{template}'",
+            f"add {base_name} -a Gemini -n 2 --branch-template {pane_quote(template)}",
         )
 
         for idx in (1, 2):
@@ -870,7 +870,7 @@ class TestAgentErrors:
             env,
             workmux_exe_path,
             mux_repo_path,
-            "add my-feature --foreach 'p:a' -a claude",
+            f"add my-feature --foreach {pane_quote('p:a')} -a claude",
             expect_fail=True,
         )
         assert (
@@ -890,7 +890,7 @@ class TestAgentErrors:
             env,
             workmux_exe_path,
             mux_repo_path,
-            "add my-feature --foreach 'platform:ios,android;lang:swift'",
+            f"add my-feature --foreach {pane_quote('platform:ios,android;lang:swift')}",
             expect_fail=True,
         )
         assert (
@@ -912,7 +912,7 @@ class TestAgentErrors:
             env,
             workmux_exe_path,
             mux_repo_path,
-            "add my-feature --prompt 'do something'",
+            f"add my-feature --prompt {pane_quote('do something')}",
             expect_fail=True,
         )
         # Agent defaults to "claude", so error says no pane runs claude
@@ -937,7 +937,7 @@ class TestAgentErrors:
             env,
             workmux_exe_path,
             mux_repo_path,
-            "add my-feature --prompt 'do something'",
+            f"add my-feature --prompt {pane_quote('do something')}",
             expect_fail=True,
         )
         assert "no pane is configured to run the agent" in result.stderr
@@ -956,7 +956,7 @@ class TestAgentErrors:
             env,
             workmux_exe_path,
             mux_repo_path,
-            "add my-feature --prompt 'do something' --no-pane-cmds",
+            f"add my-feature --prompt {pane_quote('do something')} --no-pane-cmds",
             expect_fail=True,
         )
         assert "pane commands are disabled" in result.stderr
@@ -990,7 +990,7 @@ class TestTemplateVariableValidation:
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt {shlex.quote(prompt_text)}",
+            extra_args=f"--prompt {pane_quote(prompt_text)}",
         )
         window = get_window_name(branch_name)
         wait_for_file(
@@ -1010,11 +1010,12 @@ class TestTemplateVariableValidation:
         """Verifies branch template with undefined variable fails with helpful error."""
         env = mux_server
         write_workmux_config(mux_repo_path, panes=[])
+        template = "{{ base_name }}-{{ typo }}"
         result = run_workmux_command(
             env,
             workmux_exe_path,
             mux_repo_path,
-            "add my-feature -n 2 --branch-template '{{ base_name }}-{{ typo }}'",
+            f"add my-feature -n 2 --branch-template {pane_quote(template)}",
             expect_fail=True,
         )
         assert "Invalid branch name template" in result.stderr
@@ -1040,14 +1041,15 @@ class TestTemplateVariableValidation:
         )
 
         # This should succeed because platform and lang are defined by foreach
+        prompt = "Build {{ platform }} with {{ lang }}"
         run_workmux_command(
             env,
             workmux_exe_path,
             mux_repo_path,
             (
                 f"add {base_name} --foreach "
-                "'platform:ios;lang:swift' "
-                "--prompt 'Build {{ platform }} with {{ lang }}'"
+                f"{pane_quote('platform:ios;lang:swift')} "
+                f"--prompt {pane_quote(prompt)}"
             ),
         )
 
@@ -1064,14 +1066,16 @@ class TestTemplateVariableValidation:
         """Verifies typo in foreach variable name fails with helpful error."""
         env = mux_server
         write_workmux_config(mux_repo_path, panes=[{"command": "<agent>"}])
+        # typo: plattform instead of platform
+        prompt = "Build {{ plattform }}"
         result = run_workmux_command(
             env,
             workmux_exe_path,
             mux_repo_path,
             (
                 "add my-feature --foreach "
-                "'platform:ios,android' "
-                "--prompt 'Build {{ plattform }}'"  # typo: plattform instead of platform
+                f"{pane_quote('platform:ios,android')} "
+                f"--prompt {pane_quote(prompt)}"
             ),
             expect_fail=True,
         )
@@ -1103,7 +1107,7 @@ class TestPromptFileOnly:
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt {shlex.quote(prompt_text)} --prompt-file-only",
+            extra_args=f"--prompt {pane_quote(prompt_text)} --prompt-file-only",
         )
 
         # Prompt file should be written to the worktree
@@ -1145,7 +1149,7 @@ echo "ARGS:$@" > "{output_filename}"
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt {shlex.quote(prompt_text)} --prompt-file-only",
+            extra_args=f"--prompt {pane_quote(prompt_text)} --prompt-file-only",
         )
 
         # Prompt file should still be written
@@ -1186,7 +1190,7 @@ echo "ARGS:$@" > "{output_filename}"
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt {shlex.quote(prompt_text)}",
+            extra_args=f"--prompt {pane_quote(prompt_text)}",
         )
 
         assert_prompt_file_contents(env, branch_name, prompt_text, worktree_path)

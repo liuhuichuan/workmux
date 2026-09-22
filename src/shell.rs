@@ -141,6 +141,110 @@ pub fn snippet_quote(value: &str) -> String {
     shell_quote(value)
 }
 
+/// Quote `value` as one word of a command line that `dialect` will read.
+///
+/// A word carrying nothing but characters every shell passes through is left
+/// alone, which is what a Windows path needs: quoting a path the C runtime's
+/// way hands PowerShell a string where it wants a program, and a quoted program
+/// is only a program to PowerShell when the call operator names it.
+///
+/// `is_program` says whether the word is the command being run rather than one
+/// of its arguments -- the two are quoted the same way everywhere but in
+/// PowerShell, where the call operator is part of naming the program.
+pub fn word_quote(value: &str, dialect: ShellDialect, is_program: bool) -> String {
+    if !value.is_empty() && value.chars().all(is_word_character) {
+        return value.to_string();
+    }
+    match dialect {
+        ShellDialect::PowerShell => {
+            let quoted = format!("'{}'", value.replace('\'', "''"));
+            if is_program {
+                format!("& {quoted}")
+            } else {
+                quoted
+            }
+        }
+        ShellDialect::Cmd => snippet_quote(value),
+        ShellDialect::Posix => shell_quote(value),
+    }
+}
+
+/// Characters no shell here reads as syntax, so a word made of them needs no
+/// quoting: the path separators of either platform, and the punctuation of
+/// flags, versions and model names.
+fn is_word_character(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '\\' | ':' | '+' | '~')
+}
+
+/// Split a command line into the words this platform's shells pass on.
+///
+/// The POSIX rules read a backslash as an escape, which is not what a Windows
+/// path is: `C:\Users\me\claude --flag` comes back as `C:Usersmeclaude` and
+/// `--flag`, and an agent configured by path is then a program nothing has
+/// heard of. Windows keeps the backslash as a character -- it escapes a quote
+/// and nothing else -- and groups words with quotes, so a command line read off
+/// a config file is split the way the platform that will run it reads it.
+pub fn split_command_line(command: &str) -> Option<Vec<String>> {
+    #[cfg(not(windows))]
+    {
+        shlex::split(command)
+    }
+    #[cfg(windows)]
+    {
+        split_windows_command_line(command)
+    }
+}
+
+/// Split `command` the way Windows reads a command line.
+///
+/// Quoted runs -- `'...'` as the shells here accept, `"..."` as Windows does --
+/// are one word with the quotes taken off, an unmatched quote is not a command
+/// line at all, and a backslash stands for itself except in front of a quote it
+/// is escaping.
+#[cfg(windows)]
+fn split_windows_command_line(command: &str) -> Option<Vec<String>> {
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(open) if c == open => quote = None,
+            Some('"') if c == '\\' && chars.peek() == Some(&'"') => {
+                word.push('"');
+                chars.next();
+            }
+            Some(_) => word.push(c),
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    started = true;
+                }
+                c if c.is_whitespace() => {
+                    if started {
+                        words.push(std::mem::take(&mut word));
+                        started = false;
+                    }
+                }
+                c => {
+                    word.push(c);
+                    started = true;
+                }
+            },
+        }
+    }
+
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        words.push(word);
+    }
+    Some(words)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +397,85 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args, vec![script.to_string()]);
+    }
+
+    /// A command line names a program and its arguments, and on Windows the
+    /// program is usually a path: splitting it the POSIX way eats the
+    /// separators out of that path and leaves a name no shell can find.
+    #[test]
+    fn a_command_line_splits_the_way_this_platform_reads_it() {
+        if cfg!(windows) {
+            assert_eq!(
+                split_command_line(r"C:\Users\me\fake-bin\claude --verbose --model opus"),
+                Some(vec![
+                    r"C:\Users\me\fake-bin\claude".to_string(),
+                    "--verbose".to_string(),
+                    "--model".to_string(),
+                    "opus".to_string(),
+                ])
+            );
+        } else {
+            assert_eq!(
+                split_command_line("/home/me/fake-bin/claude --verbose --model opus"),
+                Some(vec![
+                    "/home/me/fake-bin/claude".to_string(),
+                    "--verbose".to_string(),
+                    "--model".to_string(),
+                    "opus".to_string(),
+                ])
+            );
+        }
+
+        // Quoted runs are one word, with the quotes taken off.
+        assert_eq!(
+            split_command_line(r#""C:\Program Files\claude" -p 'a b'"#),
+            Some(vec![
+                r"C:\Program Files\claude".to_string(),
+                "-p".to_string(),
+                "a b".to_string(),
+            ])
+        );
+        assert_eq!(split_command_line("   "), Some(vec![]));
+        assert_eq!(split_command_line(""), Some(vec![]));
+        // A quote that never closes is not a command line.
+        assert_eq!(split_command_line("claude 'unclosed"), None);
+    }
+
+    /// A word is quoted for the shell that will read it, and left bare when
+    /// that shell reads it as itself: a Windows path is one word, not a string.
+    #[test]
+    fn a_word_is_quoted_for_the_shell_that_reads_it() {
+        assert_eq!(
+            word_quote(
+                r"C:\Users\me\fake-bin\claude",
+                ShellDialect::PowerShell,
+                true
+            ),
+            r"C:\Users\me\fake-bin\claude"
+        );
+        assert_eq!(
+            word_quote(r"C:\Users\me\fake-bin\claude", ShellDialect::Posix, true),
+            r"C:\Users\me\fake-bin\claude"
+        );
+        assert_eq!(
+            word_quote(r"C:\Users\me\fake-bin\claude", ShellDialect::Cmd, true),
+            r"C:\Users\me\fake-bin\claude"
+        );
+
+        // A word that has to be quoted: PowerShell names a quoted program with
+        // the call operator, and an argument needs no such thing.
+        assert_eq!(
+            word_quote(r"C:\Program Files\claude", ShellDialect::PowerShell, true),
+            r"& 'C:\Program Files\claude'"
+        );
+        assert_eq!(word_quote("a b", ShellDialect::PowerShell, false), "'a b'");
+        assert_eq!(word_quote("a b", ShellDialect::Posix, true), "'a b'");
+        assert_eq!(word_quote("a b", ShellDialect::Posix, false), "'a b'");
+        assert_eq!(word_quote("it's", ShellDialect::Posix, false), r"'it'\''s'");
+        assert_eq!(
+            word_quote("it's", ShellDialect::PowerShell, false),
+            "'it''s'"
+        );
+        assert_eq!(word_quote("a & b", ShellDialect::Cmd, false), "\"a & b\"");
     }
 }
