@@ -468,8 +468,14 @@ mod tests {
     #[test]
     fn custom_command_can_exit_without_reading_prompt() {
         let prompt = "x".repeat(1024 * 1024);
-        let output = run_custom_command("sh -c 'printf \"fix/issue-123\\n\"'", &prompt).unwrap();
-        assert_eq!(output, "fix/issue-123\n");
+        // A command that exits without draining stdin must not fail the run;
+        // each platform spells "print and exit" its own way.
+        #[cfg(unix)]
+        let cmdline = "sh -c 'printf \"fix/issue-123\\n\"'";
+        #[cfg(windows)]
+        let cmdline = "cmd /C echo fix/issue-123";
+        let output = run_custom_command(cmdline, &prompt).unwrap();
+        assert_eq!(output.trim(), "fix/issue-123");
     }
 
     #[test]

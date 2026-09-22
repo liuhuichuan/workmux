@@ -1191,6 +1191,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_sanitized_env_normalizes_path() {
         // Test the normalization logic directly without modifying env
@@ -1308,6 +1309,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_exec_allowed_command() {
         let (mut client, _tmp, _handle) = start_exec_server(&["echo"], true);
@@ -1336,6 +1338,7 @@ mod tests {
         assert_eq!(code, 127);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_exec_shell_metacharacters_in_args_not_interpreted() {
         let (mut client, _tmp, _handle) = start_exec_server(&["echo"], true);
@@ -1356,6 +1359,7 @@ mod tests {
         assert_eq!(stdout.trim(), "hello; whoami");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_exec_env_sanitized() {
         let (mut client, _tmp, _handle) = start_exec_server(&["env"], true);
@@ -1387,6 +1391,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_exec_sandbox_blocks_ssh_read() {
         #[cfg(target_os = "linux")]
@@ -1450,6 +1455,7 @@ mod tests {
         assert_ne!(code, 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_exec_exit_code_propagated() {
         let (mut client, _tmp, _handle) = start_exec_server(&["sh"], true);
@@ -1457,6 +1463,7 @@ mod tests {
         assert_eq!(code, 42, "exit code should be propagated from child");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_exec_stderr_captured() {
         let (mut client, _tmp, _handle) = start_exec_server(&["sh"], true);
@@ -1465,6 +1472,7 @@ mod tests {
         assert_eq!(stderr.trim(), "oops");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_exec_multiple_commands_on_same_connection() {
         let (mut client, _tmp, _handle) = start_exec_server(&["echo"], true);

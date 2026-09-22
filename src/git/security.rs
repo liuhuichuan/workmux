@@ -565,10 +565,13 @@ mod tests {
         let (temp, worktree) = linked_repo();
         let global_config = temp.path().join("global-config");
         let global_excludes = temp.path().join("global-excludes");
+        // Git config treats `\` as an escape character, so the path is written
+        // in the forward-slash form Git accepts on every platform.
+        let excludes_path = global_excludes.display().to_string().replace('\\', "/");
         std::fs::write(&global_excludes, "globally-ignored\n").unwrap();
         std::fs::write(
             &global_config,
-            format!("[core]\n\texcludesFile = {}\n", global_excludes.display()),
+            format!("[core]\n\texcludesFile = {excludes_path}\n"),
         )
         .unwrap();
         std::fs::write(worktree.join("globally-ignored"), "ignored\n").unwrap();
@@ -838,6 +841,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn unprotected_status_fixture_executes_fsmonitor() {
         let (temp, worktree) = linked_repo();

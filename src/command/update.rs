@@ -153,7 +153,6 @@ fn verify_checksum(file: &std::path::Path, expected_line: &str) -> Result<()> {
 
 /// Replace the current binary with the new one, with rollback on failure.
 fn replace_binary(new_binary: &std::path::Path, current_exe: &std::path::Path) -> Result<()> {
-
     let exe_dir = current_exe
         .parent()
         .context("Could not determine binary directory")?;
@@ -167,7 +166,6 @@ fn replace_binary(new_binary: &std::path::Path, current_exe: &std::path::Path) -
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
     }
-
 
     // Rename current -> .old, then staged -> current
     let backup = exe_dir.join(".workmux.old");
@@ -416,6 +414,9 @@ pub fn run_background_check() -> Result<()> {
 mod tests {
     use super::*;
 
+    // Windows has no published release artifact, so `platform_suffix`
+    // correctly reports the platform as unsupported there.
+    #[cfg(unix)]
     #[test]
     fn test_platform_suffix_current() {
         // Should succeed on any supported CI/dev platform

@@ -1,5 +1,7 @@
 //! Shell escaping utilities.
 
+use std::process::Command;
+
 /// The command interpreter workmux hands its snippets to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellDialect {
@@ -53,6 +55,25 @@ pub fn snippet_argv(script: &str) -> Vec<String> {
     } else {
         vec!["sh".to_string(), "-c".to_string(), script.to_string()]
     }
+}
+
+/// Append `script` to `command` the way `shell` expects to receive it.
+///
+/// `cmd.exe` re-parses its own command line, so its snippet has to arrive
+/// verbatim: the C runtime quoting `Command::arg` applies would escape the
+/// quotes in e.g. `echo hi > "C:\dir\file"` and cmd would treat the backslashes
+/// as part of the file name. Every other interpreter takes its snippet through
+/// standard argument quoting.
+pub fn append_snippet(command: &mut Command, shell: &str, script: &str) {
+    #[cfg(not(windows))]
+    let _ = shell;
+    #[cfg(windows)]
+    if dialect_of(shell) == ShellDialect::Cmd {
+        use std::os::windows::process::CommandExt;
+        command.raw_arg(script);
+        return;
+    }
+    command.arg(script);
 }
 
 /// Escape single quotes within a string for use inside a single-quoted shell argument.
@@ -155,5 +176,38 @@ mod tests {
         } else {
             assert_eq!(argv[..2], ["sh".to_string(), "-c".to_string()]);
         }
+    }
+
+    /// `cmd.exe` re-parses its own command line, so a snippet containing quotes
+    /// has to reach it verbatim rather than through C runtime quoting.
+    #[cfg(windows)]
+    #[test]
+    fn append_snippet_hands_cmd_its_snippet_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out file.txt");
+        let script = format!("echo compatible > \"{}\"", output.display());
+
+        let mut command = Command::new("cmd.exe");
+        command.args(["/C"]);
+        append_snippet(&mut command, "cmd.exe", &script);
+
+        assert!(command.status().unwrap().success());
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap().trim(),
+            "compatible"
+        );
+    }
+
+    #[test]
+    fn append_snippet_passes_other_shells_a_single_argument() {
+        let script = "echo \"quoted\"";
+        let mut command = Command::new("workmux-unused-shell");
+        append_snippet(&mut command, "pwsh", script);
+
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec![script.to_string()]);
     }
 }

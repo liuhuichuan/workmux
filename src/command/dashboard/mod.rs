@@ -615,8 +615,12 @@ fn handle_terminal_event(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::{enter_terminal, leave_terminal};
 
+    // On Windows crossterm toggles mouse capture through the console API
+    // instead of emitting `?1000h`/`?1000l`, so only Unix sees the sequences.
+    #[cfg(unix)]
     #[test]
     fn terminal_control_sequences_enable_and_disable_mouse_capture() {
         let mut enter = Vec::new();

@@ -42,11 +42,17 @@ fn validate_agent_executable(config: &config::Config) -> Result<()> {
     if command.is_empty() {
         bail!("Agent command must not be empty");
     }
-    if !command
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-_.+/".contains(c))
-        || (command.contains('/') && !std::path::Path::new(command).is_absolute())
-    {
+    // Shell snippets (spaces, redirections, ...) are passed through untested;
+    // only bare names and absolute paths get the executable check. Windows
+    // paths add a drive letter and `\` separators to the alphabet.
+    let bare_name_or_path = command.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || "-_.+/".contains(c)
+            || c == std::path::MAIN_SEPARATOR
+            || (cfg!(windows) && c == ':')
+    });
+    let is_path = command.contains('/') || command.contains(std::path::MAIN_SEPARATOR);
+    if !bare_name_or_path || (is_path && !std::path::Path::new(command).is_absolute()) {
         return Ok(());
     }
     let found =
@@ -1415,8 +1421,15 @@ mod agent_validation_tests {
 
     #[test]
     fn checks_absolute_executable_paths() {
-        assert!(validate_agent_executable(&config("/bin/sh")).is_ok());
-        assert!(validate_agent_executable(&config("/nonexistent/workmux-agent")).is_err());
+        #[cfg(unix)]
+        let (installed, missing) = ("/bin/sh", "/nonexistent/workmux-agent");
+        #[cfg(windows)]
+        let (installed, missing) = (
+            r"C:\Windows\System32\cmd.exe",
+            r"C:\nonexistent\workmux-agent",
+        );
+        assert!(validate_agent_executable(&config(installed)).is_ok());
+        assert!(validate_agent_executable(&config(missing)).is_err());
     }
 
     #[test]

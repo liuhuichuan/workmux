@@ -1,13 +1,58 @@
 //! Test-only helpers shared across modules.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 pub const ISOLATED_TEST_ENV: &str = "WM_ISOLATED_TEST";
 pub const ISOLATED_TEST_CANARY: &str = "WM_ISOLATED_TEST_EXECUTED";
 
+/// Host directory for fixtures that must be absolute for container-style
+/// tooling. `/tmp` is not absolute on Windows, so those fixtures root
+/// themselves at a drive instead.
+pub const FIXTURE_ROOT: &str = if cfg!(windows) {
+    "C:/workmux-test"
+} else {
+    "/tmp"
+};
+
 pub fn is_isolated_child(test_name: &str) -> bool {
     std::env::var_os(ISOLATED_TEST_ENV).as_deref() == Some(std::ffi::OsStr::new(test_name))
+}
+
+/// Canonical form of `dir` as `std::env::current_dir` reports it.
+///
+/// `Path::canonicalize` returns `\\?\`-prefixed paths on Windows while
+/// `current_dir` does not, so the two only compare equal once the prefix is
+/// stripped.
+pub fn canonical_dir(dir: &Path) -> PathBuf {
+    let canonical = dir.canonicalize().expect("directory should canonicalize");
+    PathBuf::from(crate::util::git_path(&canonical).into_owned())
+}
+
+/// Whether this process may create file symlinks.
+///
+/// Windows needs Developer Mode or `SeCreateSymbolicLinkPrivilege`, which
+/// sandboxed test runners usually lack. Probed once per process: a denied
+/// `CreateSymbolicLink` can take tens of seconds on a Defender-heavy machine.
+pub fn file_symlinks_supported(dir: &Path) -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| probe_file_symlinks(dir))
+}
+
+fn probe_file_symlinks(dir: &Path) -> bool {
+    let target = dir.join("workmux-symlink-probe-target");
+    let link = dir.join("workmux-symlink-probe-link");
+    if std::fs::write(&target, b"").is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    let created = std::os::unix::fs::symlink(&target, &link).is_ok();
+    #[cfg(windows)]
+    let created = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_file(&target);
+    created
 }
 
 pub fn run_isolated_test(test_name: &str, cwd: &Path, envs: &[(&str, &Path)]) {

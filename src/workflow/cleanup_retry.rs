@@ -128,8 +128,8 @@ fn retry_with_clock(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::cleanup::test_identity as identity;
+    use super::*;
 
     #[derive(Default)]
     struct Clock {

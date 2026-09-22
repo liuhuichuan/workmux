@@ -196,6 +196,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let commands = vec!["just".to_string(), "cargo".to_string(), "npm".to_string()];
 
+        if !crate::test_support::file_symlinks_supported(tmp.path()) {
+            return;
+        }
+
         let shim_bin = create_shim_directory(tmp.path(), &commands).unwrap();
 
         // Dispatcher exists and is executable
@@ -216,6 +220,10 @@ mod tests {
     fn test_create_shim_directory_skips_invalid() {
         let tmp = tempfile::tempdir().unwrap();
         let commands = vec!["valid".to_string(), "/bin/evil".to_string(), "".to_string()];
+
+        if !crate::test_support::file_symlinks_supported(tmp.path()) {
+            return;
+        }
 
         let shim_bin = create_shim_directory(tmp.path(), &commands).unwrap();
         assert!(shim_bin.join("valid").exists());
@@ -252,6 +260,10 @@ mod tests {
     fn test_create_shim_directory_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let commands = vec!["just".to_string()];
+
+        if !crate::test_support::file_symlinks_supported(tmp.path()) {
+            return;
+        }
 
         create_shim_directory(tmp.path(), &commands).unwrap();
         // Running again should not error
@@ -327,6 +339,10 @@ mod tests {
             "wl-paste".to_string(),
             "xclip".to_string(),
         ];
+
+        if !crate::test_support::file_symlinks_supported(tmp.path()) {
+            return;
+        }
 
         let shim_bin = create_shim_directory(tmp.path(), &commands).unwrap();
 

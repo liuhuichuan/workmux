@@ -382,6 +382,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[cfg(unix)]
     #[test]
     fn detached_runner_preserves_hostile_shell_literals() {
         let temp = tempfile::tempdir().unwrap();

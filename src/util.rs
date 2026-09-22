@@ -609,9 +609,13 @@ mod tests {
     fn expand_worktree_dir_absolute_with_dotdot_preserved() {
         // Absolute templates must be returned verbatim, matching prior
         // create.rs behavior. No lexical normalization.
+        #[cfg(unix)]
+        let template = "/tmp/foo/../bar";
+        #[cfg(windows)]
+        let template = r"C:\tmp\foo\..\bar";
         let project = PathBuf::from("/x/y/foo");
-        let expanded = expand_worktree_dir_with_home("/tmp/foo/../bar", &project, None).unwrap();
-        assert_eq!(expanded, PathBuf::from("/tmp/foo/../bar"));
+        let expanded = expand_worktree_dir_with_home(template, &project, None).unwrap();
+        assert_eq!(expanded, PathBuf::from(template));
     }
 
     #[test]

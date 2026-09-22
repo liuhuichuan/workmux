@@ -131,6 +131,22 @@ fn open_snapshot(path: &Path) -> Result<File> {
         options.custom_flags(libc::O_NOFOLLOW);
     }
 
+    #[cfg(not(unix))]
+    {
+        // Windows refuses to open a directory at all, so the "not a regular
+        // file" report has to happen before the open. Symlinks are followed
+        // here and rejected by the reparse-point check below.
+        if !std::fs::metadata(path)
+            .context("Failed to inspect frozen configuration snapshot path")?
+            .is_file()
+        {
+            bail!(
+                "Frozen configuration snapshot must be a regular file: {}",
+                path.display()
+            );
+        }
+    }
+
     let file = options.open(path).with_context(|| {
         format!(
             "Failed to open frozen configuration snapshot: {}",

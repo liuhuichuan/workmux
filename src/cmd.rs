@@ -191,7 +191,9 @@ pub fn shell_command_with_env_mode(
     }
 
     let mut cmd = Command::new(executable);
-    cmd.args(args).arg(command).current_dir(workdir);
+    cmd.args(args);
+    crate::shell::append_snippet(&mut cmd, executable, command);
+    cmd.current_dir(workdir);
 
     match output {
         ShellOutput::Inherit => {}
@@ -232,14 +234,23 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn lifecycle_hook_default_is_bash_c() {
+    fn lifecycle_hook_default_is_the_platform_shell() {
         let temp = TempDir::new().unwrap();
         let output = temp.path().join("default-shell");
-        let command = format!("printf compatible > '{}'", output.display());
+        // The default hook shell is `bash -c` on Unix and `cmd /C` on Windows,
+        // so the snippet has to be spelled in that dialect.
+        let command = if cfg!(windows) {
+            format!("echo compatible > \"{}\"", output.display())
+        } else {
+            format!("printf compatible > '{}'", output.display())
+        };
 
         shell_command_with_env(None, &command, temp.path(), &[]).unwrap();
 
-        assert_eq!(std::fs::read_to_string(output).unwrap(), "compatible");
+        assert_eq!(
+            std::fs::read_to_string(output).unwrap().trim(),
+            "compatible"
+        );
     }
 
     #[cfg(unix)]

@@ -1581,6 +1581,30 @@ mod tests {
         }
     }
 
+    /// `target=` paths of the generated `--mount` arguments, canonicalized and
+    /// paired with their read-only flag so that comparisons survive Windows
+    /// separator style and extended-length prefixes.
+    fn mount_targets(args: &[String]) -> Vec<(PathBuf, bool)> {
+        args.iter()
+            .filter_map(|arg| {
+                let mut target = None;
+                let mut read_only = false;
+                for field in arg.split(',') {
+                    if let Some(value) = field.strip_prefix("target=") {
+                        target = Some(value);
+                    } else if field == "readonly" {
+                        read_only = true;
+                    }
+                }
+                let path = Path::new(target?);
+                Some((
+                    path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
+                    read_only,
+                ))
+            })
+            .collect()
+    }
+
     #[test]
     fn docker_mounts_git_policy_separately_from_writable_data() {
         let (temp, main, worktree) = linked_worktree();
@@ -1619,10 +1643,10 @@ mod tests {
             "target={},readonly",
             identity.admin_dir.join("commondir").display()
         )));
-        assert!(joined.contains(&format!(
-            "target={},readonly",
-            main.canonicalize().unwrap().display()
-        )));
+        assert!(
+            mount_targets(&args).contains(&(main.canonicalize().unwrap(), true)),
+            "main worktree must be mounted read-only: {args:?}"
+        );
         assert!(joined.contains(&format!(
             "target={}",
             identity.common_dir.join("config").display()
@@ -1953,13 +1977,9 @@ mod tests {
 
         // The joined path preserves `..`, but critically it is absolute
         // (anchored at the worktree root) so Docker can resolve it.
-        let resolved_main_env = wt.join("../main/.env");
-        let expected = format!(
-            "type=bind,source=/dev/null,target={},readonly",
-            resolved_main_env.display()
-        );
+        let masked_env = main.join(".env").canonicalize().unwrap();
         assert!(
-            args.contains(&expected),
+            mount_targets(&args).contains(&(masked_env, true)),
             "expected main-worktree alias masked at absolute path, got: {:?}",
             args
         );
@@ -1982,8 +2002,10 @@ mod tests {
                     .strip_prefix("source=")
                     .or_else(|| kv.strip_prefix("target="))
                 {
+                    // Guest paths such as `/dev/null` or `/tmp/.claude` are
+                    // POSIX container paths, not host paths.
                     assert!(
-                        v.starts_with('/'),
+                        v.starts_with('/') || Path::new(v).is_absolute(),
                         "mount spec has non-absolute path in {kv:?} (full: {m})"
                     );
                 }
@@ -2242,30 +2264,33 @@ mod tests {
     fn test_build_args_extra_mounts_readonly() {
         use crate::config::ExtraMount;
 
+        let notes = format!("{}/notes", crate::test_support::FIXTURE_ROOT);
         let mut config = sandbox_config(SandboxRuntime::Docker, |_| {});
-        config.extra_mounts = Some(vec![ExtraMount::Path("/tmp/notes".to_string())]);
+        config.extra_mounts = Some(vec![ExtraMount::Path(notes.clone())]);
         let args = test_build_run_args(&config, false);
 
         let args_str = args.join(" ");
-        assert!(args_str.contains("type=bind,source=/tmp/notes,target=/tmp/notes,readonly"));
+        assert!(args_str.contains(&format!("type=bind,source={notes},target={notes},readonly")));
     }
 
     #[test]
     fn test_build_args_extra_mounts_writable_with_guest_path() {
         use crate::config::ExtraMount;
 
+        let data = format!("{}/data", crate::test_support::FIXTURE_ROOT);
+        let mounted = format!("{}/mnt/data", crate::test_support::FIXTURE_ROOT);
         let mut config = sandbox_config(SandboxRuntime::Docker, |_| {});
         config.extra_mounts = Some(vec![ExtraMount::Spec {
-            host_path: "/tmp/data".to_string(),
-            guest_path: Some("/mnt/data".to_string()),
+            host_path: data.clone(),
+            guest_path: Some(mounted.clone()),
             writable: Some(true),
         }]);
         let args = test_build_run_args(&config, false);
 
         let args_str = args.join(" ");
-        assert!(args_str.contains("type=bind,source=/tmp/data,target=/mnt/data"));
+        assert!(args_str.contains(&format!("type=bind,source={data},target={mounted}")));
         // Readonly stays absent.
-        assert!(!args_str.contains("/tmp/data,target=/mnt/data,readonly"));
+        assert!(!args_str.contains(&format!("{data},target={mounted},readonly")));
     }
 
     #[test]

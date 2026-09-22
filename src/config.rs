@@ -5198,42 +5198,50 @@ agents:
 
     #[test]
     fn test_extra_mount_parse_simple_string() {
-        let yaml = r#"extra_mounts: ["/tmp/notes"]"#;
-        let config: SandboxConfig = serde_yaml::from_str(yaml).unwrap();
+        let notes = format!("{}/notes", crate::test_support::FIXTURE_ROOT);
+        let yaml = format!(r#"extra_mounts: ["{notes}"]"#);
+        let config: SandboxConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(config.extra_mounts().len(), 1);
         let (host, guest, read_only) = config.extra_mounts()[0].resolve().unwrap();
-        assert_eq!(host, std::path::PathBuf::from("/tmp/notes"));
-        assert_eq!(guest, std::path::PathBuf::from("/tmp/notes"));
+        assert_eq!(host, std::path::PathBuf::from(&notes));
+        assert_eq!(guest, std::path::PathBuf::from(&notes));
         assert!(read_only);
     }
 
     #[test]
     fn test_extra_mount_parse_spec() {
-        let yaml = r#"
+        let data = format!("{}/data", crate::test_support::FIXTURE_ROOT);
+        let mounted = format!("{}/mnt/data", crate::test_support::FIXTURE_ROOT);
+        let yaml = format!(
+            r#"
 extra_mounts:
-  - host_path: /tmp/data
-    guest_path: /mnt/data
+  - host_path: {data}
+    guest_path: {mounted}
     writable: true
-"#;
-        let config: SandboxConfig = serde_yaml::from_str(yaml).unwrap();
+"#
+        );
+        let config: SandboxConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(config.extra_mounts().len(), 1);
         let (host, guest, read_only) = config.extra_mounts()[0].resolve().unwrap();
-        assert_eq!(host, std::path::PathBuf::from("/tmp/data"));
-        assert_eq!(guest, std::path::PathBuf::from("/mnt/data"));
+        assert_eq!(host, std::path::PathBuf::from(&data));
+        assert_eq!(guest, std::path::PathBuf::from(&mounted));
         assert!(!read_only);
     }
 
     #[test]
     fn test_extra_mount_spec_defaults() {
-        let yaml = r#"
+        let data = format!("{}/data", crate::test_support::FIXTURE_ROOT);
+        let yaml = format!(
+            r#"
 extra_mounts:
-  - host_path: /tmp/data
-"#;
-        let config: SandboxConfig = serde_yaml::from_str(yaml).unwrap();
+  - host_path: {data}
+"#
+        );
+        let config: SandboxConfig = serde_yaml::from_str(&yaml).unwrap();
         let (host, guest, read_only) = config.extra_mounts()[0].resolve().unwrap();
-        assert_eq!(host, std::path::PathBuf::from("/tmp/data"));
+        assert_eq!(host, std::path::PathBuf::from(&data));
         // guest defaults to host path
-        assert_eq!(guest, std::path::PathBuf::from("/tmp/data"));
+        assert_eq!(guest, std::path::PathBuf::from(&data));
         // writable defaults to false (read_only = true)
         assert!(read_only);
     }
@@ -5244,30 +5252,35 @@ extra_mounts:
         let (host, guest, _) = mount.resolve().unwrap();
         // Should expand ~ to home dir
         assert!(!host.to_string_lossy().starts_with('~'));
-        assert!(host.to_string_lossy().ends_with("/notes"));
+        assert_eq!(host, home::home_dir().unwrap().join("notes"));
         // Guest should mirror expanded host
         assert_eq!(host, guest);
     }
 
     #[test]
     fn test_extra_mount_mixed_list() {
-        let yaml = r#"
+        let notes = format!("{}/notes", crate::test_support::FIXTURE_ROOT);
+        let data = format!("{}/data", crate::test_support::FIXTURE_ROOT);
+        let mounted = format!("{}/mnt/data", crate::test_support::FIXTURE_ROOT);
+        let yaml = format!(
+            r#"
 extra_mounts:
-  - /tmp/notes
-  - host_path: /tmp/data
-    guest_path: /mnt/data
+  - {notes}
+  - host_path: {data}
+    guest_path: {mounted}
     writable: true
-"#;
-        let config: SandboxConfig = serde_yaml::from_str(yaml).unwrap();
+"#
+        );
+        let config: SandboxConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(config.extra_mounts().len(), 2);
 
         let (host0, _, ro0) = config.extra_mounts()[0].resolve().unwrap();
-        assert_eq!(host0, std::path::PathBuf::from("/tmp/notes"));
+        assert_eq!(host0, std::path::PathBuf::from(&notes));
         assert!(ro0);
 
         let (host1, guest1, ro1) = config.extra_mounts()[1].resolve().unwrap();
-        assert_eq!(host1, std::path::PathBuf::from("/tmp/data"));
-        assert_eq!(guest1, std::path::PathBuf::from("/mnt/data"));
+        assert_eq!(host1, std::path::PathBuf::from(&data));
+        assert_eq!(guest1, std::path::PathBuf::from(&mounted));
         assert!(!ro1);
     }
 
@@ -5280,13 +5293,15 @@ extra_mounts:
     #[test]
     fn test_extra_mounts_global_only() {
         // Project config is ignored -- only global matters
-        let global = sandbox_extra_mounts(&["/global/path"]);
-        let project = sandbox_extra_mounts(&["/project/path"]);
+        let global_path = format!("{}/global/path", crate::test_support::FIXTURE_ROOT);
+        let project_path = format!("{}/project/path", crate::test_support::FIXTURE_ROOT);
+        let global = sandbox_extra_mounts(&[global_path.as_str()]);
+        let project = sandbox_extra_mounts(&[project_path.as_str()]);
 
         let merged = global.merge(project);
         assert_eq!(merged.sandbox.extra_mounts().len(), 1);
         let (host, _, _) = merged.sandbox.extra_mounts()[0].resolve().unwrap();
-        assert_eq!(host, std::path::PathBuf::from("/global/path"));
+        assert_eq!(host, std::path::PathBuf::from(&global_path));
     }
 
     #[test]
@@ -5300,13 +5315,14 @@ extra_mounts:
 
     #[test]
     fn test_extra_mounts_uses_global() {
-        let global = sandbox_extra_mounts(&["/global/path"]);
+        let global_path = format!("{}/global/path", crate::test_support::FIXTURE_ROOT);
+        let global = sandbox_extra_mounts(&[global_path.as_str()]);
         let project = Config::default();
 
         let merged = global.merge(project);
         assert_eq!(merged.sandbox.extra_mounts().len(), 1);
         let (host, _, _) = merged.sandbox.extra_mounts()[0].resolve().unwrap();
-        assert_eq!(host, std::path::PathBuf::from("/global/path"));
+        assert_eq!(host, std::path::PathBuf::from(&global_path));
     }
 
     #[test]
@@ -5409,7 +5425,7 @@ extra_mounts:
     #[test]
     fn test_extra_mount_rejects_relative_guest_path() {
         let mount = ExtraMount::Spec {
-            host_path: "/tmp/data".to_string(),
+            host_path: format!("{}/data", crate::test_support::FIXTURE_ROOT),
             guest_path: Some("relative/guest".to_string()),
             writable: None,
         };

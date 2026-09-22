@@ -700,7 +700,7 @@ mod tests {
         let repo_b = temp.join("repo-b");
         assert_eq!(
             std::env::current_dir().unwrap(),
-            repo_a.canonicalize().unwrap()
+            test_support::canonical_dir(&repo_a)
         );
 
         let worktree_path = temp.join("repo-b__worktrees").join("feature");

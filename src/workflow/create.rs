@@ -1363,7 +1363,7 @@ mod tests {
         let non_repo = temp.join("not-a-repo");
         assert_eq!(
             std::env::current_dir().unwrap(),
-            non_repo.canonicalize().unwrap()
+            test_support::canonical_dir(&non_repo)
         );
 
         let config = Config::default();

@@ -58,8 +58,11 @@ fn try_run(run_dir: &Path) -> Result<()> {
     let (program, args) = argv
         .split_first()
         .expect("snippet_argv always returns a program");
-    let mut child = Command::new(program)
-        .args(args)
+    let (flags, snippet) = args.split_at(args.len() - 1);
+    let mut command = Command::new(program);
+    command.args(flags);
+    crate::shell::append_snippet(&mut command, program, &snippet[0]);
+    let mut child = command
         .current_dir(&spec.worktree_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -67,6 +70,7 @@ fn try_run(run_dir: &Path) -> Result<()> {
         .spawn()
         .context("Failed to spawn command")?;
 
+    #[cfg(unix)]
     let child_pid = child.id();
     let running = Arc::new(AtomicBool::new(true));
 

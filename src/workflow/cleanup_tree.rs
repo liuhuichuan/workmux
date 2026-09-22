@@ -148,9 +148,7 @@ pub(super) fn remove(path: &Path, expected: DirectoryIdentity) -> io::Result<()>
         Err(error) => return Err(error),
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(io::Error::other(
-            "Quarantined worktree is not a directory",
-        ));
+        return Err(io::Error::other("Quarantined worktree is not a directory"));
     }
     if !metadata_matches(path, &metadata, expected) {
         return Err(io::Error::other(
@@ -362,9 +360,9 @@ pub(super) mod before_rmdir {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::cleanup::test_identity as identity;
     use super::super::cleanup::test_symlink_dir;
+    use super::*;
 
     #[test]
     fn removes_nested_files_without_following_symlinks() {
