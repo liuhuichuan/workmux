@@ -61,3 +61,16 @@ jobs:
           tests/venv/bin/pip install -r tests/requirements.txt
       - name: Run Python test suite
         run: just itest
+
+  windows-unit-tests:
+    name: Windows unit tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The port's Windows-only code paths are covered by `#[cfg(windows)]`
+      # tests that the Linux jobs never run, and the justfile needs a POSIX
+      # shell, so call cargo directly.
+      - name: Run unit tests
+        run: cargo test --bin workmux
