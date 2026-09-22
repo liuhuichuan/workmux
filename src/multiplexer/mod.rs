@@ -649,6 +649,33 @@ pub trait Multiplexer: Send + Sync {
         command: Option<&str>,
     ) -> Result<String>;
 
+    /// Split a pane, running `argv` in the new one with no shell in between.
+    ///
+    /// The default puts the words into the command string the platform shell
+    /// takes, for backends whose panes run their command through one. A backend
+    /// whose panes take a program and its arguments themselves overrides this
+    /// and passes the words on untouched, which is what a caller wants when it
+    /// has the words and nothing that a shell would do to them.
+    fn split_pane_argv(
+        &self,
+        target_pane_id: &str,
+        direction: &SplitDirection,
+        cwd: &Path,
+        size: Option<u16>,
+        percentage: Option<u8>,
+        argv: &[String],
+    ) -> Result<String> {
+        let command = shell_command(argv);
+        self.split_pane(
+            target_pane_id,
+            direction,
+            cwd,
+            size,
+            percentage,
+            Some(&command),
+        )
+    }
+
     /// Setup panes in a window according to configuration.
     ///
     /// Default implementation handles the full orchestration: command resolution,
@@ -999,6 +1026,17 @@ pub trait Multiplexer: Send + Sync {
     }
 }
 
+/// The command string that runs `argv` under the platform shell.
+///
+/// Every word is quoted the way that shell takes it, so a word holding a space
+/// arrives as one word and a word holding a quote does not end the word.
+fn shell_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|word| crate::shell::snippet_quote(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Detect which backend to use based on environment.
 ///
 /// Checks `$WORKMUX_BACKEND` first for an explicit override, then auto-detects
@@ -1167,6 +1205,33 @@ mod tests {
         ];
 
         assert!(adoption_targets(records, "wm-work", None, &worktree).is_empty());
+    }
+
+    /// A backend whose panes run a command string is given the words as one,
+    /// quoted the way the platform shell takes them, so a word with a space in
+    /// it arrives as one word.
+    #[test]
+    fn argv_becomes_a_command_string_the_platform_shell_takes() {
+        let argv = vec![
+            r"C:\Program Files\workmux.exe".to_string(),
+            "_exec".to_string(),
+            "--run-dir".to_string(),
+            r"C:\workmux runs\42".to_string(),
+        ];
+
+        let command = shell_command(&argv);
+
+        if cfg!(windows) {
+            assert_eq!(
+                command,
+                r#""C:\Program Files\workmux.exe" _exec --run-dir "C:\workmux runs\42""#
+            );
+        } else {
+            assert_eq!(
+                command,
+                r"'C:\Program Files\workmux.exe' _exec --run-dir 'C:\workmux runs\42'"
+            );
+        }
     }
 
     #[test]
