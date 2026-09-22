@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use super::util::PaneCommandShell;
 use crate::config::{AgentEntry, AgentEnvValue, Config};
 
 /// Describes agent-specific behaviors for command rewriting and status handling.
@@ -47,9 +48,10 @@ pub trait AgentProfile: Send + Sync {
 
     /// Format the prompt injection argument for this agent.
     ///
-    /// Returns the CLI fragment to append (e.g., `-- "$(cat PROMPT.md)"`).
-    fn prompt_argument(&self, prompt_path: &str) -> String {
-        format!("-- \"$(cat {})\"", prompt_path)
+    /// Returns the CLI fragment to append (e.g., `-- "$(cat PROMPT.md)"`),
+    /// reading the file in the syntax `shell` evaluates.
+    fn prompt_argument(&self, prompt_path: &str, shell: PaneCommandShell) -> String {
+        format!("-- \"{}\"", shell.file_argument(prompt_path))
     }
 
     /// Subcommand to insert after the executable when launching.
@@ -122,8 +124,8 @@ impl AgentProfile for GeminiProfile {
         Some("--yolo")
     }
 
-    fn prompt_argument(&self, prompt_path: &str) -> String {
-        format!("-i \"$(cat {})\"", prompt_path)
+    fn prompt_argument(&self, prompt_path: &str, shell: PaneCommandShell) -> String {
+        format!("-i \"{}\"", shell.file_argument(prompt_path))
     }
 
     fn auto_name_command(&self) -> Option<&'static str> {
@@ -150,8 +152,8 @@ impl AgentProfile for AntigravityProfile {
         Some("--dangerously-skip-permissions")
     }
 
-    fn prompt_argument(&self, prompt_path: &str) -> String {
-        format!("-i \"$(cat {})\"", prompt_path)
+    fn prompt_argument(&self, prompt_path: &str, shell: PaneCommandShell) -> String {
+        format!("-i \"{}\"", shell.file_argument(prompt_path))
     }
 
     fn auto_name_command(&self) -> Option<&'static str> {
@@ -174,8 +176,8 @@ impl AgentProfile for OpenCodeProfile {
         true
     }
 
-    fn prompt_argument(&self, prompt_path: &str) -> String {
-        format!("--prompt \"$(cat {})\"", prompt_path)
+    fn prompt_argument(&self, prompt_path: &str, shell: PaneCommandShell) -> String {
+        format!("--prompt \"{}\"", shell.file_argument(prompt_path))
     }
 
     fn auto_name_command(&self) -> Option<&'static str> {
@@ -222,8 +224,8 @@ impl AgentProfile for KiroProfile {
         Some("chat")
     }
 
-    fn prompt_argument(&self, prompt_path: &str) -> String {
-        format!("\"$(cat {})\"", prompt_path)
+    fn prompt_argument(&self, prompt_path: &str, shell: PaneCommandShell) -> String {
+        format!("\"{}\"", shell.file_argument(prompt_path))
     }
 
     fn auto_name_command(&self) -> Option<&'static str> {
@@ -246,8 +248,8 @@ impl AgentProfile for VibeProfile {
         Some("--agent auto-approve")
     }
 
-    fn prompt_argument(&self, prompt_path: &str) -> String {
-        format!("\"$(cat {})\"", prompt_path)
+    fn prompt_argument(&self, prompt_path: &str, shell: PaneCommandShell) -> String {
+        format!("\"{}\"", shell.file_argument(prompt_path))
     }
 
     fn continue_flag(&self) -> Option<&'static str> {
@@ -270,8 +272,8 @@ impl AgentProfile for GrokProfile {
         Some("--yolo")
     }
 
-    fn prompt_argument(&self, prompt_path: &str) -> String {
-        format!("\"$(cat {})\"", prompt_path)
+    fn prompt_argument(&self, prompt_path: &str, shell: PaneCommandShell) -> String {
+        format!("\"{}\"", shell.file_argument(prompt_path))
     }
 
     fn continue_flag(&self) -> Option<&'static str> {
@@ -290,8 +292,8 @@ impl AgentProfile for PiProfile {
         true
     }
 
-    fn prompt_argument(&self, prompt_path: &str) -> String {
-        format!("\"$(cat {})\"", prompt_path)
+    fn prompt_argument(&self, prompt_path: &str, shell: PaneCommandShell) -> String {
+        format!("\"{}\"", shell.file_argument(prompt_path))
     }
 
     fn auto_name_command(&self) -> Option<&'static str> {
@@ -314,8 +316,8 @@ impl AgentProfile for OmpProfile {
         true
     }
 
-    fn prompt_argument(&self, prompt_path: &str) -> String {
-        format!("\"$(cat {})\"", prompt_path)
+    fn prompt_argument(&self, prompt_path: &str, shell: PaneCommandShell) -> String {
+        format!("\"{}\"", shell.file_argument(prompt_path))
     }
 
     fn auto_name_command(&self) -> Option<&'static str> {
@@ -656,7 +658,7 @@ mod tests {
         assert!(profile.needs_bang_delay());
         assert!(profile.needs_auto_status());
         assert_eq!(
-            profile.prompt_argument("PROMPT.md"),
+            profile.prompt_argument("PROMPT.md", PaneCommandShell::Posix),
             "-- \"$(cat PROMPT.md)\""
         );
         assert_eq!(
@@ -674,7 +676,7 @@ mod tests {
         assert!(!profile.needs_bang_delay());
         assert!(!profile.needs_auto_status());
         assert_eq!(
-            profile.prompt_argument("PROMPT.md"),
+            profile.prompt_argument("PROMPT.md", PaneCommandShell::Posix),
             "-i \"$(cat PROMPT.md)\""
         );
         assert_eq!(profile.skip_permissions_flag(), Some("--yolo"));
@@ -692,7 +694,7 @@ mod tests {
         assert!(!profile.needs_bang_delay());
         assert!(profile.needs_auto_status());
         assert_eq!(
-            profile.prompt_argument("PROMPT.md"),
+            profile.prompt_argument("PROMPT.md", PaneCommandShell::Posix),
             "-i \"$(cat PROMPT.md)\""
         );
         assert_eq!(
@@ -713,7 +715,7 @@ mod tests {
         assert!(!profile.needs_bang_delay());
         assert!(profile.needs_auto_status());
         assert_eq!(
-            profile.prompt_argument("PROMPT.md"),
+            profile.prompt_argument("PROMPT.md", PaneCommandShell::Posix),
             "--prompt \"$(cat PROMPT.md)\""
         );
         assert_eq!(profile.auto_name_command(), Some("opencode run"));
@@ -728,7 +730,7 @@ mod tests {
         assert!(profile.uses_bracketed_paste_for_input());
         assert!(!profile.needs_auto_status());
         assert_eq!(
-            profile.prompt_argument("PROMPT.md"),
+            profile.prompt_argument("PROMPT.md", PaneCommandShell::Posix),
             "-- \"$(cat PROMPT.md)\""
         );
         assert_eq!(profile.skip_permissions_flag(), Some("--yolo"));
@@ -746,7 +748,10 @@ mod tests {
         assert!(!profile.needs_bang_delay());
         assert!(!profile.needs_auto_status());
         assert_eq!(profile.default_subcommand(), Some("chat"));
-        assert_eq!(profile.prompt_argument("PROMPT.md"), "\"$(cat PROMPT.md)\"");
+        assert_eq!(
+            profile.prompt_argument("PROMPT.md", PaneCommandShell::Posix),
+            "\"$(cat PROMPT.md)\""
+        );
         assert_eq!(profile.skip_permissions_flag(), None);
         assert_eq!(
             profile.auto_name_command(),
@@ -761,7 +766,10 @@ mod tests {
         assert_eq!(profile.name(), "vibe");
         assert!(!profile.needs_bang_delay());
         assert!(!profile.needs_auto_status());
-        assert_eq!(profile.prompt_argument("PROMPT.md"), "\"$(cat PROMPT.md)\"");
+        assert_eq!(
+            profile.prompt_argument("PROMPT.md", PaneCommandShell::Posix),
+            "\"$(cat PROMPT.md)\""
+        );
         assert_eq!(
             profile.skip_permissions_flag(),
             Some("--agent auto-approve")
@@ -776,7 +784,10 @@ mod tests {
         assert_eq!(profile.name(), "grok");
         assert!(!profile.needs_bang_delay());
         assert!(profile.needs_auto_status());
-        assert_eq!(profile.prompt_argument("PROMPT.md"), "\"$(cat PROMPT.md)\"");
+        assert_eq!(
+            profile.prompt_argument("PROMPT.md", PaneCommandShell::Posix),
+            "\"$(cat PROMPT.md)\""
+        );
         assert_eq!(profile.skip_permissions_flag(), Some("--yolo"));
         assert_eq!(profile.auto_name_command(), None);
         assert_eq!(profile.continue_flag(), Some("--continue"));
@@ -788,7 +799,10 @@ mod tests {
         assert_eq!(profile.name(), "pi");
         assert!(!profile.needs_bang_delay());
         assert!(profile.needs_auto_status());
-        assert_eq!(profile.prompt_argument("PROMPT.md"), "\"$(cat PROMPT.md)\"");
+        assert_eq!(
+            profile.prompt_argument("PROMPT.md", PaneCommandShell::Posix),
+            "\"$(cat PROMPT.md)\""
+        );
         assert_eq!(profile.skip_permissions_flag(), None);
         assert_eq!(profile.auto_name_command(), Some("pi -p"));
         assert_eq!(profile.continue_flag(), Some("--continue"));
@@ -800,7 +814,10 @@ mod tests {
         assert_eq!(profile.name(), "omp");
         assert!(!profile.needs_bang_delay());
         assert!(profile.needs_auto_status());
-        assert_eq!(profile.prompt_argument("PROMPT.md"), "\"$(cat PROMPT.md)\"");
+        assert_eq!(
+            profile.prompt_argument("PROMPT.md", PaneCommandShell::Posix),
+            "\"$(cat PROMPT.md)\""
+        );
         assert_eq!(profile.skip_permissions_flag(), None);
         assert_eq!(profile.auto_name_command(), Some("omp -p"));
         assert_eq!(profile.continue_flag(), Some("--continue"));
@@ -813,7 +830,7 @@ mod tests {
         assert!(!profile.needs_bang_delay());
         assert!(!profile.needs_auto_status());
         assert_eq!(
-            profile.prompt_argument("PROMPT.md"),
+            profile.prompt_argument("PROMPT.md", PaneCommandShell::Posix),
             "-- \"$(cat PROMPT.md)\""
         );
         assert_eq!(profile.auto_name_command(), None);

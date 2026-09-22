@@ -37,6 +37,65 @@ pub fn is_posix_shell(shell: &str) -> bool {
     matches!(shell_name, "bash" | "zsh" | "sh" | "dash" | "ksh" | "ash")
 }
 
+/// The shell that evaluates a command workmux sends to a pane, and the launcher
+/// it needs when the pane's own shell cannot evaluate it.
+///
+/// A Unix pane always has a POSIX shell to fall back on, so a fish or nu pane
+/// gets a `sh -c` wrapper. Windows has no `sh`: a PowerShell pane evaluates
+/// `$(...)` itself, and `cmd.exe`, which substitutes nothing, is handed a
+/// PowerShell that does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneCommandShell {
+    /// The pane's own POSIX shell.
+    Posix,
+    /// A `sh -c` wrapper around a shell that is not POSIX.
+    PosixWrapped,
+    /// The pane's own PowerShell.
+    PowerShell,
+    /// A `powershell -Command` wrapper around a `cmd.exe` pane.
+    PowerShellWrapped,
+}
+
+impl PaneCommandShell {
+    /// Classify the shell a pane runs.
+    pub fn of(shell: &str) -> Self {
+        if is_posix_shell(shell) {
+            Self::Posix
+        } else if !cfg!(windows) {
+            Self::PosixWrapped
+        } else if crate::shell::dialect_of(shell) == crate::shell::ShellDialect::PowerShell {
+            Self::PowerShell
+        } else {
+            Self::PowerShellWrapped
+        }
+    }
+
+    /// The contents of `path` as a single argument, in this shell's
+    /// substitution syntax.
+    ///
+    /// PowerShell needs `-Raw`: `Get-Content` otherwise yields one string per
+    /// line, and a subexpression in a quoted string joins those with spaces.
+    pub fn file_argument(self, path: &str) -> String {
+        match self {
+            Self::Posix | Self::PosixWrapped => format!("$(cat {path})"),
+            Self::PowerShell | Self::PowerShellWrapped => {
+                format!("$(Get-Content -Raw '{}')", path.replace('\'', "''"))
+            }
+        }
+    }
+
+    /// Hand `command` to the launcher this shell needs, if any.
+    pub fn wrap(self, command: &str) -> String {
+        match self {
+            Self::Posix | Self::PowerShell => command.to_string(),
+            Self::PosixWrapped => wrap_for_non_posix_shell(command),
+            Self::PowerShellWrapped => {
+                format!("powershell -NoProfile -Command \"{command}\"")
+            }
+        }
+    }
+}
+
 /// Return the last `lines` lines from terminal output.
 pub fn tail_lines(output: &str, lines: u16) -> String {
     let all_lines: Vec<&str> = output.lines().collect();
@@ -185,7 +244,7 @@ pub struct ResolvedCommand {
     /// Command before prompt injection, so `render_command` stays idempotent.
     base_command: String,
     prompt_argument: Option<String>,
-    posix_shell: bool,
+    pane_shell: PaneCommandShell,
     use_agent_command: bool,
     apply_agent_prefix: bool,
 }
@@ -200,11 +259,8 @@ impl ResolvedCommand {
         if let Some(prompt_argument) = &self.prompt_argument {
             command.push(' ');
             command.push_str(prompt_argument);
-            command = if self.posix_shell {
-                command
-            } else {
-                wrap_for_non_posix_shell(&command)
-            };
+            let wrapped = self.pane_shell.wrap(&command);
+            command = wrapped;
             command.insert(0, ' ');
         }
         command
@@ -246,6 +302,7 @@ pub fn resolve_pane_command_with_config(
     if !run_commands {
         return None;
     }
+    let pane_shell = PaneCommandShell::of(shell);
 
     let default_agent = super::agent::resolve_selected_agent(config, task_agent);
     let mut selected_agent = None;
@@ -300,7 +357,9 @@ pub fn resolve_pane_command_with_config(
     let prompt_argument = selected_agent.as_ref().and_then(|agent| {
         prompt_file_path.map(|prompt_path| {
             let relative = prompt_path.strip_prefix(working_dir).unwrap_or(prompt_path);
-            agent.profile.prompt_argument(&relative.to_string_lossy())
+            agent
+                .profile
+                .prompt_argument(&relative.to_string_lossy(), pane_shell)
         })
     });
     let prompt_injected = prompt_argument.is_some();
@@ -316,7 +375,7 @@ pub fn resolve_pane_command_with_config(
         prompt_injected,
         selected_agent,
         prompt_argument,
-        posix_shell: is_posix_shell(shell),
+        pane_shell,
         use_agent_command,
         apply_agent_prefix,
     };
@@ -458,6 +517,74 @@ mod tests {
     fn test_is_posix_shell_fish() {
         assert!(!is_posix_shell("/usr/bin/fish"));
         assert!(!is_posix_shell("/opt/homebrew/bin/fish"));
+    }
+
+    #[test]
+    fn pane_command_shell_classifies_posix_panes() {
+        assert_eq!(PaneCommandShell::of("/bin/bash"), PaneCommandShell::Posix);
+        assert_eq!(PaneCommandShell::of("/bin/zsh"), PaneCommandShell::Posix);
+        assert_eq!(PaneCommandShell::of("/bin/sh"), PaneCommandShell::Posix);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_command_shell_wraps_non_posix_panes_in_sh() {
+        assert_eq!(
+            PaneCommandShell::of("/usr/bin/fish"),
+            PaneCommandShell::PosixWrapped
+        );
+        assert_eq!(
+            PaneCommandShell::of("/opt/homebrew/bin/nu"),
+            PaneCommandShell::PosixWrapped
+        );
+        assert_eq!(
+            PaneCommandShell::PosixWrapped.wrap("claude -- prompt"),
+            "sh -c 'claude -- prompt'"
+        );
+    }
+
+    /// `cmd.exe` substitutes nothing and Windows has no `sh`, so a command it
+    /// cannot evaluate is handed to a PowerShell; a PowerShell pane evaluates
+    /// `$(...)` itself.
+    #[cfg(windows)]
+    #[test]
+    fn pane_command_shell_wraps_cmd_panes_in_powershell() {
+        assert_eq!(
+            PaneCommandShell::of("C:\\Windows\\system32\\cmd.exe"),
+            PaneCommandShell::PowerShellWrapped
+        );
+        assert_eq!(
+            PaneCommandShell::of("powershell.exe"),
+            PaneCommandShell::PowerShell
+        );
+        assert_eq!(
+            PaneCommandShell::PowerShellWrapped.wrap("claude -- prompt"),
+            "powershell -NoProfile -Command \"claude -- prompt\""
+        );
+        assert_eq!(
+            PaneCommandShell::PowerShell.wrap("claude -- prompt"),
+            "claude -- prompt"
+        );
+    }
+
+    #[test]
+    fn pane_command_shell_reads_a_file_in_its_own_dialect() {
+        assert_eq!(
+            PaneCommandShell::Posix.file_argument("PROMPT.md"),
+            "$(cat PROMPT.md)"
+        );
+        assert_eq!(
+            PaneCommandShell::PosixWrapped.file_argument("PROMPT.md"),
+            "$(cat PROMPT.md)"
+        );
+        assert_eq!(
+            PaneCommandShell::PowerShell.file_argument("PROMPT.md"),
+            "$(Get-Content -Raw 'PROMPT.md')"
+        );
+        assert_eq!(
+            PaneCommandShell::PowerShellWrapped.file_argument("it's.md"),
+            "$(Get-Content -Raw 'it''s.md')"
+        );
     }
 
     // --- escape_for_double_quotes tests ---
@@ -690,6 +817,7 @@ mod tests {
         assert_eq!(resolved.render_command(), resolved.command);
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_structured_pane_command_wraps_non_posix_shell() {
         let prompt = PathBuf::from("/tmp/worktree/PROMPT.md");
@@ -706,6 +834,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.command, " sh -c 'claude -- \"$(cat PROMPT.md)\"'");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_structured_pane_command_wraps_cmd_shell() {
+        let prompt = PathBuf::from("/tmp/worktree/PROMPT.md");
+        let working_dir = PathBuf::from("/tmp/worktree");
+        let config = config_with_agent("claude");
+        let resolved = resolve_pane_command_with_config(
+            Some("<agent>"),
+            true,
+            Some(&prompt),
+            &working_dir,
+            &config,
+            None,
+            "cmd.exe",
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.command,
+            " powershell -NoProfile -Command \"claude -- \"$(Get-Content -Raw 'PROMPT.md')\"\""
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_structured_pane_command_reads_the_prompt_file_raw_in_powershell() {
+        let prompt = PathBuf::from("/tmp/worktree/PROMPT.md");
+        let working_dir = PathBuf::from("/tmp/worktree");
+        let config = config_with_agent("claude");
+        let resolved = resolve_pane_command_with_config(
+            Some("<agent>"),
+            true,
+            Some(&prompt),
+            &working_dir,
+            &config,
+            None,
+            "powershell.exe",
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.command,
+            " claude -- \"$(Get-Content -Raw 'PROMPT.md')\""
+        );
     }
 
     #[test]
