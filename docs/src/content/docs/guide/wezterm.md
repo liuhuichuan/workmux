@@ -100,6 +100,7 @@ Without this configuration, the dashboard can display agents from all workspaces
 - Sidebar panes are tracked by the ids workmux records in its settings file, not by title: WezTerm applies a pane's title only on its focused tab, so a sidebar started by hand (`_sidebar-run`) is found only while its tab is focused
 - On Windows, `wezterm cli list-clients` reports nothing, so host-window focus is read from the active tab: "the window is focused" and "the tab is active" are the same signal
 - `wezterm cli` waits on the mux server for as long as the server takes to answer, and a mux can stop answering for good -- this is what a wedged WezTerm GUI looks like. Every call workmux makes runs under a 20-second deadline instead: the call is killed and reported as an error, so a mux that is gone reads as "Failed to list WezTerm panes" rather than taking the caller down with it
+- `wezterm cli` is a process per call, so a listing is read once and shared by everything in that run that asks for it (`workmux list` was measured at ten readings of the same listing). Any command that can change the panes drops the reading, and the callers that run in a loop -- the sidebar's poll, a dashboard refresh, a state reconciliation -- read the mux again on every turn
 - Some edge cases may not be as thoroughly tested as the tmux backend
 
 ## Credits

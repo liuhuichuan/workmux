@@ -8,7 +8,7 @@ use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::cmd::Cmd;
@@ -98,7 +98,7 @@ fn pane_id_from_env(value: Option<&str>) -> Option<String> {
 }
 
 /// WezTerm pane information from `wezterm cli list --format json`
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct WezTermPane {
     // The following fields are required for JSON deserialization from `wezterm cli list`
     // but are not used after parsing. The allow(dead_code) suppresses false positives.
@@ -129,7 +129,7 @@ struct WezTermPane {
 }
 
 /// Cell extent of a pane, as `wezterm cli list` reports it.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct WezTermPaneSize {
     rows: u16,
     cols: u16,
@@ -203,6 +203,74 @@ fn drop_url_trailing_separator(path: PathBuf) -> PathBuf {
     PathBuf::from(trimmed)
 }
 
+/// The panes workmux last read from the mux.
+///
+/// A `wezterm cli` call is a whole process on Windows, measured at 69-230 ms,
+/// and one workmux command asks the mux the same question many times: `workmux
+/// list` was measured at ten identical `wezterm cli list --format json` runs.
+/// The panes of an instance are one fact, so a reading is kept and the reads
+/// that follow use it -- until something could have changed them, which is any
+/// other command workmux runs, or a caller that asks for the panes now.
+#[derive(Default)]
+struct PaneReading {
+    panes: Mutex<Option<Vec<WezTermPane>>>,
+}
+
+impl PaneReading {
+    /// The reading held, or one read from the mux and held now.
+    fn get_or_read(
+        &self,
+        read: impl FnOnce() -> Result<Vec<WezTermPane>>,
+    ) -> Result<Vec<WezTermPane>> {
+        if let Some(panes) = self.held() {
+            return Ok(panes);
+        }
+        self.read_now(read)
+    }
+
+    /// A reading taken from the mux now, held for the reads that follow.
+    ///
+    /// A caller that runs in a loop reads this way: the panes change underneath
+    /// a sidebar or a dashboard, and every turn of the loop has to see it.
+    fn read_now(
+        &self,
+        read: impl FnOnce() -> Result<Vec<WezTermPane>>,
+    ) -> Result<Vec<WezTermPane>> {
+        let panes = read()?;
+        if let Ok(mut held) = self.panes.lock() {
+            *held = Some(panes.clone());
+        }
+        Ok(panes)
+    }
+
+    /// Drop the reading: the next one is read from the mux.
+    fn forget(&self) {
+        if let Ok(mut held) = self.panes.lock() {
+            *held = None;
+        }
+    }
+
+    fn held(&self) -> Option<Vec<WezTermPane>> {
+        self.panes.lock().ok()?.clone()
+    }
+}
+
+/// The reading this process holds, if it has taken one.
+static PANES: OnceLock<PaneReading> = OnceLock::new();
+
+fn panes_reading() -> &'static PaneReading {
+    PANES.get_or_init(PaneReading::default)
+}
+
+/// Whether a `wezterm cli` command line is a listing.
+///
+/// A listing reports the panes it finds, so running one cannot invalidate a
+/// reading; every other subcommand can. The subcommand is the argument that
+/// follows `cli`.
+fn asks_for_a_listing(args: &[&str]) -> bool {
+    args.get(1) == Some(&"list")
+}
+
 /// WezTerm backend implementation.
 ///
 /// Relies on inherited WEZTERM_UNIX_SOCKET and WEZTERM_PANE environment variables.
@@ -234,11 +302,32 @@ impl WezTermBackend {
         Cmd::new(wezterm_program()).timeout(WEZTERM_CLI_TIMEOUT)
     }
 
-    /// Query all panes from WezTerm.
+    /// A `wezterm cli` command, ready to run.
+    ///
+    /// Nothing but a listing leaves the panes as they are: a spawn, a kill, a
+    /// retitle, a rename, or a focus change all show up in the next listing, so
+    /// any other subcommand drops the reading workmux holds.
+    fn cli<'a>(&self, args: &[&'a str]) -> Cmd<'a> {
+        if !asks_for_a_listing(args) {
+            panes_reading().forget();
+        }
+        self.wezterm_cmd().args(args)
+    }
+
+    /// Query all panes from WezTerm, as read earlier in this run if they were.
     fn list_panes(&self) -> Result<Vec<WezTermPane>> {
+        panes_reading().get_or_read(|| self.read_panes())
+    }
+
+    /// Query all panes from WezTerm now, for a caller that runs in a loop.
+    fn list_panes_now(&self) -> Result<Vec<WezTermPane>> {
+        panes_reading().read_now(|| self.read_panes())
+    }
+
+    /// Ask WezTerm for its panes, and parse what it reports.
+    fn read_panes(&self) -> Result<Vec<WezTermPane>> {
         let output = self
-            .wezterm_cmd()
-            .args(&["cli", "list", "--format", "json"])
+            .cli(&["cli", "list", "--format", "json"])
             .run_and_capture_stdout()
             .context("Failed to list WezTerm panes")?;
 
@@ -346,8 +435,7 @@ impl WezTermBackend {
 
     /// Set the tab title for a pane.
     fn set_tab_title(&self, pane_id: &str, title: &str) -> Result<()> {
-        self.wezterm_cmd()
-            .args(&["cli", "set-tab-title", "--pane-id", pane_id, title])
+        self.cli(&["cli", "set-tab-title", "--pane-id", pane_id, title])
             .run()
             .context("Failed to set tab title")?;
         Ok(())
@@ -403,8 +491,7 @@ impl WezTermBackend {
         }
 
         let output = self
-            .wezterm_cmd()
-            .args(&args)
+            .cli(&args)
             .run_and_capture_stdout()
             .context("Failed to split WezTerm pane")?;
 
@@ -485,10 +572,15 @@ pub(crate) struct InstancePanes {
     pub live: HashMap<String, LivePaneInfo>,
 }
 
-/// Read the instance once, for callers that need both shapes.
+/// Read the instance now, for callers that need both shapes.
+///
+/// The reading is taken from the mux rather than reused, because the caller
+/// runs in a loop -- a sidebar poll, a dashboard refresh, a state
+/// reconciliation -- and every turn of it has to see the mux as it is. The
+/// reads that follow in the same turn reuse what this one read.
 pub(crate) fn instance_panes() -> Result<InstancePanes> {
     let backend = WezTermBackend::new();
-    let panes = backend.list_panes()?;
+    let panes = backend.list_panes_now()?;
     Ok(instance_panes_from(&backend, &panes))
 }
 
@@ -522,10 +614,12 @@ fn summarize(panes: &[WezTermPane]) -> Vec<PaneSummary> {
 }
 
 /// Run a `wezterm cli` subcommand and return its standard output.
+///
+/// The backend makes the command, so that a subcommand which can change the
+/// panes drops the reading workmux holds.
 pub(crate) fn cli(args: &[&str]) -> Result<String> {
     WezTermBackend::new()
-        .wezterm_cmd()
-        .args(args)
+        .cli(args)
         .run_and_capture_stdout()
         .with_context(|| format!("Failed to run wezterm {}", args.join(" ")))
 }
@@ -555,7 +649,7 @@ impl Multiplexer for WezTermBackend {
     // === Server/Session ===
 
     fn is_running(&self) -> Result<bool> {
-        self.wezterm_cmd().args(&["cli", "list"]).run_as_check()
+        self.cli(&["cli", "list"]).run_as_check()
     }
 
     fn current_pane_id(&self) -> Option<String> {
@@ -594,8 +688,7 @@ impl Multiplexer for WezTermBackend {
         // params.after_window is ignored (different from tmux)
         // spawn without --new-window creates a new tab in the current window
         let output = self
-            .wezterm_cmd()
-            .args(&["cli", "spawn", "--cwd", &*cwd_str])
+            .cli(&["cli", "spawn", "--cwd", &*cwd_str])
             .run_and_capture_stdout()
             .context("Failed to create WezTerm tab")?;
 
@@ -645,8 +738,7 @@ impl Multiplexer for WezTermBackend {
         // Kill in reverse order (last pane first)
         for pane in tab_panes.iter().rev() {
             let _ = self
-                .wezterm_cmd()
-                .args(&["cli", "kill-pane", "--pane-id", &pane.pane_id.to_string()])
+                .cli(&["cli", "kill-pane", "--pane-id", &pane.pane_id.to_string()])
                 .run();
         }
         Ok(())
@@ -745,15 +837,14 @@ impl Multiplexer for WezTermBackend {
             .next()
             .ok_or_else(|| anyhow!("Window '{}' not found", full_name))?;
 
-        self.wezterm_cmd()
-            .args(&[
-                "cli",
-                "activate-tab",
-                "--tab-id",
-                &target.tab_id.to_string(),
-            ])
-            .run()
-            .context("Failed to activate tab")?;
+        self.cli(&[
+            "cli",
+            "activate-tab",
+            "--tab-id",
+            &target.tab_id.to_string(),
+        ])
+        .run()
+        .context("Failed to activate tab")?;
         Ok(())
     }
 
@@ -796,8 +887,7 @@ impl Multiplexer for WezTermBackend {
     // === Pane Management ===
 
     fn select_pane(&self, pane_id: &str) -> Result<()> {
-        self.wezterm_cmd()
-            .args(&["cli", "activate-pane", "--pane-id", pane_id])
+        self.cli(&["cli", "activate-pane", "--pane-id", pane_id])
             .run()
             .context("Failed to select pane")?;
         Ok(())
@@ -823,8 +913,7 @@ impl Multiplexer for WezTermBackend {
     }
 
     fn kill_pane(&self, pane_id: &str) -> Result<()> {
-        self.wezterm_cmd()
-            .args(&["cli", "kill-pane", "--pane-id", pane_id])
+        self.cli(&["cli", "kill-pane", "--pane-id", pane_id])
             .run()?;
         Ok(())
     }
@@ -846,8 +935,7 @@ impl Multiplexer for WezTermBackend {
 
         if let Some(sib) = sibling {
             // Has sibling: kill target, split from sibling
-            self.wezterm_cmd()
-                .args(&["cli", "kill-pane", "--pane-id", pane_id])
+            self.cli(&["cli", "kill-pane", "--pane-id", pane_id])
                 .run()?;
 
             let new_pane_id = self.split_pane_internal(
@@ -875,8 +963,7 @@ impl Multiplexer for WezTermBackend {
             }
 
             let output = self
-                .wezterm_cmd()
-                .args(&args)
+                .cli(&args)
                 .run_and_capture_stdout()
                 .context("Failed to spawn new tab")?;
 
@@ -886,10 +973,7 @@ impl Multiplexer for WezTermBackend {
             self.set_tab_title(&new_pane_id, &original_tab_title)?;
 
             // Kill old pane (tab will close but new tab exists)
-            let _ = self
-                .wezterm_cmd()
-                .args(&["cli", "kill-pane", "--pane-id", pane_id])
-                .run();
+            let _ = self.cli(&["cli", "kill-pane", "--pane-id", pane_id]).run();
 
             Ok(new_pane_id)
         }
@@ -899,8 +983,7 @@ impl Multiplexer for WezTermBackend {
         // Note: We don't use --escapes to avoid partial escape sequences like (B
         // appearing in the preview. Plain text is cleaner for dashboard display.
         let output = self
-            .wezterm_cmd()
-            .args(&["cli", "get-text", "--pane-id", pane_id])
+            .cli(&["cli", "get-text", "--pane-id", pane_id])
             .run_and_capture_stdout()
             .ok()?;
 
@@ -910,8 +993,7 @@ impl Multiplexer for WezTermBackend {
     // === Text I/O ===
 
     fn send_text_fragment(&self, pane_id: &str, text: &str) -> Result<()> {
-        self.wezterm_cmd()
-            .args(&["cli", "send-text", "--pane-id", pane_id, "--no-paste", text])
+        self.cli(&["cli", "send-text", "--pane-id", pane_id, "--no-paste", text])
             .run()
             .context("Failed to send text to pane")
             .map(|_| ())
@@ -922,8 +1004,7 @@ impl Multiplexer for WezTermBackend {
     }
 
     fn send_key(&self, pane_id: &str, key: &str) -> Result<()> {
-        self.wezterm_cmd()
-            .args(&["cli", "send-text", "--pane-id", pane_id, "--no-paste", key])
+        self.cli(&["cli", "send-text", "--pane-id", pane_id, "--no-paste", key])
             .run()
             .context("Failed to send key to pane")?;
         Ok(())
@@ -931,8 +1012,7 @@ impl Multiplexer for WezTermBackend {
 
     fn paste_text(&self, pane_id: &str, content: &str) -> Result<()> {
         // Without --no-paste, WezTerm uses bracketed paste
-        self.wezterm_cmd()
-            .args(&["cli", "send-text", "--pane-id", pane_id, content])
+        self.cli(&["cli", "send-text", "--pane-id", pane_id, content])
             .run()?;
 
         Ok(())
@@ -1121,6 +1201,7 @@ fn send_pane_switch_signal(workspace: &str, tab_title: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     /// A pane carrying `cwd`, with the other fields at values nothing reads.
     fn pane_at(cwd: &str) -> WezTermPane {
@@ -1150,6 +1231,100 @@ mod tests {
     fn pane_id_from_env_reads_the_callers_own_pane() {
         assert_eq!(pane_id_from_env(Some("12")), Some("12".to_string()));
         assert_eq!(pane_id_from_env(Some(" 12 ")), Some("12".to_string()));
+    }
+
+    /// Two reads of the panes in one run are one question, and the mux is asked
+    /// once: a `wezterm cli` call is a process on Windows, and `workmux list`
+    /// was measured asking for the same listing ten times.
+    #[test]
+    fn a_run_reads_the_panes_once() {
+        let reading = PaneReading::default();
+        let reads = Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok(vec![pane_at("file:///C:/repo")])
+        };
+
+        assert_eq!(reading.get_or_read(read).unwrap().len(), 1);
+        assert_eq!(reading.get_or_read(read).unwrap().len(), 1);
+        assert_eq!(reads.get(), 1);
+    }
+
+    /// Anything that can change the panes drops the reading, so the question
+    /// after a spawn or a kill is put to the mux instead of being answered from
+    /// what it said before.
+    #[test]
+    fn a_command_that_can_change_the_panes_drops_the_reading() {
+        let reading = PaneReading::default();
+        let reads = Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok(vec![pane_at("file:///C:/repo")])
+        };
+
+        let _ = reading.get_or_read(read).unwrap();
+        reading.forget();
+        let _ = reading.get_or_read(read).unwrap();
+        assert_eq!(reads.get(), 2);
+    }
+
+    /// A caller that runs in a loop reads the mux again on every turn, and the
+    /// reading it takes is the one the rest of that turn uses.
+    #[test]
+    fn a_loop_reads_the_mux_again_on_every_turn() {
+        let reading = PaneReading::default();
+        let reads = Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Ok(vec![pane_at("file:///C:/repo")])
+        };
+
+        let _ = reading.read_now(read).unwrap();
+        let _ = reading.read_now(read).unwrap();
+        let _ = reading.get_or_read(read).unwrap();
+        assert_eq!(reads.get(), 2);
+    }
+
+    /// A mux that does not answer is asked again rather than remembered as
+    /// having no panes: an unreachable mux must not read as an empty one.
+    #[test]
+    fn a_failed_read_is_not_held() {
+        let reading = PaneReading::default();
+        let reads = Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Err(anyhow!("mux is gone"))
+        };
+
+        assert!(reading.get_or_read(read).is_err());
+        assert!(reading.get_or_read(read).is_err());
+        assert_eq!(reads.get(), 2);
+        assert!(reading.held().is_none());
+    }
+
+    /// A listing is kept, and the subcommands that can change what a listing
+    /// would show are not.
+    #[test]
+    fn only_a_listing_keeps_the_reading() {
+        assert!(asks_for_a_listing(&["cli", "list"]));
+        assert!(asks_for_a_listing(&["cli", "list", "--format", "json"]));
+        assert!(!asks_for_a_listing(&["cli", "kill-pane", "--pane-id", "3"]));
+        assert!(!asks_for_a_listing(&["cli", "spawn", "--cwd", "C:\\repo"]));
+        assert!(!asks_for_a_listing(&[
+            "cli",
+            "activate-tab",
+            "--tab-id",
+            "1"
+        ]));
+        // The pane this is sent to is free to be called anything, including
+        // "list": the subcommand is the argument after `cli`.
+        assert!(!asks_for_a_listing(&[
+            "cli",
+            "send-text",
+            "--pane-id",
+            "3",
+            "list"
+        ]));
     }
 
     #[test]
