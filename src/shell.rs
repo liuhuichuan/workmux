@@ -116,6 +116,31 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
+/// Quote `value` as one argument for the shell `snippet_argv` names.
+///
+/// A POSIX quoted argument is not a quoted argument to `cmd.exe`, which has no
+/// single-quote form: it looks for a program whose name carries the quotes and
+/// fails. cmd quotes with `"`, so anything outside the plain set is wrapped in
+/// one. A path stays bare, which is also what lets it survive a hand-off that
+/// escapes any quote it finds.
+pub fn snippet_quote(value: &str) -> String {
+    if cfg!(windows) {
+        /// Characters cmd reads as syntax rather than as text.
+        const UNSAFE: &[char] = &[' ', '\t', '"', '&', '|', '<', '>', '^', '(', ')', '%', '!'];
+
+        if value.is_empty() {
+            return "\"\"".to_string();
+        }
+        if !value.contains(UNSAFE) {
+            return value.to_string();
+        }
+        // cmd has no escape for a quote inside a quoted argument, so doubling
+        // it is as far as a command line can carry.
+        return format!("\"{}\"", value.replace('"', "\"\""));
+    }
+    shell_quote(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +234,31 @@ mod tests {
             assert_eq!(argv[..2], ["cmd.exe".to_string(), "/C".to_string()]);
         } else {
             assert_eq!(argv[..2], ["sh".to_string(), "-c".to_string()]);
+        }
+    }
+
+    /// The shell `snippet_argv` names has to be able to read what
+    /// `snippet_quote` writes: cmd rejects the POSIX single-quoted form, and a
+    /// path stays bare so that a hand-off which escapes quotes still delivers it.
+    #[test]
+    fn snippet_quote_matches_the_snippet_shell() {
+        if cfg!(windows) {
+            assert_eq!(snippet_quote("plain"), "plain");
+            assert_eq!(
+                snippet_quote(r"C:\workmux\workmux.exe"),
+                r"C:\workmux\workmux.exe"
+            );
+            assert_eq!(
+                snippet_quote(r"C:\Program Files\workmux.exe"),
+                r#""C:\Program Files\workmux.exe""#
+            );
+            assert_eq!(snippet_quote("a & b"), "\"a & b\"");
+            assert_eq!(snippet_quote(""), "\"\"");
+        } else {
+            assert_eq!(snippet_quote("plain"), "plain");
+            assert_eq!(snippet_quote("a b"), "'a b'");
+            assert_eq!(snippet_quote("it's"), "'it'\\''s'");
+            assert_eq!(snippet_quote(""), "''");
         }
     }
 
