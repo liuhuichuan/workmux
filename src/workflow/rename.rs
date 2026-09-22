@@ -1,15 +1,19 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
-use tracing::{info, warn};
+use std::collections::HashSet;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::config::MuxMode;
-use crate::multiplexer::util::prefixed;
+use crate::multiplexer::handle::mode_label;
+use crate::multiplexer::{AgentPane, Multiplexer, ResumeMode, util::prefixed};
 use crate::state::StateStore;
 use crate::util::canon_or_self;
 use crate::{git, naming};
+use tracing::{info, warn};
 
 use super::context::WorkflowContext;
-use super::types::RenameResult;
+use super::types::{RenameResult, SetupOptions};
 
 /// Rename a worktree, its tmux window/session, per-worktree git metadata,
 /// agent state files, and (optionally) the branch.
@@ -146,6 +150,31 @@ pub fn rename(
     //    the worktree being moved, we'd otherwise lose our CWD.
     context.chdir_to_main_worktree()?;
 
+    // 9a. Windows cannot rename a directory while a live process sits in it, and
+    //     a workmux pane's shell always sits in its worktree, so close the
+    //     affected pane(s) and wait for the shell to release the path. Runs
+    //     before the metadata migration so a failure here needs no rollback.
+    let closed_panes = if should_close_panes(
+        MOVE_NEEDS_CLOSED_PANES,
+        mux_running,
+        attachment.manages_mux(),
+        new_handle != old_handle,
+    ) {
+        let agent = agent_running_in(&old_path, context.mux.as_ref());
+        info!(handle = %old_handle, mode = ?mode, "rename:closing panes that hold the directory");
+        let closed = close_panes_for_move(
+            context.mux.as_ref(),
+            mode,
+            &old_full,
+            context.config.default_session(),
+        )?;
+        // Only reconnect what was connected: a worktree whose window is already
+        // closed (`workmux close`) has to stay closed.
+        closed.then(|| ClosedPanes { agent })
+    } else {
+        None
+    };
+
     // 10. Migrate metadata first so a successful path move leaves attachment
     // state keyed by the resulting handle.
     if new_handle != old_handle {
@@ -232,6 +261,57 @@ pub fn rename(
         }
     };
 
+    // 15. Reopen the pane(s) the move had to close, with the options `resurrect`
+    //     uses for an existing worktree: no hooks or file ops, but the pane
+    //     commands and the agent's previous conversation.
+    let mut mux_reopened = None;
+    let mut mux_reopen_error = None;
+    if let Some(closed) = closed_panes {
+        let options = SetupOptions {
+            run_hooks: false,
+            run_file_ops: false,
+            run_pane_commands: true,
+            prompt_file_path: None,
+            focus_window: false,
+            working_dir: None,
+            config_root: None,
+            open_if_exists: false,
+            mode,
+            target_window_name: None,
+            target_session_name: None,
+            window_session_name: None,
+            window_token: None,
+            primary_window: true,
+            resume_mode: ResumeMode::Continue,
+        };
+        let target_name = new_full.clone();
+        match super::open(
+            &new_handle,
+            context,
+            options,
+            false,
+            None,
+            None,
+            closed.agent.as_deref(),
+        ) {
+            Ok(_) => {
+                info!(handle = %new_handle, target = %target_name, "rename:reopened worktree");
+                mux_reopened = Some(target_name);
+            }
+            Err(error) => {
+                let error = error.context(format!(
+                    "Worktree renamed, but its {} '{}' could not be reopened; run \
+                     'workmux open {}' to reopen it",
+                    mode_label(mode),
+                    target_name,
+                    new_handle
+                ));
+                warn!(handle = %new_handle, error = %error, "rename:failed to reopen worktree");
+                mux_reopen_error = Some(error);
+            }
+        }
+    }
+
     Ok(RenameResult {
         old_path,
         new_path,
@@ -241,6 +321,165 @@ pub fn rename(
         new_branch,
         tmux_renamed,
         agents_migrated,
+        mux_reopened,
+        mux_reopen_error,
+    })
+}
+
+/// Windows cannot rename a directory while any process sits in it, and a
+/// workmux pane's shell always sits in its worktree, so the target has to be
+/// closed for the move. Unix renames the directory under live processes without
+/// complaint, so it keeps the pane and its scrollback.
+#[cfg(windows)]
+const MOVE_NEEDS_CLOSED_PANES: bool = true;
+#[cfg(not(windows))]
+const MOVE_NEEDS_CLOSED_PANES: bool = false;
+
+/// How long a closed pane's shell gets to release the worktree path, matching
+/// the deferred-cleanup worker that waits for the same release.
+const PANE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const PANE_CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Whether the move needs the worktree's multiplexer target closed first. The
+/// platform flag is a parameter rather than a `cfg!` so tests can pin both
+/// behaviours.
+fn should_close_panes(
+    platform_needs_closed_panes: bool,
+    mux_running: bool,
+    manages_mux: bool,
+    handle_changed: bool,
+) -> bool {
+    platform_needs_closed_panes && mux_running && manages_mux && handle_changed
+}
+
+/// Panes closed so their worktree could be renamed, kept so the caller can
+/// reopen the worktree afterwards.
+struct ClosedPanes {
+    /// Agent the closed panes were running; relaunched on reopen.
+    agent: Option<String>,
+}
+
+/// Close the worktree's live target and wait until it is gone, so the move
+/// cannot race a shell that still sits in the directory. Reports whether there
+/// was a target to close, so an already-closed worktree stays closed.
+fn close_panes_for_move(
+    mux: &dyn Multiplexer,
+    mode: MuxMode,
+    full_name: &str,
+    default_session: Option<&str>,
+) -> Result<bool> {
+    match mode {
+        MuxMode::Session => {
+            if !mux.session_exists(full_name)? {
+                return Ok(false);
+            }
+            if mux.current_session().as_deref() == Some(full_name) {
+                bail!("{}", own_pane_error(mode, full_name));
+            }
+            mux.kill_session_to(full_name, default_session)?;
+            wait_for_panes_to_close(full_name, PANE_CLOSE_TIMEOUT, || {
+                mux.session_exists(full_name)
+            })?;
+            Ok(true)
+        }
+        MuxMode::Window => {
+            let current = mux.current_window_name().unwrap_or(None);
+            let names = window_names_for_handle(
+                &mux.get_all_window_names()?,
+                full_name,
+                current.as_deref(),
+            )?;
+            if names.is_empty() {
+                return Ok(false);
+            }
+            for name in &names {
+                mux.kill_window(name)?;
+            }
+            wait_for_panes_to_close(full_name, PANE_CLOSE_TIMEOUT, || {
+                let live = mux.get_all_window_names()?;
+                Ok(names.iter().any(|name| live.contains(name)))
+            })?;
+            Ok(true)
+        }
+    }
+}
+
+/// Names of the worktree's open window(s), numbered duplicates included.
+fn window_names_for_handle(
+    all: &HashSet<String>,
+    full_name: &str,
+    current: Option<&str>,
+) -> Result<Vec<String>> {
+    let re = duplicate_name_regex(full_name);
+    let mut names: Vec<String> = all
+        .iter()
+        .filter(|name| re.is_match(name))
+        .cloned()
+        .collect();
+    names.sort();
+    if let Some(current) = current
+        && names.iter().any(|name| name == current)
+    {
+        bail!("{}", own_pane_error(MuxMode::Window, current));
+    }
+    Ok(names)
+}
+
+/// Renaming cannot close the caller's own pane: the shell hosting this process
+/// sits in the directory too, and closing it would kill us mid-move.
+fn own_pane_error(mode: MuxMode, full_name: &str) -> String {
+    format!(
+        "Cannot rename while running inside {} '{}': a directory with a live process \
+         in it cannot be moved. Run 'workmux rename' from another window.",
+        mode_label(mode),
+        full_name
+    )
+}
+
+/// Poll `still_open` until the closed pane releases the worktree path.
+fn wait_for_panes_to_close(
+    full_name: &str,
+    timeout: Duration,
+    mut still_open: impl FnMut() -> Result<bool>,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !still_open()? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Timed out waiting for '{}' to close; close it and retry the rename",
+                full_name
+            );
+        }
+        std::thread::sleep(PANE_CLOSE_POLL_INTERVAL);
+    }
+}
+
+/// Agent the worktree's live panes run, so reopening it resumes the same one.
+/// Best effort: a failed lookup just means the configured agent is used.
+fn agent_running_in(worktree: &Path, mux: &dyn Multiplexer) -> Option<String> {
+    let panes = StateStore::new().ok()?.load_reconciled_agents(mux).ok()?;
+    reopen_agent(&panes, worktree)
+}
+
+/// Pick the agent to relaunch from the panes of one worktree, preferring the
+/// canonical profile name so `open` can resolve it through the agent config.
+fn reopen_agent(panes: &[AgentPane], worktree: &Path) -> Option<String> {
+    let worktree = canon_or_self(worktree);
+    let mut matching: Vec<&AgentPane> = panes
+        .iter()
+        .filter(|pane| {
+            let path = canon_or_self(&pane.path);
+            path == worktree || path.starts_with(&worktree)
+        })
+        .collect();
+    matching.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+    matching.into_iter().find_map(|pane| {
+        pane.agent_kind
+            .clone()
+            .or_else(|| pane.agent_command.clone())
     })
 }
 
@@ -305,5 +544,140 @@ mod tests {
         assert!(!re.is_match("wm-feature-x"));
         assert!(!re.is_match("wm-feature2"));
         assert!(!re.is_match("other"));
+    }
+
+    fn pane_at(
+        path: &Path,
+        pane_id: &str,
+        agent_kind: Option<&str>,
+        agent_command: Option<&str>,
+    ) -> AgentPane {
+        serde_json::from_value(serde_json::json!({
+            "session": "test",
+            "window_name": "wm-feature",
+            "pane_id": pane_id,
+            "path": path,
+            "agent_kind": agent_kind,
+            "agent_command": agent_command,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn should_close_panes_only_where_the_platform_needs_it() {
+        assert!(should_close_panes(true, true, true, true));
+        assert!(!should_close_panes(false, true, true, true));
+        assert!(!should_close_panes(true, false, true, true));
+        assert!(!should_close_panes(true, true, false, true));
+        assert!(!should_close_panes(true, true, true, false));
+    }
+
+    #[test]
+    fn window_names_for_handle_includes_numbered_duplicates() {
+        let all: HashSet<String> = ["wm-feature", "wm-feature-2", "wm-feature-x", "wm-other"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(
+            window_names_for_handle(&all, "wm-feature", None).unwrap(),
+            vec!["wm-feature".to_string(), "wm-feature-2".to_string()]
+        );
+        assert!(
+            window_names_for_handle(&all, "wm-absent", None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn window_names_for_handle_refuses_the_callers_own_window() {
+        let all: HashSet<String> = ["wm-feature", "wm-feature-2"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let error = window_names_for_handle(&all, "wm-feature", Some("wm-feature-2"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("running inside window 'wm-feature-2'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn wait_for_panes_to_close_returns_once_the_pane_is_gone() {
+        let mut polls = 0;
+        wait_for_panes_to_close("wm-feature", Duration::from_secs(30), || {
+            polls += 1;
+            Ok(polls < 3)
+        })
+        .unwrap();
+        assert_eq!(polls, 3);
+    }
+
+    #[test]
+    fn wait_for_panes_to_close_times_out() {
+        let error = wait_for_panes_to_close("wm-feature", Duration::ZERO, || Ok(true))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Timed out waiting for 'wm-feature'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn wait_for_panes_to_close_propagates_errors() {
+        let error = wait_for_panes_to_close("wm-feature", Duration::from_secs(30), || {
+            Err(anyhow!("multiplexer went away"))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("multiplexer went away"), "{error}");
+    }
+
+    #[test]
+    fn reopen_agent_prefers_the_canonical_profile_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("feature");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let panes = [pane_at(
+            &worktree,
+            "1",
+            Some("claude"),
+            Some("claude --verbose"),
+        )];
+        assert_eq!(reopen_agent(&panes, &worktree).as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn reopen_agent_falls_back_to_the_launch_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("feature");
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        let panes = [pane_at(
+            &worktree.join("src"),
+            "1",
+            None,
+            Some("codex exec"),
+        )];
+        assert_eq!(
+            reopen_agent(&panes, &worktree).as_deref(),
+            Some("codex exec")
+        );
+    }
+
+    #[test]
+    fn reopen_agent_ignores_panes_of_other_worktrees() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("feature");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(temp.path().join("other")).unwrap();
+        let panes = [
+            pane_at(&temp.path().join("other"), "1", Some("codex"), None),
+            pane_at(&worktree, "2", None, None),
+        ];
+        assert_eq!(reopen_agent(&panes, &worktree), None);
+        assert_eq!(reopen_agent(&panes[..1], &worktree), None);
     }
 }

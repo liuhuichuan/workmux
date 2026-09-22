@@ -84,6 +84,12 @@ pub struct RenameResult {
     pub tmux_renamed: usize,
     /// Number of agent state files updated.
     pub agents_migrated: usize,
+    /// Full name of the multiplexer target reopened after the move. Set when the
+    /// platform had to close it first (Windows cannot rename a directory that a
+    /// live process sits in).
+    pub mux_reopened: Option<String>,
+    /// Set when the move succeeded but the worktree could not be reopened.
+    pub mux_reopen_error: Option<anyhow::Error>,
 }
 
 #[derive(Clone, Debug)]

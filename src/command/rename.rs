@@ -46,6 +46,14 @@ pub fn run(names: Vec<String>, rename_branch: bool) -> Result<()> {
         println!("✓ Renamed {} tmux {}", result.tmux_renamed, noun);
     }
 
+    if let Some(ref reopened) = result.mux_reopened {
+        println!("✓ Reopened '{}'", reopened);
+    }
+
+    if let Some(error) = &result.mux_reopen_error {
+        eprintln!("\nWarning: {error:#}");
+    }
+
     if result.agents_migrated > 0 {
         let noun = if result.agents_migrated == 1 {
             "file"
