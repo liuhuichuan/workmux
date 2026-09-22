@@ -1,7 +1,7 @@
 //! Run a command in a worktree's tmux/wezterm window.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -163,21 +163,26 @@ pub fn run(
     }
 }
 
-/// Stream new content from file starting at given position, return new position.
+/// Copy the bytes a run's command has written since `pos`, and report the
+/// position they were copied up to.
+///
+/// Bytes, not lines: a command writes in the console's code page, so the output
+/// of `ping` on a Chinese Windows is GBK, which is not UTF-8. A reader that
+/// decodes such output as lines stops at the first byte it cannot read, and
+/// stops there for good -- every later look from the same position fails the
+/// same way -- so the rest of the run's output is dropped in silence.
 fn stream_new_content<W: Write>(file: &mut File, pos: u64, out: &mut W) -> u64 {
     if file.seek(SeekFrom::Start(pos)).is_err() {
         return pos;
     }
 
-    let mut reader = BufReader::new(file);
     let mut new_pos = pos;
-
+    let mut buffer = [0u8; 8192];
     loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
+        match file.read(&mut buffer) {
             Ok(0) => break, // EOF
             Ok(n) => {
-                let _ = out.write_all(line.as_bytes());
+                let _ = out.write_all(&buffer[..n]);
                 let _ = out.flush();
                 new_pos += n as u64;
             }
@@ -220,5 +225,57 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let exec_cmd = "/tmp/workmux _exec --run-dir /tmp/runs/1";
         assert_eq!(pane_command(dir.path(), exec_cmd).unwrap(), exec_cmd);
+    }
+
+    /// A command's output reaches the caller as the bytes it wrote: a Windows
+    /// command writes in the console's code page, so the output of `ping` on a
+    /// Chinese Windows is GBK, which is not UTF-8.
+    #[test]
+    fn output_that_is_not_utf8_is_streamed_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout");
+        // `ping 127.0.0.1` on a Chinese Windows, in GBK.
+        let ping = b"\xd5\xfd\xd4\xda Ping 127.0.0.1\r\n\xbb\xd8\xb8\xb4: \xd7\xd6\xbd\xda=32\r\n";
+        std::fs::write(&path, ping).unwrap();
+
+        let mut file = File::open(&path).unwrap();
+        let mut streamed = Vec::new();
+        let pos = stream_new_content(&mut file, 0, &mut streamed);
+
+        assert_eq!(streamed.as_slice(), ping.as_slice());
+        assert_eq!(pos, ping.len() as u64);
+    }
+
+    /// Output written after an earlier look is still streamed, and a later look
+    /// resumes where the last one stopped rather than repeating it.
+    #[test]
+    fn output_written_later_is_streamed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout");
+        std::fs::write(&path, "first\n").unwrap();
+
+        let mut file = File::open(&path).unwrap();
+        let mut streamed = Vec::new();
+        let pos = stream_new_content(&mut file, 0, &mut streamed);
+        assert_eq!(streamed.as_slice(), b"first\n".as_slice());
+
+        // The run's pane appends to the same file while it is being read.
+        {
+            let mut appender = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            appender.write_all(b"second\n").unwrap();
+        }
+
+        let pos = stream_new_content(&mut file, pos, &mut streamed);
+        assert_eq!(streamed.as_slice(), b"first\nsecond\n".as_slice());
+        assert_eq!(pos, 13);
+
+        // Nothing was written since: the position holds still and no line is
+        // repeated.
+        let pos = stream_new_content(&mut file, pos, &mut streamed);
+        assert_eq!(streamed.as_slice(), b"first\nsecond\n".as_slice());
+        assert_eq!(pos, 13);
     }
 }
