@@ -959,7 +959,6 @@ pub fn run_sidebar() -> Result<()> {
     runtime::run_sidebar()
 }
 
-#[cfg(unix)]
 /// Navigation action for sidebar hotkeys.
 pub enum NavAction {
     Next,
@@ -967,7 +966,6 @@ pub enum NavAction {
     Jump(usize),
 }
 
-#[cfg(unix)]
 /// Compute the target index for a navigation action given the current index and list length.
 fn compute_nav_target(action: &NavAction, current_idx: Option<usize>, len: usize) -> Option<usize> {
     if len == 0 {
@@ -1078,7 +1076,6 @@ fn read_sidebar_layout_mode() -> app::SidebarLayoutMode {
         .unwrap_or_default()
 }
 
-#[cfg(unix)]
 fn current_listed_window_pane<'a>(
     panes: &'a [&str],
     current_pane_id: &'a str,
@@ -1096,7 +1093,6 @@ fn current_listed_window_pane<'a>(
     })
 }
 
-#[cfg(unix)]
 fn navigation_anchor_pane<'a>(
     panes: &'a [&str],
     current_pane_id: &'a str,
@@ -1215,12 +1211,15 @@ pub fn set_filter_mode(mode: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-// The sidebar tests exercise tmux user options and hooks, which have no Windows
-// equivalent, so they only run where the sidebar itself does.
-#[cfg(all(test, unix))]
+// There is no tmux on Windows, so the sidebar is built from code that is not
+// tied to it (`resolve_width_for`, `compute_nav_target`, the anchor lookup) and
+// those tests run everywhere. The few that go through tmux's session ids and
+// scope do not compile where those helpers are absent.
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn parses_session_id_set() {
         let ids = parse_session_id_set("$2  $0\n$1");
@@ -1230,12 +1229,14 @@ mod tests {
         assert!(ids.contains("$2"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn empty_scope_with_enabled_flag_is_global() {
         assert_eq!(parse_scope("", true), SidebarScope::Global);
         assert_eq!(parse_scope("", false), SidebarScope::Off);
     }
 
+    #[cfg(unix)]
     #[test]
     fn serializes_session_id_set_deterministically() {
         let ids = parse_session_id_set("$2 $0 $1");
@@ -1484,20 +1485,24 @@ mod tests {
 // itself, keeps that state in workmux's own settings file, and finds its
 // siblings by the title each one claims.
 
-/// Navigation action for sidebar hotkeys.
-#[cfg(windows)]
-#[allow(dead_code)]
-pub enum NavAction {
-    Next,
-    Prev,
-    Jump(usize),
-}
-
 /// The pane the sidebar is being asked to manage, or why there is none.
 #[cfg(windows)]
 fn require_wezterm_pane() -> Result<crate::multiplexer::wezterm::HostPane> {
     crate::multiplexer::wezterm::current_host_pane()
         .ok_or_else(|| anyhow!("the sidebar needs to run inside a WezTerm pane"))
+}
+
+/// The tab each pane belongs to, keyed by pane id.
+#[cfg(windows)]
+fn pane_window_ids() -> std::collections::HashMap<String, String> {
+    crate::multiplexer::wezterm::panes()
+        .map(|panes| {
+            panes
+                .into_iter()
+                .map(|pane| (pane.pane_id, pane.window_id))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(windows)]
@@ -1580,11 +1585,33 @@ pub fn toggle_session(
 }
 
 #[cfg(windows)]
-pub fn navigate(_action: NavAction) -> Result<()> {
-    Err(anyhow!(
-        "sidebar navigation is not available on Windows yet: nothing publishes \
-         the agent order the sidebar renders"
-    ))
+/// Move the focus to the agent this navigation action lands on.
+///
+/// The focus follows the selection the sidebar would show for the pane asking:
+/// an agent pane moves to the next agent, and anything else (the sidebar
+/// itself) moves to the first agent of its own tab.
+pub fn navigate(action: NavAction) -> Result<()> {
+    let host = require_wezterm_pane()?;
+    let mux = crate::multiplexer::create_backend(crate::multiplexer::detect_backend());
+    let panes = windows::listed_agent_panes(&host.workspace, mux.as_ref())?;
+    if panes.is_empty() {
+        bail!("no sidebar agents found (is the sidebar running?)");
+    }
+
+    let pane_ids: Vec<&str> = panes.iter().map(String::as_str).collect();
+    let anchors = pane_window_ids();
+    let current_pane_id = host.pane_id.to_string();
+    let current_window_id = host.tab_id.to_string();
+    let current_idx =
+        navigation_anchor_pane(&pane_ids, &current_pane_id, &current_window_id, &anchors)
+            .and_then(|anchor| panes.iter().position(|pane_id| pane_id == anchor));
+
+    let target = match &action {
+        NavAction::Jump(n) => compute_nav_target(&action, current_idx, panes.len())
+            .ok_or_else(|| anyhow!("agent {} out of range (1-{})", n, panes.len()))?,
+        _ => compute_nav_target(&action, current_idx, panes.len()).expect("len > 0 guarantees one"),
+    };
+    windows::activate(&panes[target])
 }
 
 #[cfg(windows)]

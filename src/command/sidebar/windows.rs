@@ -21,13 +21,13 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 
-use crate::config::{Config, SidebarPosition, StatusIcons};
+use crate::config::{Config, SidebarPosition};
 use crate::git::{self, GitStatus};
 use crate::multiplexer::wezterm;
-use crate::multiplexer::{Multiplexer, create_backend, detect_backend};
+use crate::multiplexer::{AgentPane, Multiplexer, create_backend, detect_backend};
 use crate::state::StateStore;
 
-use super::app::SidebarApp;
+use super::app::{SidebarApp, SidebarFilterMode};
 use super::input::{LastPaneCheck, apply_input, quit_for_last_pane};
 use super::snapshot::{SidebarSnapshot, build_snapshot};
 use super::ui::render_sidebar;
@@ -244,7 +244,6 @@ fn sidebar_is_only_pane(window_id: &str, pane_id: &str) -> bool {
 /// app would make the last value its own source.
 fn build_view(
     mux: &dyn Multiplexer,
-    status_icons: &StatusIcons,
     git_statuses: HashMap<PathBuf, GitStatus>,
 ) -> Result<SidebarSnapshot> {
     let config = Config::load(None).unwrap_or_default();
@@ -284,12 +283,43 @@ fn build_view(
         layout_mode,
         filter_mode,
         config.sidebar.sort.unwrap_or_default(),
-        status_icons,
+        &config.status_icons,
         git_statuses,
         HashMap::new(),
         HashMap::new(),
         &super::read_sidebar_sleeping(),
     ))
+}
+
+/// The agent pane ids in the order the sidebar lists them.
+///
+/// `sidebar next` runs outside any sidebar, and on tmux it reads back the order
+/// the daemon published. Nothing publishes one here, and the order is a
+/// function of the live panes, the state store and the settings, so it is
+/// recomputed instead: there is no copy to fall out of step.
+pub(super) fn listed_agent_panes(workspace: &str, mux: &dyn Multiplexer) -> Result<Vec<String>> {
+    let snapshot = build_view(mux, HashMap::new())?;
+    Ok(listed_pane_ids(
+        snapshot.agents,
+        snapshot.filter_mode,
+        workspace,
+    ))
+}
+
+/// The pane ids the sidebar would show for `workspace`'s own session filter.
+///
+/// This is the same rule `SidebarApp::apply_snapshot` applies: a sidebar scoped
+/// to its session lists only the agents in that session.
+fn listed_pane_ids(
+    agents: Vec<AgentPane>,
+    filter_mode: SidebarFilterMode,
+    workspace: &str,
+) -> Vec<String> {
+    agents
+        .into_iter()
+        .filter(|agent| filter_mode != SidebarFilterMode::Session || agent.session == workspace)
+        .map(|agent| agent.pane_id)
+        .collect()
 }
 
 /// Take one poll: rebuild the list and notice a window that has emptied out.
@@ -300,7 +330,7 @@ fn poll(
     git_statuses: &HashMap<PathBuf, GitStatus>,
     git_paths: &Arc<Mutex<Vec<PathBuf>>>,
 ) -> Result<()> {
-    let snapshot = build_view(mux.as_ref(), &app.status_icons, git_statuses.clone())?;
+    let snapshot = build_view(mux.as_ref(), git_statuses.clone())?;
 
     if let Ok(mut published) = git_paths.lock() {
         let mut paths: Vec<PathBuf> = snapshot.agents.iter().map(|a| a.path.clone()).collect();
@@ -520,6 +550,25 @@ mod tests {
         }
     }
 
+    fn agent(pane_id: &str, workspace: &str) -> AgentPane {
+        AgentPane {
+            session: workspace.to_string(),
+            window_name: "w".to_string(),
+            pane_id: pane_id.to_string(),
+            window_id: String::new(),
+            window_index: None,
+            path: PathBuf::from("C:\\repo"),
+            pane_title: None,
+            status: None,
+            status_ts: None,
+            activity_ts: None,
+            updated_ts: None,
+            window_cmd: None,
+            agent_command: None,
+            agent_kind: None,
+        }
+    }
+
     /// Sidebars are placed per tab, so `on` walks the tabs that lack one.
     #[test]
     fn tabs_are_planned_in_id_order_and_skip_the_ones_that_have_a_sidebar() {
@@ -575,6 +624,26 @@ mod tests {
         assert_eq!(
             panes_to_close(&panes, None, Some("2")),
             vec!["3".to_string(), "4".to_string()]
+        );
+    }
+
+    /// `sidebar next` walks what the sidebar lists, so the session filter it
+    /// applies has to be the sidebar's, not every workspace on the server.
+    #[test]
+    fn listing_agents_under_the_session_filter_keeps_the_workspace() {
+        let agents = vec![
+            agent("1", "ws-a"),
+            agent("2", "ws-b"),
+            agent("3", "ws-a"),
+        ];
+
+        assert_eq!(
+            listed_pane_ids(agents.clone(), SidebarFilterMode::Session, "ws-a"),
+            vec!["1".to_string(), "3".to_string()]
+        );
+        assert_eq!(
+            listed_pane_ids(agents, SidebarFilterMode::None, "ws-a"),
+            vec!["1".to_string(), "2".to_string(), "3".to_string()]
         );
     }
 }
