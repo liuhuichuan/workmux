@@ -26,6 +26,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::state::PaneKey;
 
@@ -140,13 +141,22 @@ pub fn pane_root(processes: &[WinProcess], pid: u32) -> Option<u32> {
 /// as `pane_current_command`. A shell with nothing below it is the command,
 /// which is what makes an agent's exit readable: the pane's command changes
 /// from the agent back to the shell that started it.
-pub fn foreground<'a>(processes: &'a [WinProcess], root: u32) -> Option<&'a WinProcess> {
+pub fn foreground(processes: &[WinProcess], root: u32) -> Option<&WinProcess> {
+    foreground_ignoring(processes, root, self_image_name())
+}
+
+/// `foreground`, with the name workmux's own runs carry given explicitly.
+fn foreground_ignoring<'a>(
+    processes: &'a [WinProcess],
+    root: u32,
+    self_name: Option<&str>,
+) -> Option<&'a WinProcess> {
     let mut current = find(processes, root)?;
     for _ in 0..WALK_LIMIT {
         if !is_shell(&current.name) {
             break;
         }
-        let Some(child) = running_child(processes, current.pid) else {
+        let Some(child) = running_child(processes, current.pid, self_name) else {
             break;
         };
         current = child;
@@ -159,11 +169,40 @@ pub fn foreground<'a>(processes: &'a [WinProcess], root: u32) -> Option<&'a WinP
 ///
 /// Windows hands out process ids in order, so the largest id is the newest
 /// child -- the command the shell started most recently.
-fn running_child(processes: &[WinProcess], pid: u32) -> Option<&WinProcess> {
+///
+/// A run of workmux's own is not that command: the status hook runs inside the
+/// pane it reports on, and it lives only for the hook. Counting it would make
+/// the pane look like it had changed command every time its status was set, and
+/// the agent that set it would be read as gone.
+fn running_child<'a>(
+    processes: &'a [WinProcess],
+    pid: u32,
+    self_name: Option<&str>,
+) -> Option<&'a WinProcess> {
     processes
         .iter()
-        .filter(|process| process.parent == pid)
+        .filter(|process| process.parent == pid && !is_own_run(&process.name, self_name))
         .max_by_key(|process| (!is_shell(&process.name), process.pid))
+}
+
+/// Whether `name` is the name one of workmux's own runs carries.
+fn is_own_run(name: &str, self_name: Option<&str>) -> bool {
+    self_name.is_some_and(|own| name.eq_ignore_ascii_case(own))
+}
+
+/// The image name this process was started from.
+///
+/// workmux runs from one image whatever it is asked to do, so the name of the
+/// process asking is the name of every run of it, hooks included.
+fn self_image_name() -> Option<&'static str> {
+    static NAME: OnceLock<Option<String>> = OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::current_exe().ok().and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+    })
+    .as_deref()
 }
 
 fn find(processes: &[WinProcess], pid: u32) -> Option<&WinProcess> {
@@ -343,6 +382,44 @@ mod tests {
 
         assert_eq!(pane_root(&processes, 5), None);
         assert!(foreground(&processes, 5).is_some());
+    }
+
+    /// A status hook runs inside the pane it reports on, and it is not the
+    /// command that pane is running.
+    #[test]
+    fn a_status_hook_is_not_the_command_a_pane_runs() {
+        // The pane is back at its prompt: the shell is what it runs, and the
+        // hook is only the child it started.
+        let hook_alone = vec![
+            process(1, 0, "wezterm-gui.exe"),
+            process(2, 1, "cmd.exe"),
+            process(3, 2, "bin-workmux.exe"),
+        ];
+        assert_eq!(
+            foreground_ignoring(&hook_alone, 2, Some("bin-workmux.exe"))
+                .map(|process| command_name(&process.name)),
+            Some("cmd")
+        );
+
+        // An agent is running: the hook must not stand in for it, even though
+        // the hook is the younger of the shell's two children.
+        let agent_and_hook = vec![
+            process(1, 0, "wezterm-gui.exe"),
+            process(2, 1, "cmd.exe"),
+            process(3, 2, "node.exe"),
+            process(4, 2, "bin-workmux.exe"),
+        ];
+        assert_eq!(
+            foreground_ignoring(&agent_and_hook, 2, Some("bin-workmux.exe"))
+                .map(|process| command_name(&process.name)),
+            Some("node")
+        );
+
+        // An image name is compared without regard to case, and a run of
+        // another workmux is not this one.
+        assert!(is_own_run("BIN-WORKMUX.EXE", Some("bin-workmux.exe")));
+        assert!(!is_own_run("bin-workmux.exe", Some("workmux.exe")));
+        assert!(!is_own_run("bin-workmux.exe", None));
     }
 
     /// The process table names images, so a command carries a suffix the Unix
