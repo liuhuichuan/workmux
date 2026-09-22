@@ -28,6 +28,8 @@ from .conftest import (
     get_window_name,
     get_worktree_path,
     make_env_script,
+    pane_home_env,
+    pane_quote,
     poll_until,
     run_workmux_add,
     wait_for_window_ready,
@@ -102,8 +104,8 @@ def test_register_agent_creates_statusless_state(
 
     register_cmd = make_env_script(
         env,
-        f"{shlex.quote(str(workmux_exe_path))} register-agent",
-        {"XDG_STATE_HOME": env.env["XDG_STATE_HOME"]},
+        f"{pane_quote(workmux_exe_path)} register-agent",
+        pane_home_env(env),
     )
     registered_after = int(time.time())
     env.send_keys(window_name, register_cmd)

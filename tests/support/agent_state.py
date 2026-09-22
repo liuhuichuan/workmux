@@ -1,7 +1,6 @@
 """Helpers for agent state file setup in command tests."""
 
 import json
-import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +11,7 @@ from ..conftest import (
     get_worktree_path,
     make_env_script,
     pane_home_env,
+    pane_marker_step,
     poll_until,
     run_workmux_add,
     wait_for_window_ready,
@@ -65,7 +65,7 @@ def build_status_cmd_with_marker(
     marker_path: Path,
     env_vars: dict[str, str] | None = None,
 ) -> str:
-    command = f"{workmux_exe} set-window-status {status}; touch {shlex.quote(str(marker_path))}"
+    command = f"{workmux_exe} set-window-status {status}{pane_marker_step(marker_path)}"
     script_env = pane_home_env(env)
     if env_vars:
         script_env.update(env_vars)

@@ -1596,8 +1596,19 @@ def pane_cd(path: Path) -> str:
 def pane_echo(text: str, path: Path) -> str:
     """A line that writes `text` to a file the test can poll for."""
     if IS_WINDOWS:
-        return f"echo {text}> {pane_quote(path)}"
+        # The space before `>` matters: `echo 1> file` is a handle redirect.
+        return f"echo {text} > {pane_quote(path)}"
     return f"echo {text} > {shlex.quote(str(path))}"
+
+
+def pane_marker_step(path: Path) -> str:
+    """A step, appended to a pane command, that creates `path` once it has run.
+
+    The separator and the write are the pane shell's own: cmd.exe has neither a
+    `;` between commands nor a `touch` to create a file with.
+    """
+    separator = " & " if IS_WINDOWS else "; "
+    return separator + pane_echo("done", path)
 
 
 def pane_exit_status(path: Path) -> str:
