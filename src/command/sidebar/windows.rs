@@ -37,6 +37,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// How often git status is recomputed. Slower than the poll, because a refresh
 /// runs git once per agent and git answers in tens of milliseconds.
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+/// How often the pane looks for a wake-up from a command that changed state.
+///
+/// Reading the token is one read of a small file, orders of magnitude below the
+/// ~70 ms a `wezterm cli list` costs on this machine, so a state change lands
+/// within one of these plus one listing instead of waiting out the poll.
+const SIGNAL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Title this pane claims, so a human can tell a sidebar pane from a shell.
 ///
@@ -347,6 +353,65 @@ fn sidebar_is_only_pane(panes: &[wezterm::PaneSummary], window_id: &str, pane_id
     in_tab.next().is_some_and(|first| first.pane_id == pane_id) && in_tab.next().is_none()
 }
 
+/// The wake-up a workmux command leaves for the sidebars of its multiplexer.
+///
+/// There is no daemon here to receive a signal, so a command that changed state
+/// writes a token into the state store and the sidebar's loop compares it with
+/// the last one it read. No store at all, or nothing written yet, is simply no
+/// wake-up: the timed poll still runs.
+struct RefreshSignal {
+    path: Option<PathBuf>,
+    seen: Option<String>,
+}
+
+impl RefreshSignal {
+    /// The wake-up of the multiplexer this pane runs under.
+    fn new(mux: &dyn Multiplexer) -> Self {
+        let path = StateStore::new()
+            .ok()
+            .map(|store| store.refresh_signal_path(mux.name(), &mux.instance_id()));
+        Self::at(path)
+    }
+
+    /// A wake-up at `path`; `None` is a sidebar nothing can wake.
+    fn at(path: Option<PathBuf>) -> Self {
+        Self { path, seen: None }
+    }
+
+    /// The token the last command left behind, if any.
+    fn read(&self) -> Option<String> {
+        let token = crate::util::read_shared(self.path.as_ref()?).ok()?;
+        let token = token.trim();
+        (!token.is_empty()).then(|| token.to_string())
+    }
+
+    /// Whether a command asked for a poll since the last call.
+    fn requested(&mut self) -> bool {
+        let Some(token) = self.read() else {
+            return false;
+        };
+        if self.seen.as_deref() == Some(token.as_str()) {
+            return false;
+        }
+        self.seen = Some(token);
+        true
+    }
+}
+
+/// Ask every running sidebar of `mux` for a poll now.
+///
+/// A state change used to wait for the sidebar's next timed poll -- up to a
+/// second of rows that are already wrong. The command that made the change says
+/// so instead, and the wait becomes one read of a token.
+pub(super) fn request_refresh(mux: &dyn Multiplexer) {
+    let Ok(store) = StateStore::new() else {
+        return;
+    };
+    if let Err(error) = store.signal_sidebar_refresh(mux.name(), &mux.instance_id()) {
+        tracing::warn!(%error, "sidebar refresh signal could not be written");
+    }
+}
+
 /// What a poll reads, and what it keeps from one poll to the next.
 ///
 /// The store and the cache of already-parsed state files outlive a poll:
@@ -568,6 +633,7 @@ pub(super) fn run_sidebar() -> Result<()> {
     // The last reading of the panes: the poll replaces it, and the last-pane
     // check between polls reads it rather than asking again.
     let mut panes: Option<wezterm::InstancePanes> = None;
+    let mut refresh = RefreshSignal::new(mux.as_ref());
 
     loop {
         if needs_render {
@@ -582,9 +648,16 @@ pub(super) fn run_sidebar() -> Result<()> {
         // Sleep exactly until the next thing that comes due: the poll, a
         // spinner frame, the startup recheck, or a pending resize.
         let now = Instant::now();
+        let requested = refresh.requested();
+        if requested {
+            tracing::debug!("sidebar woken by a refresh signal");
+        }
         let mut wait = last_poll.map_or(Duration::ZERO, |last| {
             POLL_INTERVAL.saturating_sub(now.duration_since(last))
         });
+        // A wake-up is only read at the top of the loop, so the sleep is never
+        // longer than the interval one is written on.
+        wait = wait.min(SIGNAL_INTERVAL);
         if let Some(interval) = app
             .host_window_active()
             .then(|| app.refresh_interval())
@@ -625,7 +698,7 @@ pub(super) fn run_sidebar() -> Result<()> {
 
         let now = Instant::now();
 
-        if last_poll.is_none_or(|last| now.duration_since(last) >= POLL_INTERVAL) {
+        if requested || last_poll.is_none_or(|last| now.duration_since(last) >= POLL_INTERVAL) {
             match wezterm::instance_panes() {
                 Ok(fresh) => {
                     if let Some(reader) = reader.as_mut()
@@ -917,5 +990,76 @@ mod tests {
             listed_pane_ids(agents, SidebarFilterMode::None, "ws-a"),
             vec!["1".to_string(), "2".to_string(), "3".to_string()]
         );
+    }
+
+    /// A wake-up is taken once, not once per look: the loop polls on the change
+    /// and then waits again with the token it just read remembered.
+    #[test]
+    fn a_wake_up_is_taken_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wezterm__sock.refresh");
+        let mut signal = RefreshSignal::at(Some(path.clone()));
+
+        assert!(!signal.requested(), "no command has asked for anything yet");
+
+        crate::util::write_atomic(&path, b"1").unwrap();
+        assert!(signal.requested());
+        assert!(
+            !signal.requested(),
+            "the same token is not a second request"
+        );
+
+        crate::util::write_atomic(&path, b"2").unwrap();
+        assert!(signal.requested(), "a later token is a new request");
+    }
+
+    /// A sidebar with nothing to read never wakes and never fails: no state
+    /// store, no token written yet.
+    #[test]
+    fn a_wake_up_that_is_not_there_is_not_a_request() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(
+            !RefreshSignal::at(Some(dir.path().join("missing.refresh"))).requested(),
+            "the file is written by the first command that changes state"
+        );
+        assert!(!RefreshSignal::at(None).requested());
+    }
+
+    /// The store writes the token the loop reads, and every write is a new one
+    /// even though the file is the same file.
+    #[test]
+    fn a_signal_writes_a_token_the_sidebar_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::with_path(dir.path().to_path_buf()).unwrap();
+        let path = store.refresh_signal_path("wezterm", "sock");
+        let mut signal = RefreshSignal::at(Some(path.clone()));
+
+        assert!(!path.exists(), "nothing is written until a command asks");
+        assert!(!signal.requested());
+
+        store.signal_sidebar_refresh("wezterm", "sock").unwrap();
+        assert!(signal.requested());
+        assert!(!signal.requested());
+
+        store.signal_sidebar_refresh("wezterm", "sock").unwrap();
+        assert!(signal.requested(), "a later write is a new request");
+    }
+
+    /// Two instances, and two backends, never share one wake-up -- and an
+    /// instance that holds path separators names a file, not a directory.
+    #[test]
+    fn a_wake_up_names_the_instance_it_is_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::with_path(dir.path().to_path_buf()).unwrap();
+        let path = store.refresh_signal_path("wezterm", r"\\?\C:\socket");
+
+        assert!(path.starts_with(dir.path().join("runtime")));
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            "wezterm__%5C%5C?%5CC%3A%5Csocket.refresh"
+        );
+        assert_ne!(path, store.refresh_signal_path("tmux", r"\\?\C:\socket"));
+        assert_ne!(path, store.refresh_signal_path("wezterm", "socket"));
     }
 }

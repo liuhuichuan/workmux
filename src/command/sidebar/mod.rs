@@ -608,15 +608,17 @@ fn reflow_all_sidebars_except(_exclude_window_id: &str) {}
 /// Ask a running sidebar to redraw after a state change.
 ///
 /// tmux wakes the daemon, which pushes a fresh snapshot to every client that is
-/// already connected. The WezTerm sidebar has no daemon and re-reads state on its
-/// own tick, so there is nothing to wake.
+/// already connected. The WezTerm sidebar has no daemon to signal, so the
+/// wake-up is a token in the state store that the pane's own loop reads.
 #[cfg(unix)]
 pub(super) fn signal_refresh(mux: &dyn crate::multiplexer::Multiplexer) {
     daemon_ctrl::signal_daemon_for(mux);
 }
 
 #[cfg(windows)]
-pub(super) fn signal_refresh(_mux: &dyn crate::multiplexer::Multiplexer) {}
+pub(super) fn signal_refresh(mux: &dyn crate::multiplexer::Multiplexer) {
+    windows::request_refresh(mux);
+}
 
 fn apply_cli_dimensions(
     config: &mut crate::config::Config,
@@ -1656,6 +1658,8 @@ pub fn reflow_all(_exclude_window: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// The sidebar pane polls for itself, so a status change needs no wake-up.
+/// A state change leaves a wake-up the polling sidebar reads on its next look.
 #[cfg(windows)]
-pub(crate) fn request_refresh_for(_mux: &dyn crate::multiplexer::Multiplexer) {}
+pub(crate) fn request_refresh_for(mux: &dyn crate::multiplexer::Multiplexer) {
+    windows::request_refresh(mux);
+}

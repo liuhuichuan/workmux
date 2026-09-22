@@ -1264,6 +1264,38 @@ impl StateStore {
         let _ = fs::remove_file(path);
     }
 
+    /// Path to the file a sidebar watches for a wake-up from a command.
+    ///
+    /// File path: `runtime/<backend>__<instance>.refresh`
+    #[cfg(windows)]
+    pub(crate) fn refresh_signal_path(&self, backend: &str, instance: &str) -> PathBuf {
+        let safe_instance =
+            percent_encoding::utf8_percent_encode(instance, super::types::FILENAME_ENCODE_SET)
+                .to_string();
+        self.runtime_dir()
+            .join(format!("{backend}__{safe_instance}.refresh"))
+    }
+
+    /// Leave a wake-up for the sidebars of one multiplexer instance.
+    ///
+    /// tmux wakes its sidebar through the daemon's signal. WezTerm has no daemon
+    /// and its pane re-reads state on a timer, so a command that changed state
+    /// writes a token here for that pane to read. The token is the time of the
+    /// write rather than a counter, because the writers are separate processes
+    /// and reading a counter back to increment it is a race.
+    #[cfg(windows)]
+    pub(crate) fn signal_sidebar_refresh(&self, backend: &str, instance: &str) -> Result<()> {
+        fs::create_dir_all(self.runtime_dir()).context("Failed to create runtime directory")?;
+        let token = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(elapsed) => elapsed.as_nanos().to_string(),
+            // A clock before the epoch still has to leave a token that differs
+            // from the one it left last.
+            Err(error) => format!("-{}", error.duration().as_nanos()),
+        };
+        let path = self.refresh_signal_path(backend, instance);
+        write_atomic(&path, token.as_bytes())
+    }
+
     /// Load agents with reconciliation against live multiplexer state.
     ///
     /// Uses batched pane queries for performance, with backend-specific fallback validation.
