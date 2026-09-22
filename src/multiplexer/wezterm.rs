@@ -758,6 +758,30 @@ pub(crate) fn cli(args: &[&str]) -> Result<String> {
         .with_context(|| format!("Failed to run wezterm {}", args.join(" ")))
 }
 
+/// The bytes that stand for a key named the way tmux names it.
+///
+/// Callers name keys for tmux -- `reap-agents` asks to end an agent with "C-c",
+/// the dashboard types "Enter" and the arrows -- and `tmux send-keys` resolves
+/// those names itself. `wezterm cli send-text` does not: it types out whatever
+/// it is given, so an agent asked to quit received the four characters `C-c`
+/// and stayed up. Names with a byte to their meaning are spelled out here;
+/// anything that is already the text to type is left alone.
+fn key_sequence(key: &str) -> &str {
+    match key {
+        "C-c" => "\x03",
+        "C-d" => "\x04",
+        "Enter" => "\r",
+        "BSpace" => "\x7f",
+        "Tab" => "\t",
+        "Escape" => "\x1b",
+        "Up" => "\x1b[A",
+        "Down" => "\x1b[B",
+        "Right" => "\x1b[C",
+        "Left" => "\x1b[D",
+        typed => typed,
+    }
+}
+
 /// Outer corner of the panes of one tab, in cells.
 ///
 /// Panes tile their tab but leave a separator cell between neighbours, so
@@ -1138,9 +1162,16 @@ impl Multiplexer for WezTermBackend {
     }
 
     fn send_key(&self, pane_id: &str, key: &str) -> Result<()> {
-        self.cli(&["cli", "send-text", "--pane-id", pane_id, "--no-paste", key])
-            .run()
-            .context("Failed to send key to pane")?;
+        self.cli(&[
+            "cli",
+            "send-text",
+            "--pane-id",
+            pane_id,
+            "--no-paste",
+            key_sequence(key),
+        ])
+        .run()
+        .context("Failed to send key to pane")?;
         Ok(())
     }
 
@@ -1813,5 +1844,32 @@ mod tests {
             socket_boot_id(Some(PathBuf::from("/nonexistent/workmux/wezterm/sock"))),
             None
         );
+    }
+
+    /// A key named the way tmux names it reaches the pane as the byte tmux
+    /// would send it as, not as the name itself: `reap-agents` ends an agent by
+    /// asking for "C-c", and WezTerm types whatever text it is handed.
+    #[test]
+    fn a_key_name_is_sent_as_the_byte_it_stands_for() {
+        assert_eq!(key_sequence("C-c"), "\x03");
+        assert_eq!(key_sequence("C-d"), "\x04");
+        assert_eq!(key_sequence("Enter"), "\r");
+        assert_eq!(key_sequence("BSpace"), "\x7f");
+        assert_eq!(key_sequence("Tab"), "\t");
+        assert_eq!(key_sequence("Escape"), "\x1b");
+        assert_eq!(key_sequence("Up"), "\x1b[A");
+        assert_eq!(key_sequence("Down"), "\x1b[B");
+        assert_eq!(key_sequence("Right"), "\x1b[C");
+        assert_eq!(key_sequence("Left"), "\x1b[D");
+    }
+
+    /// The dashboard's input mode types single characters into an agent, so
+    /// text that names no key goes through as the text it is.
+    #[test]
+    fn text_that_names_no_key_is_typed_as_itself() {
+        assert_eq!(key_sequence("q"), "q");
+        assert_eq!(key_sequence("ls -la"), "ls -la");
+        // A key name is the whole name: "C-c" is one, "C-cd" is two letters.
+        assert_eq!(key_sequence("C-cd"), "C-cd");
     }
 }
