@@ -154,10 +154,11 @@ fn classify_agent_kind_enum(command: Option<&str>, pane_title: Option<&str>) -> 
         return Some(kind);
     }
 
-    // The Windows WezTerm backend cannot report a pane's foreground process, so
-    // every Windows pane lands here without a command; the title is the only
-    // signal left, and the interpreter gate below cannot fire without one.
-    // Unix backends always report the command and keep the conservative answer.
+    // A Windows pane workmux has not seen from the inside arrives without a
+    // command, because the process table cannot say which pane a process
+    // belongs to; the title is the only signal left, and the interpreter gate
+    // below cannot fire without one. A Unix pane always carries the tty's
+    // foreground process, and keeps the conservative answer.
     #[cfg(windows)]
     if raw.is_empty()
         && let Some(kind) = classify_by_pane_title(pane_title.unwrap_or(""))
@@ -383,17 +384,18 @@ mod tests {
     fn empty_command_returns_none() {
         assert_eq!(classify_agent_kind(None, None), None);
         assert_eq!(classify("", ""), None);
-        // Only Windows panes reach the classifier without a command, and there
-        // the title is the signal; Unix keeps the conservative answer.
+        // A Windows pane workmux has not seen from the inside is the one that
+        // reaches the classifier without a command, and there the title is the
+        // signal; Unix keeps the conservative answer.
         #[cfg(unix)]
         assert_eq!(classify("", "Vibe"), None);
         #[cfg(windows)]
         assert_eq!(classify("", "Vibe"), Some("vibe".into()));
     }
 
-    /// The Windows WezTerm backend cannot read a pane's foreground process, so
-    /// the title is classified as if it were the command: WezTerm titles a pane
-    /// with the process name until the agent labels itself.
+    /// A Windows pane workmux has not seen from the inside arrives without a
+    /// command, so the title is classified as if it were the command: WezTerm
+    /// titles a pane with the process name until the agent labels itself.
     #[cfg(windows)]
     #[test]
     fn windows_title_stands_in_for_missing_command() {
