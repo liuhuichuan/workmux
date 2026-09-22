@@ -89,12 +89,19 @@ static ROOTS: OnceLock<Reading> = OnceLock::new();
 /// The worktrees, as `git worktree list --porcelain` prints them.
 static WORKTREES: OnceLock<Reading> = OnceLock::new();
 
+/// The workmux base each branch was created from, as `git config` prints them.
+static BASES: OnceLock<Reading> = OnceLock::new();
+
 pub(crate) fn roots() -> &'static Reading {
     ROOTS.get_or_init(Reading::default)
 }
 
 pub(crate) fn worktrees() -> &'static Reading {
     WORKTREES.get_or_init(Reading::default)
+}
+
+pub(crate) fn branch_bases() -> &'static Reading {
+    BASES.get_or_init(Reading::default)
 }
 
 /// Forget what git was asked, for a command that changes the worktrees.
@@ -105,6 +112,7 @@ pub(crate) fn worktrees() -> &'static Reading {
 pub fn forget_repository_readings() {
     roots().forget();
     worktrees().forget();
+    branch_bases().forget();
 }
 
 #[cfg(test)]

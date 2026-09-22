@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Instant;
 use tracing::debug;
 
 use crate::cmd::Cmd;
@@ -207,6 +208,9 @@ pub fn list_local_branches_in(workdir: Option<&Path>) -> Result<Vec<String>> {
 /// `branch.<old>.workmux-base`) to `branch.<new>.*`, so we don't need to
 /// touch branch-base metadata manually.
 pub fn rename_branch(old: &str, new: &str) -> Result<()> {
+    // The rename moves `branch.<old>.workmux-base` to `branch.<new>.workmux-base`.
+    super::forget_repository_readings();
+
     Cmd::new("git")
         .args(&["branch", "-m", old, new])
         .run()
@@ -216,6 +220,9 @@ pub fn rename_branch(old: &str, new: &str) -> Result<()> {
 
 /// Delete a local branch.
 pub fn delete_branch_in(branch_name: &str, force: bool, git_common_dir: &Path) -> Result<()> {
+    // Deleting a branch deletes the base it recorded.
+    super::forget_repository_readings();
+
     let mut cmd = Cmd::new("git").workdir(git_common_dir).arg("branch");
 
     if force {
@@ -380,6 +387,9 @@ pub fn set_branch_base(branch: &str, base: &str) -> Result<()> {
 
 /// Store the base branch/commit in a specific workdir
 pub fn set_branch_base_in(branch: &str, base: &str, workdir: Option<&Path>) -> Result<()> {
+    // Writing a base changes what a reading of them would print.
+    super::forget_repository_readings();
+
     let config_key = format!("branch.{}.workmux-base", branch);
     let cmd = Cmd::new("git").args(&["config", "--local", &config_key, base]);
     let cmd = match workdir {
@@ -397,26 +407,67 @@ pub fn get_branch_base(branch: &str) -> Result<String> {
 
 /// Get the base branch for a given branch in a specific workdir
 pub fn get_branch_base_in(branch: &str, workdir: Option<&Path>) -> Result<String> {
-    let config_key = format!("branch.{}.workmux-base", branch);
-    let cmd = Cmd::new("git").args(&["config", "--local", &config_key]);
+    let recorded =
+        super::branch_bases().get_or_take(super::asked_from(workdir), Instant::now(), || {
+            read_branch_bases(workdir)
+        })?;
+
+    parse_branch_bases(&recorded)
+        .remove(branch)
+        .filter(|base| !base.is_empty())
+        .ok_or_else(|| anyhow!("No workmux-base found for branch '{}'", branch))
+}
+
+/// Read every base branch one command records, in one `git config` process.
+///
+/// Each branch answers this question separately, and a listing asks it for
+/// every worktree it prints: one `git config --local branch.<name>.workmux-base`
+/// is one process per worktree, where the same config asks for them all at
+/// once. A repository that recorded none exits with the empty listing, which
+/// reads the same as no base for any branch.
+fn read_branch_bases(workdir: Option<&Path>) -> Result<String> {
+    let cmd = Cmd::new("git").args(&[
+        "config",
+        "--local",
+        "--get-regexp",
+        r"^branch\..*\.workmux-base$",
+    ]);
     let cmd = match workdir {
         Some(path) => cmd.workdir(path),
         None => cmd,
     };
-    let output = cmd
-        .run_and_capture_stdout()
-        .context("Failed to get workmux-base config")?;
+    Ok(cmd.run_and_capture_stdout().unwrap_or_default())
+}
 
-    if output.is_empty() {
-        return Err(anyhow!("No workmux-base found for branch '{}'", branch));
+/// The base each branch recorded, out of `git config --get-regexp` output.
+///
+/// Each line is `<key> <value>`, and the branch is everything between
+/// `branch.` and `.workmux-base`, so a branch named after a version -- a name
+/// with dots of its own -- keeps all of itself.
+fn parse_branch_bases(output: &str) -> HashMap<String, String> {
+    let mut bases = HashMap::new();
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some(branch) = key
+            .strip_prefix("branch.")
+            .and_then(|rest| rest.strip_suffix(".workmux-base"))
+        else {
+            continue;
+        };
+        if branch.is_empty() {
+            continue;
+        }
+        bases.insert(branch.to_string(), value.to_string());
     }
-
-    Ok(output)
+    bases
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     #[test]
     fn valid_branch_name_accepts_slashes() {
@@ -429,6 +480,83 @@ mod tests {
         assert!(!is_valid_branch_name("fix//issue-123").unwrap());
         assert!(!is_valid_branch_name("fix/issue-123.lock").unwrap());
         assert!(!is_valid_branch_name("fix issue 123").unwrap());
+    }
+
+    /// Every base a repository recorded comes out of one reading of them, and
+    /// a branch that recorded none has none however many others did.
+    #[test]
+    fn a_base_comes_from_one_reading_of_them_all() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_support::init_repo(&repo);
+
+        set_branch_base_in("feature", "main", Some(&repo)).unwrap();
+        set_branch_base_in("release/v1.2", "develop", Some(&repo)).unwrap();
+        set_branch_base_in("v1.2", "main", Some(&repo)).unwrap();
+
+        assert_eq!(get_branch_base_in("feature", Some(&repo)).unwrap(), "main");
+        assert_eq!(
+            get_branch_base_in("release/v1.2", Some(&repo)).unwrap(),
+            "develop"
+        );
+        assert_eq!(get_branch_base_in("v1.2", Some(&repo)).unwrap(), "main");
+        assert!(get_branch_base_in("unrecorded", Some(&repo)).is_err());
+    }
+
+    /// A base written after a reading is the one the next read answers: what a
+    /// command writes is not answered from before it wrote.
+    #[test]
+    fn a_base_written_after_a_reading_is_the_one_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_support::init_repo(&repo);
+
+        assert!(get_branch_base_in("feature", Some(&repo)).is_err());
+
+        set_branch_base_in("feature", "main", Some(&repo)).unwrap();
+
+        assert_eq!(get_branch_base_in("feature", Some(&repo)).unwrap(), "main");
+    }
+
+    /// One repository's bases are not another's, even in the same run.
+    #[test]
+    fn a_base_does_not_carry_to_another_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let one = temp.path().join("one");
+        let two = temp.path().join("two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        test_support::init_repo(&one);
+        test_support::init_repo(&two);
+
+        set_branch_base_in("feature", "release", Some(&one)).unwrap();
+
+        assert_eq!(
+            get_branch_base_in("feature", Some(&one)).unwrap(),
+            "release"
+        );
+        assert!(get_branch_base_in("feature", Some(&two)).is_err());
+    }
+
+    /// The key names the branch, out of the other settings git keeps per
+    /// branch, and a branch name keeps its own dots.
+    #[test]
+    fn a_recorded_base_is_read_by_its_branch_name() {
+        let output = "branch.main.workmux-base main\n\
+                      branch.v1.2.workmux-base release/v1.2\n\
+                      branch.main.remote origin\n\
+                      branch.main.merge refs/heads/main\n\
+                      workmux.worktree.feature.mode session\n";
+
+        assert_eq!(
+            parse_branch_bases(output),
+            HashMap::from([
+                ("main".to_string(), "main".to_string()),
+                ("v1.2".to_string(), "release/v1.2".to_string()),
+            ])
+        );
     }
 
     #[test]
