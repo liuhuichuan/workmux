@@ -7,6 +7,10 @@
 //! these, so the result of `classify_agent_kind` is cached on `AgentState`
 //! once it becomes non-None and reused by the sidebar render path.
 //!
+//! Windows has no `pane_current_command` equivalent: the WezTerm backend cannot
+//! read a pane's foreground process, so every Windows pane arrives here without
+//! a command and its title is classified in place of one.
+//!
 //! The canonical string form (e.g. "claude", "kiro-cli") matches the existing
 //! `AgentProfile::name` so the sidebar can look up the corresponding profile.
 
@@ -148,6 +152,17 @@ fn classify_agent_kind_enum(command: Option<&str>, pane_title: Option<&str>) -> 
         return Some(kind);
     }
 
+    // The Windows WezTerm backend cannot report a pane's foreground process, so
+    // every Windows pane lands here without a command; the title is the only
+    // signal left, and the interpreter gate below cannot fire without one.
+    // Unix backends always report the command and keep the conservative answer.
+    #[cfg(windows)]
+    if raw.is_empty()
+        && let Some(kind) = classify_by_pane_title(pane_title.unwrap_or(""))
+    {
+        return Some(kind);
+    }
+
     if is_generic_interpreter(&stem)
         && let Some(kind) = classify_by_title(pane_title.unwrap_or(""))
     {
@@ -155,6 +170,17 @@ fn classify_agent_kind_enum(command: Option<&str>, pane_title: Option<&str>) -> 
     }
 
     None
+}
+
+/// Classify a pane title that has to stand in for a missing foreground command.
+///
+/// WezTerm titles a Windows pane with its foreground process name ("claude",
+/// "claude.exe") until the agent replaces it with its own title ("Claude Code",
+/// "Gemini - working"), so the title carries both signals: the executable rules
+/// resolve the process-name phase, the brand-title rules the labelled one.
+#[cfg(windows)]
+fn classify_by_pane_title(title: &str) -> Option<AgentKind> {
+    classify_by_command(title, &command_stem(title)).or_else(|| classify_by_title(title))
 }
 
 fn classify_by_command(raw: &str, stem: &str) -> Option<AgentKind> {
@@ -355,7 +381,56 @@ mod tests {
     fn empty_command_returns_none() {
         assert_eq!(classify_agent_kind(None, None), None);
         assert_eq!(classify("", ""), None);
+        // Only Windows panes reach the classifier without a command, and there
+        // the title is the signal; Unix keeps the conservative answer.
+        #[cfg(unix)]
         assert_eq!(classify("", "Vibe"), None);
+        #[cfg(windows)]
+        assert_eq!(classify("", "Vibe"), Some("vibe".into()));
+    }
+
+    /// The Windows WezTerm backend cannot read a pane's foreground process, so
+    /// the title is classified as if it were the command: WezTerm titles a pane
+    /// with the process name until the agent labels itself.
+    #[cfg(windows)]
+    #[test]
+    fn windows_title_stands_in_for_missing_command() {
+        assert_eq!(
+            classify_agent_kind(None, Some("claude")),
+            Some("claude".into())
+        );
+        assert_eq!(
+            classify_agent_kind(None, Some("claude.exe")),
+            Some("claude".into())
+        );
+        assert_eq!(
+            classify_agent_kind(None, Some("codex.exe")),
+            Some("codex".into())
+        );
+        assert_eq!(
+            classify_agent_kind(None, Some("\u{2733} Claude Code")),
+            Some("claude".into())
+        );
+        assert_eq!(
+            classify_agent_kind(None, Some("\u{25C7}  Ready")),
+            Some("gemini".into())
+        );
+        // A shell pane is titled with its shell, which is not an agent.
+        assert_eq!(classify_agent_kind(None, Some("pwsh.exe")), None);
+        assert_eq!(classify_agent_kind(None, Some("")), None);
+        assert_eq!(classify_agent_kind(None, None), None);
+    }
+
+    /// A command that *is* reported still beats the title, so the Windows
+    /// fallback cannot resurrect what the interpreter gate rejects.
+    #[cfg(windows)]
+    #[test]
+    fn windows_title_does_not_override_a_reported_command() {
+        assert_eq!(classify("vim", "\u{2733} Claude Code"), None);
+        assert_eq!(
+            classify("node", "\u{2733} Claude Code"),
+            Some("claude".into())
+        );
     }
 
     #[test]
