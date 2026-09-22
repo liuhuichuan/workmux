@@ -1,6 +1,7 @@
 use crate::command::args::PromptArgs;
 use crate::config::MuxMode;
 use crate::multiplexer::{create_backend, detect_backend};
+use crate::multiplexer::handle::target_label;
 use crate::workflow::prompt_loader::{PromptLoadArgs, load_prompt};
 use crate::workflow::{SetupOptions, WorkflowContext};
 use crate::{config, workflow};
@@ -142,14 +143,11 @@ pub fn run(
             None,
         ) {
             Ok(result) => {
-                let target_type = match result.mode {
-                    MuxMode::Session => "session",
-                    MuxMode::Window => "window",
-                };
+                let target_type = target_label(context.mux.name(), result.mode);
 
                 if result.did_switch {
                     println!(
-                        "✓ Switched to existing tmux {} for '{}'\n  Worktree: {}",
+                        "✓ Switched to existing {} for '{}'\n  Worktree: {}",
                         target_type,
                         resolved_name,
                         result.worktree_path.display()
@@ -160,7 +158,7 @@ pub fn run(
                     }
 
                     println!(
-                        "✓ Opened tmux {} for '{}'\n  Worktree: {}",
+                        "✓ Opened {} for '{}'\n  Worktree: {}",
                         target_type,
                         resolved_name,
                         result.worktree_path.display()

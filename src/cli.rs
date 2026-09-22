@@ -185,25 +185,25 @@ impl_passthrough_typed_value_parser!(GitBranchParser);
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "workmux")]
-#[command(about = "An opinionated workflow tool that orchestrates git worktrees and tmux")]
+#[command(about = "An opinionated workflow tool that orchestrates git worktrees and windows")]
 #[command(help_template = "\
 {about}
 
 {usage-heading} {usage}
 
 Worktree lifecycle:
-  add          Create a new worktree and tmux window
-  remove       Remove a worktree, tmux window, and branch without merging [rm]
-  rename       Rename a worktree, tmux window/session, and optionally branch
-  merge        Merge a branch, then clean up the worktree and tmux window
+  add          Create a new worktree and window
+  remove       Remove a worktree, window, and branch without merging [rm]
+  rename       Rename a worktree, window/session, and optionally branch
+  merge        Merge a branch, then clean up the worktree and window
   rebase       Rebase a worktree branch onto its base branch
-  open         Open a tmux window for an existing worktree
-  close        Close a worktree's tmux window (keeps the worktree and branch)
-  resurrect    Restore worktree windows after a tmux or computer crash
+  open         Open a window for an existing worktree
+  close        Close a worktree's window (keeps the worktree and branch)
+  resurrect    Restore worktree windows after a crash
 
 Monitoring:
   dashboard    Show a TUI dashboard of all active workmux agents
-  sidebar      Toggle a live agent status sidebar in tmux
+  sidebar      Toggle a live agent status sidebar
   list         List all worktrees [ls]
   path         Get the filesystem path of a worktree
   status       Query agent status for worktrees
@@ -292,7 +292,7 @@ enum Commands {
         source_id: Option<String>,
     },
 
-    /// Create a new worktree and tmux window
+    /// Create a new worktree and window
     Add {
         /// Name of the branch (creates if it doesn't exist) or remote ref (e.g., origin/feature).
         /// When used with --pr, this becomes the custom local branch name.
@@ -315,15 +315,15 @@ enum Commands {
         #[arg(long)]
         base: Option<String>,
 
-        /// Explicit name for the worktree directory and tmux window (overrides worktree_naming strategy and worktree_prefix)
+        /// Explicit name for the worktree directory and window (overrides worktree_naming strategy and worktree_prefix)
         #[arg(long)]
         name: Option<String>,
 
-        /// Explicit name for the workmux-managed tmux target
+        /// Explicit name for the workmux-managed target
         #[arg(long = "target-name")]
         target_name: Option<String>,
 
-        /// Parent tmux session for window-mode targets
+        /// Parent session for window-mode targets
         #[arg(long = "parent-session")]
         parent_session: Option<String>,
 
@@ -352,7 +352,7 @@ enum Commands {
         #[arg(long, num_args = 0..=1, default_missing_value = "", require_equals = true)]
         fork: Option<String>,
 
-        /// Block until the created tmux window is closed
+        /// Block until the created window is closed
         #[arg(short = 'W', long)]
         wait: bool,
 
@@ -360,7 +360,7 @@ enum Commands {
         #[arg(long, value_enum)]
         mode: Option<CliMuxMode>,
 
-        /// Create the window in its own tmux session (useful for session-per-project workflows)
+        /// Create the window in its own session (useful for session-per-project workflows)
         #[arg(short = 's', long, conflicts_with = "mode")]
         session: bool,
 
@@ -381,9 +381,9 @@ enum Commands {
         config: Option<PathBuf>,
     },
 
-    /// Open a tmux window for an existing worktree
+    /// Open a window for an existing worktree
     Open {
-        /// Worktree name(s) (directory name, visible in tmux window). Optional with --new.
+        /// Worktree name(s) (directory name, visible in the window). Optional with --new.
         #[arg(value_parser = WorktreeHandleParser::new(), required_unless_present = "new")]
         names: Vec<String>,
 
@@ -407,11 +407,11 @@ enum Commands {
         #[arg(short = 's', long, conflicts_with = "mode")]
         session: bool,
 
-        /// Explicit name for the workmux-managed tmux target
+        /// Explicit name for the workmux-managed target
         #[arg(long = "target-name")]
         target_name: Option<String>,
 
-        /// Parent tmux session for window-mode targets
+        /// Parent session for window-mode targets
         #[arg(long = "parent-session")]
         parent_session: Option<String>,
 
@@ -427,14 +427,14 @@ enum Commands {
         config: Option<PathBuf>,
     },
 
-    /// Close a worktree's tmux window (keeps the worktree and branch)
+    /// Close a worktree's window (keeps the worktree and branch)
     Close {
         /// Worktree name (defaults to current directory if omitted)
         #[arg(value_parser = WorktreeHandleParser::new())]
         name: Option<String>,
     },
 
-    /// Restore worktree windows after a tmux or computer crash
+    /// Restore worktree windows after a crash
     ///
     /// Uses persisted agent state files to detect which worktrees had active
     /// agents before the crash.
@@ -444,7 +444,7 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Merge a branch, then clean up the worktree and tmux window
+    /// Merge a branch, then clean up the worktree and window
     Merge {
         /// Worktree name or branch (defaults to current directory)
         #[arg(value_parser = WorktreeHandleParser::new())]
@@ -494,7 +494,7 @@ enum Commands {
         name: Option<String>,
     },
 
-    /// Rename a worktree, its tmux window/session, and (optionally) its branch
+    /// Rename a worktree, its window/session, and (optionally) its branch
     Rename {
         /// [OLD_NAME] NEW_NAME. If only one argument is given, renames the current worktree.
         #[arg(required = true, num_args = 1..=2, value_parser = WorktreeHandleParser::new())]
@@ -505,7 +505,7 @@ enum Commands {
         branch: bool,
     },
 
-    /// Remove a worktree, tmux window, and branch without merging
+    /// Remove a worktree, window, and branch without merging
     #[command(visible_alias = "rm")]
     Remove {
         /// Worktree names (defaults to current directory name if empty)
@@ -524,7 +524,7 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
 
-        /// Keep the local branch (only remove worktree and tmux window)
+        /// Keep the local branch (only remove worktree and window)
         #[arg(short = 'k', long)]
         keep_branch: bool,
     },
@@ -693,7 +693,7 @@ enum Commands {
     /// Update workmux to the latest version
     Update,
 
-    /// Control a live agent status sidebar in tmux
+    /// Control a live agent status sidebar
     Sidebar {
         /// Scope sidebar to this session, or toggle this session off when global sidebar is active
         #[arg(short = 's', long)]
@@ -769,7 +769,7 @@ enum Commands {
     /// Manage sandbox settings
     Sandbox(command::sandbox::SandboxArgs),
 
-    /// Set agent status for the current tmux window (used by hooks)
+    /// Set agent status for the current window (used by hooks)
     #[command(hide = true)]
     SetWindowStatus {
         #[arg(value_enum)]

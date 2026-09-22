@@ -456,16 +456,25 @@ fn mark_skills_declined(agents: &[Agent]) -> Result<()> {
 
 // --- Shared prompt UI ---
 
-/// Print the status tracking description with a mock tmux status bar.
+/// Print the status tracking description next to a mock of where the status shows up.
+///
+/// The mock bar is tmux's window list; every other backend reports the same
+/// status in the dashboard, which has no status bar to mock.
 /// `prefix` is printed before each line (e.g. "│ " for the wizard, "" for the command).
 pub(crate) fn print_description(prefix: &str) {
-    println!("{prefix}  Status tracking shows agent activity in your tmux window list:");
-    println!("{prefix}");
-    println!(
-        "{prefix}    {}  2:user-auth 🤖  3:refactor 💬  {}",
-        style("1:main*").reverse(),
-        style("4:dark-mode ✅").dim(),
-    );
+    if crate::multiplexer::detect_backend() == crate::multiplexer::BackendType::Tmux {
+        println!("{prefix}  Status tracking shows agent activity in your tmux window list:");
+        println!("{prefix}");
+        println!(
+            "{prefix}    {}  2:user-auth 🤖  3:refactor 💬  {}",
+            style("1:main*").reverse(),
+            style("4:dark-mode ✅").dim(),
+        );
+    } else {
+        println!("{prefix}  Status tracking shows agent activity in the workmux dashboard:");
+        println!("{prefix}");
+        println!("{prefix}  See it with `workmux dashboard`.");
+    }
     println!("{prefix}");
     println!("{prefix}  🤖 = working  💬 = waiting for input  ✅ = done");
     println!(

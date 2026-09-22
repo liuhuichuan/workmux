@@ -20,6 +20,26 @@ pub fn mode_label(mode: MuxMode) -> &'static str {
     }
 }
 
+/// The backend's own noun for a target: "tmux window", "WezTerm tab".
+///
+/// Messages that say where a worktree landed have to use the vocabulary of the
+/// multiplexer the user is looking at. What workmux calls a window is a tmux
+/// window, but a tab in WezTerm, kitty, and zellij, and session mode is a
+/// WezTerm workspace or a zellij session, so the tmux-only phrasing names the
+/// wrong program everywhere else.
+pub fn target_label(backend: &str, mode: MuxMode) -> &'static str {
+    match (backend, mode) {
+        ("tmux", MuxMode::Window) => "tmux window",
+        ("tmux", MuxMode::Session) => "tmux session",
+        ("wezterm", MuxMode::Window) => "WezTerm tab",
+        ("wezterm", MuxMode::Session) => "WezTerm workspace",
+        ("zellij", MuxMode::Window) => "Zellij tab",
+        ("kitty", MuxMode::Window) => "kitty tab",
+        (_, MuxMode::Window) => "window",
+        (_, MuxMode::Session) => "session",
+    }
+}
+
 /// A unified handle for a multiplexer target (window or session).
 ///
 /// Wraps a reference to the backend, the mode, prefix, and handle name,
@@ -154,5 +174,30 @@ impl<'a> MuxHandle<'a> {
             MuxMode::Session => mux.shell_switch_session_cmd(full_name),
             MuxMode::Window => mux.shell_select_window_cmd(full_name),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_label_names_the_backend_the_user_is_looking_at() {
+        assert_eq!(target_label("tmux", MuxMode::Window), "tmux window");
+        assert_eq!(target_label("tmux", MuxMode::Session), "tmux session");
+        assert_eq!(target_label("wezterm", MuxMode::Window), "WezTerm tab");
+        assert_eq!(
+            target_label("wezterm", MuxMode::Session),
+            "WezTerm workspace"
+        );
+        assert_eq!(target_label("zellij", MuxMode::Window), "Zellij tab");
+        assert_eq!(target_label("kitty", MuxMode::Window), "kitty tab");
+    }
+
+    #[test]
+    fn target_label_falls_back_to_the_generic_noun() {
+        assert_eq!(target_label("kitty", MuxMode::Session), "session");
+        assert_eq!(target_label("zellij", MuxMode::Session), "session");
+        assert_eq!(target_label("future-backend", MuxMode::Window), "window");
     }
 }

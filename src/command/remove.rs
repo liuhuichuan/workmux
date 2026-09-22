@@ -1,4 +1,5 @@
 use crate::multiplexer::{create_backend, detect_backend};
+use crate::multiplexer::handle::target_label;
 use crate::workflow::WorkflowContext;
 use crate::{config, git, spinner, workflow};
 use anyhow::{Context, Result, anyhow};
@@ -141,7 +142,10 @@ fn run_specified(names: Vec<String>, force: bool, keep_branch: bool) -> Result<(
         for (_, branch, base) in &unmerged {
             println!("  - {} (base: {})", branch, base);
         }
-        println!("\nThis will delete the worktree, tmux window, and local branch.");
+        println!(
+            "\nThis will delete the worktree, {}, and local branch.",
+            target_label(context.mux.name(), context.config.mode())
+        );
         print!("Are you sure you want to continue? [y/N] ");
         io::stdout().flush().context("Failed to flush stdout")?;
 

@@ -151,7 +151,7 @@ Starting global mode still replaces any session-scoped sidebars.
 
 ## Limitations
 
-- tmux only (other backends are not supported yet)
+- tmux on macOS and Linux, WezTerm on Windows (other backends are not supported yet)
 
 ## Example tmux binding
 

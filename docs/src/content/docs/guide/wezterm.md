@@ -7,7 +7,39 @@ description: Use WezTerm as an alternative multiplexer backend
 The WezTerm backend is new and experimental. Expect rough edges and potential issues.
 :::
 
-[WezTerm](https://wezterm.org/) can be used as an alternative to tmux. Detected automatically via `$WEZTERM_PANE`.
+[WezTerm](https://wezterm.org/) can be used as an alternative to tmux. Detected automatically via `$WEZTERM_PANE`. Works on macOS, Linux, and Windows.
+
+## How workmux talks to WezTerm
+
+workmux shells out to `wezterm cli`, which connects to the mux domain named by `$WEZTERM_UNIX_SOCKET`. WezTerm sets that variable in every pane it spawns -- to the socket of the GUI that owns the pane, or to the mux server that GUI attached to -- so workmux needs no configuration to find the panes around it: it uses the instance of the pane it runs in.
+
+That also defines what workmux can see. A pane belongs to exactly one instance, and panes of another instance (a second `wezterm-gui` process that is not attached to the same mux server) are invisible to it. In that case `workmux list` and the dashboard only show the current instance's agents, and `workmux status` reports that state files exist but none match the current instance, because the agents were registered elsewhere.
+
+Run workmux from inside a WezTerm pane instead of an unrelated terminal. `wezterm cli` needs `$WEZTERM_UNIX_SOCKET` and `$WEZTERM_PANE` from that pane; outside one it has to guess at a socket, and on Windows it fails with `failed to connect to Socket("gui-sock-<pid>")`.
+
+### Sharing one instance across GUI windows
+
+Optional, but useful if you keep several WezTerm windows open and want one workmux to see the agents in all of them: connect every GUI to a mux server so they share a single domain.
+
+```lua
+local config = wezterm.config_builder()
+
+-- Connect each GUI to the same mux server on startup
+config.unix_domains = {
+    { name = 'unix' },
+}
+config.default_gui_startup_args = { 'connect', 'unix' }
+```
+
+If you have custom keybindings for creating tabs, keep new tabs in the pane's own domain so they join the same instance:
+
+```lua
+-- CORRECT: Uses the current pane's domain
+{ key = 't', mods = 'SUPER', action = act.SpawnTab('CurrentPaneDomain') },
+
+-- WRONG: This spawns in the GUI domain, which is a different instance
+-- { key = 't', mods = 'SUPER', action = act.SpawnTab({ DomainName = 'local' }) },
+```
 
 ## Differences from tmux
 
@@ -23,41 +55,8 @@ The WezTerm backend is new and experimental. Expect rough edges and potential is
 
 ## Requirements
 
-- WezTerm with CLI enabled (`wezterm cli` must work)
-- Unix-like OS (named pipes for handshakes)
-- Windows is **not supported**
-- **Required WezTerm configuration** (see below)
-
-## Required WezTerm configuration
-
-workmux relies on WezTerm's environment variables (`WEZTERM_PANE`, `WEZTERM_UNIX_SOCKET`) being consistent across all panes. This requires connecting to the mux server on startup.
-
-Add this to your `wezterm.lua`:
-
-```lua
-local config = wezterm.config_builder()
-
--- REQUIRED: Connect to unix mux server on startup
--- This ensures WEZTERM_UNIX_SOCKET is consistent across all panes
-config.default_gui_startup_args = { 'connect', 'unix' }
-
--- REQUIRED: Configure unix_domains for the mux server
-config.unix_domains = {
-    { name = 'unix' },
-}
-```
-
-Additionally, if you have custom keybindings for creating tabs, ensure they use `CurrentPaneDomain`:
-
-```lua
--- CORRECT: Uses the current pane's domain (mux server)
-{ key = 't', mods = 'SUPER', action = act.SpawnTab('CurrentPaneDomain') },
-
--- WRONG: This spawns in the GUI domain, breaking workmux
--- { key = 't', mods = 'SUPER', action = act.SpawnTab({ DomainName = 'local' }) },
-```
-
-Without this configuration, panes created via keybindings may connect to a different socket than panes created by workmux, causing state inconsistencies.
+- WezTerm with its CLI available (`wezterm cli` must work inside a pane)
+- macOS, Linux, or Windows
 
 ## Cross-workspace navigation
 
@@ -95,10 +94,10 @@ Without this configuration, the dashboard can display agents from all workspaces
 
 ## Known limitations
 
-- Windows is not supported (requires Unix-specific features)
-- Cross-workspace jumping requires Lua config (see above)
+- Cross-workspace jumping requires the Lua handler above
+- Agent status icons do not appear in tab titles; the dashboard (and, on Windows, the sidebar) shows the status instead
+- On Windows, `wezterm cli list-clients` reports nothing, so host-window focus is read from the active tab: "the window is focused" and "the tab is active" are the same signal
 - Some edge cases may not be as thoroughly tested as the tmux backend
-- Agent status icons do not appear in tab titles
 
 ## Credits
 

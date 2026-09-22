@@ -1,5 +1,5 @@
 use crate::config::MuxMode;
-use crate::multiplexer::handle::mode_label;
+use crate::multiplexer::handle::target_label;
 use crate::multiplexer::{MuxHandle, create_backend, detect_backend};
 use crate::prompt::{Prompt, PromptDocument, foreach_from_frontmatter};
 use crate::spinner;
@@ -1151,8 +1151,8 @@ impl<'a> CreationPlan<'a> {
             }
 
             println!(
-                "✓ Successfully created worktree and tmux {} for '{}'",
-                mode_label(mode),
+                "✓ Successfully created worktree and {} for '{}'",
+                target_label(mux.name(), mode),
                 result.branch_name
             );
             if let Some(ref base) = result.base_branch {
@@ -1241,7 +1241,7 @@ fn print_dry_run(
     println!(
         "Target:   {} ({})",
         target.full_name(),
-        mode_label(options.mode)
+        target_label(context.mux.name(), options.mode)
     );
     if is_explicit_name {
         println!("Handle:   {}", handle);

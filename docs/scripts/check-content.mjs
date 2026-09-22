@@ -1,7 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const contentRoot = new URL("../src/content/docs/", import.meta.url);
+// Windows paths from URL#pathname arrive as "/E:/repo/..." and then survive
+// into path.join as a second drive letter, so resolve through fileURLToPath.
+const contentRoot = fileURLToPath(
+  new URL("../src/content/docs/", import.meta.url),
+);
 const failures = [];
 
 function walk(directory) {
@@ -11,10 +16,10 @@ function walk(directory) {
   });
 }
 
-for (const file of walk(contentRoot.pathname).filter((name) =>
+for (const file of walk(contentRoot).filter((name) =>
   /\.mdx?$/.test(name),
 )) {
-  const relative = path.relative(contentRoot.pathname, file);
+  const relative = path.relative(contentRoot, file);
   const source = fs.readFileSync(file, "utf8");
   const frontmatter = source.match(/^---\n([\s\S]*?)\n---\n/);
   if (!frontmatter) {
