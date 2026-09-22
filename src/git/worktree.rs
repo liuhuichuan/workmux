@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::cmd::Cmd;
 use crate::config::MuxMode;
@@ -71,6 +72,9 @@ pub fn create_worktree_in(
     track_upstream: bool,
     workdir: Option<&Path>,
 ) -> Result<()> {
+    // Adding a worktree changes what a listing would print.
+    super::forget_repository_readings();
+
     let path = crate::util::git_path(worktree_path);
     let path_str = path
         .to_str()
@@ -105,6 +109,9 @@ pub fn create_worktree_in(
 /// `.git` pointer. Note: the admin dir itself (`.git/worktrees/<basename>/`)
 /// keeps its original basename; workmux does not rely on that path shape.
 pub fn move_worktree(old_path: &Path, new_path: &Path) -> Result<()> {
+    // Moving a worktree changes what a listing would print.
+    super::forget_repository_readings();
+
     let old_path = crate::util::git_path(old_path);
     let new_path = crate::util::git_path(new_path);
     let old = old_path
@@ -225,6 +232,9 @@ pub fn worktree_registration_exists_in(
 
 /// Prune stale worktree metadata.
 pub fn prune_worktrees_in(git_common_dir: &Path) -> Result<()> {
+    // Pruning drops worktrees a listing would still print.
+    super::forget_repository_readings();
+
     Cmd::new("git")
         .workdir(git_common_dir)
         .args(&["worktree", "prune"])
@@ -312,14 +322,16 @@ pub fn list_worktrees() -> Result<Vec<(PathBuf, String)>> {
 
 /// List all worktrees with their branches, optionally in a specific workdir
 pub fn list_worktrees_in(workdir: Option<&Path>) -> Result<Vec<(PathBuf, String)>> {
-    let cmd = Cmd::new("git").args(&["worktree", "list", "--porcelain"]);
-    let cmd = match workdir {
-        Some(path) => cmd.workdir(path),
-        None => cmd,
-    };
-    let list = cmd
-        .run_and_capture_stdout()
-        .context("Failed to list worktrees")?;
+    let list =
+        super::worktrees().get_or_take(super::asked_from(workdir), Instant::now(), || {
+            let cmd = Cmd::new("git").args(&["worktree", "list", "--porcelain"]);
+            let cmd = match workdir {
+                Some(path) => cmd.workdir(path),
+                None => cmd,
+            };
+            cmd.run_and_capture_stdout()
+                .context("Failed to list worktrees")
+        })?;
     parse_worktree_list_porcelain(&list)
 }
 
@@ -604,14 +616,16 @@ pub fn get_main_worktree_root() -> Result<PathBuf> {
 
 /// Get the main worktree root directory from a specific workdir
 pub fn get_main_worktree_root_in(workdir: Option<&Path>) -> Result<PathBuf> {
-    let cmd = Cmd::new("git").args(&["worktree", "list", "--porcelain"]);
-    let cmd = match workdir {
-        Some(path) => cmd.workdir(path),
-        None => cmd,
-    };
-    let list_str = cmd
-        .run_and_capture_stdout()
-        .context("Failed to list worktrees while locating main worktree")?;
+    let list_str =
+        super::worktrees().get_or_take(super::asked_from(workdir), Instant::now(), || {
+            let cmd = Cmd::new("git").args(&["worktree", "list", "--porcelain"]);
+            let cmd = match workdir {
+                Some(path) => cmd.workdir(path),
+                None => cmd,
+            };
+            cmd.run_and_capture_stdout()
+                .context("Failed to list worktrees while locating main worktree")
+        })?;
 
     // Check if this is a bare repo setup.
     // The first entry in `git worktree list` is always the main worktree or bare repo.
@@ -751,6 +765,72 @@ mod tests {
         assert_eq!(
             WorktreeMeta::parse(output).modes(),
             HashMap::from([("feature".to_string(), MuxMode::Session)])
+        );
+    }
+
+    /// A worktree added in this process is in the next listing, rather than
+    /// the listing this process took before the add.
+    #[test]
+    fn a_created_worktree_is_listed_right_after() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_support::init_repo(&repo);
+
+        let before = list_worktrees_in(Some(&repo)).unwrap();
+        let worktree_path = temp.path().join("repo__worktrees").join("feature");
+        create_worktree_in(
+            &worktree_path,
+            "feature",
+            true,
+            Some("main"),
+            false,
+            Some(&repo),
+        )
+        .unwrap();
+        let after = list_worktrees_in(Some(&repo)).unwrap();
+
+        let added = test_support::canonical_dir(&worktree_path);
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 2);
+        assert!(
+            after
+                .iter()
+                .any(|(path, branch)| path == &added && branch == "feature"),
+            "the worktree added in this process is not in the listing: {after:?}"
+        );
+    }
+
+    /// A worktree pruned in this process is gone from the next listing.
+    #[test]
+    fn a_pruned_worktree_is_gone_from_the_next_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_support::init_repo(&repo);
+
+        let worktree_path = temp.path().join("repo__worktrees").join("feature");
+        create_worktree_in(
+            &worktree_path,
+            "feature",
+            true,
+            Some("main"),
+            false,
+            Some(&repo),
+        )
+        .unwrap();
+        assert_eq!(list_worktrees_in(Some(&repo)).unwrap().len(), 2);
+
+        std::fs::remove_dir_all(&worktree_path).unwrap();
+        prune_worktrees_in(&repo.join(".git")).unwrap();
+
+        let after = list_worktrees_in(Some(&repo)).unwrap();
+        assert_eq!(after.len(), 1);
+        assert!(
+            after
+                .iter()
+                .all(|(path, _)| path.file_name() != Some(std::ffi::OsStr::new("feature"))),
+            "the pruned worktree is still in the listing: {after:?}"
         );
     }
 

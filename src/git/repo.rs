@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
+use std::time::Instant;
 
 use crate::cmd::Cmd;
 
@@ -98,29 +99,32 @@ pub fn get_repo_root() -> Result<PathBuf> {
 
 /// Get the root directory of a git repository in a specific workdir
 pub fn get_repo_root_in(workdir: Option<&Path>) -> Result<PathBuf> {
-    let cmd = Cmd::new("git").args(&["rev-parse", "--show-toplevel"]);
-    let cmd = match workdir {
-        Some(path) => cmd.workdir(path),
-        None => cmd,
-    };
-    let path = cmd.run_and_capture_stdout()?;
+    let path = super::roots().get_or_take(super::asked_from(workdir), Instant::now(), || {
+        let cmd = Cmd::new("git").args(&["rev-parse", "--show-toplevel"]);
+        let cmd = match workdir {
+            Some(path) => cmd.workdir(path),
+            None => cmd,
+        };
+        cmd.run_and_capture_stdout()
+    })?;
     Ok(PathBuf::from(path))
 }
 
 /// Get the root directory of the git repository containing the given path.
 /// Uses `git -C <dir>` to run git from the target directory.
 pub fn get_repo_root_for(dir: &Path) -> Result<PathBuf> {
-    let mut command = super::unattended_git(Some(dir))?;
-    let output = command
-        .args(["-C", &dir.to_string_lossy(), "rev-parse", "--show-toplevel"])
-        .output()
-        .context("Failed to run git rev-parse")?;
+    let path = super::roots().get_or_take(super::asked_from(Some(dir)), Instant::now(), || {
+        let output = super::unattended_git(Some(dir))?
+            .args(["-C", &dir.to_string_lossy(), "rev-parse", "--show-toplevel"])
+            .output()
+            .context("Failed to run git rev-parse")?;
 
-    if !output.status.success() {
-        anyhow::bail!("Not a git repository: {}", dir.display());
-    }
+        if !output.status.success() {
+            anyhow::bail!("Not a git repository: {}", dir.display());
+        }
 
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    })?;
     Ok(PathBuf::from(path))
 }
 
