@@ -2186,12 +2186,28 @@ pub struct ConfigLocation {
 /// Find the nearest .workmux.yaml by walking up from start_dir to repo root.
 /// Returns ConfigLocation with the relative path computed at discovery time.
 pub fn find_project_config(start_dir: &Path) -> anyhow::Result<Option<ConfigLocation>> {
+    Ok(find_project_config_with_root(start_dir)?.0)
+}
+
+/// Find the nearest .workmux.yaml, and the repository root the search ran under.
+///
+/// The walk needs the repository root to know where to stop, and the caller
+/// needs the same root to know where defaults are anchored. Handing it back
+/// costs nothing, while asking git for it again costs a process -- and on
+/// Windows a process is the better part of a tenth of a second, which every
+/// config load and therefore every sidebar poll pays.
+pub fn find_project_config_with_root(
+    start_dir: &Path,
+) -> anyhow::Result<(Option<ConfigLocation>, Option<PathBuf>)> {
     let config_names = [".workmux.yaml", ".workmux.yml"];
 
     let repo_root = match git::get_repo_root_for(start_dir) {
         Ok(root) => root,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok((None, None)),
     };
+    // The root as git spelled it: callers compare it against directories git
+    // printed too, and a canonical path is spelled differently on Windows.
+    let git_root = repo_root.clone();
 
     // Canonicalize both paths to handle symlinks and ensure consistent comparison
     let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
@@ -2201,7 +2217,7 @@ pub fn find_project_config(start_dir: &Path) -> anyhow::Result<Option<ConfigLoca
 
     // Safety: ensure we're inside the repo
     if !dir.starts_with(&repo_root) {
-        return Ok(None);
+        return Ok((None, Some(git_root)));
     }
 
     // Walk upward from start_dir to repo_root (inclusive)
@@ -2218,11 +2234,14 @@ pub fn find_project_config(start_dir: &Path) -> anyhow::Result<Option<ConfigLoca
                     rel_dir = %rel_dir.display(),
                     "config:found project config"
                 );
-                return Ok(Some(ConfigLocation {
-                    config_path: candidate,
-                    config_dir: dir,
-                    rel_dir,
-                }));
+                return Ok((
+                    Some(ConfigLocation {
+                        config_path: candidate,
+                        config_dir: dir,
+                        rel_dir,
+                    }),
+                    Some(git_root),
+                ));
             }
         }
         if dir == repo_root {
@@ -2241,17 +2260,41 @@ pub fn find_project_config(start_dir: &Path) -> anyhow::Result<Option<ConfigLoca
                 let candidate = main_root.join(name);
                 if candidate.exists() {
                     debug!(path = %candidate.display(), "config:found main-worktree config");
-                    return Ok(Some(ConfigLocation {
-                        config_path: candidate,
-                        config_dir: main_root.clone(),
-                        rel_dir: PathBuf::new(), // Main worktree root = empty rel_dir
-                    }));
+                    return Ok((
+                        Some(ConfigLocation {
+                            config_path: candidate,
+                            config_dir: main_root.clone(),
+                            rel_dir: PathBuf::new(), // Main worktree root = empty rel_dir
+                        }),
+                        Some(git_root),
+                    ));
                 }
             }
         }
     }
 
-    Ok(None)
+    Ok((None, Some(git_root)))
+}
+
+/// Where the defaults a project config leaves out are anchored.
+///
+/// A config inside its repository anchors them at its own directory -- a config
+/// in `backend/` describes `backend/`. The main-worktree fallback lands outside
+/// the repository the caller started in, so it anchors at the root instead, and
+/// a directory that is no repository at all anchors at itself.
+fn defaults_root_for(
+    location: Option<&ConfigLocation>,
+    repo_root: Option<&Path>,
+    start_dir: &Path,
+) -> PathBuf {
+    match location {
+        Some(loc) => match repo_root {
+            Some(root) if !loc.config_dir.starts_with(root) => root.to_path_buf(),
+            Some(_) => loc.config_dir.clone(),
+            None => start_dir.to_path_buf(),
+        },
+        None => repo_root.unwrap_or(start_dir).to_path_buf(),
+    }
 }
 
 impl WorktreeNaming {
@@ -2492,7 +2535,7 @@ impl Config {
         debug!(start_dir = %start_dir.display(), "config:loading with location from");
         let global_config = Self::load_global()?.unwrap_or_default();
 
-        let (project_config, location) = if let Some(path) = config_override {
+        let (project_config, location, repo_root) = if let Some(path) = config_override {
             let meta = std::fs::metadata(path)
                 .with_context(|| format!("Config file not found: {}", path.display()))?;
             if meta.is_dir() {
@@ -2518,29 +2561,21 @@ impl Config {
                 config_dir: config_dir.clone(),
                 rel_dir: PathBuf::new(),
             };
-            (config, Some(location))
+            // An override skips the discovery walk, so the root still has to be
+            // asked for: it is what the override's directory is judged against.
+            let repo_root = git::get_repo_root_for(start_dir).ok();
+            (config, Some(location), repo_root)
         } else {
-            let location = find_project_config(start_dir)?;
+            let (location, repo_root) = find_project_config_with_root(start_dir)?;
             let project_config = if let Some(ref loc) = location {
                 Self::load_from_path(&loc.config_path)?.unwrap_or_default()
             } else {
                 Self::default()
             };
-            (project_config, location)
+            (project_config, location, repo_root)
         };
 
-        let defaults_root = location
-            .as_ref()
-            .and_then(|loc| {
-                let repo_root = git::get_repo_root_for(start_dir).ok()?;
-                if loc.config_dir.starts_with(&repo_root) {
-                    Some(loc.config_dir.clone())
-                } else {
-                    Some(repo_root)
-                }
-            })
-            .or_else(|| git::get_repo_root_for(start_dir).ok())
-            .unwrap_or_else(|| start_dir.to_path_buf());
+        let defaults_root = defaults_root_for(location.as_ref(), repo_root.as_deref(), start_dir);
 
         let mut config = Self::merge_and_apply_defaults(
             global_config,
@@ -4659,6 +4694,102 @@ agents:
         let backend_config = backend.join(".workmux.yaml").canonicalize().unwrap();
         assert_eq!(loc.config_path, backend_config);
         assert_eq!(loc.config_dir, backend.canonicalize().unwrap());
+    }
+
+    use super::{ConfigLocation, defaults_root_for, find_project_config_with_root};
+
+    /// The walk that finds the config knows the repository root already, so it
+    /// hands it back: the same answer used to cost a second `git rev-parse`.
+    #[test]
+    fn finding_a_project_config_reports_the_root_it_walked() {
+        let temp = git_tempdir();
+        let root = temp.path();
+        fs::write(root.join(".workmux.yaml"), "agent: claude").unwrap();
+
+        let (location, repo_root) = find_project_config_with_root(root).unwrap();
+
+        assert!(
+            location.is_some(),
+            "the config beside the root was not found"
+        );
+        let repo_root = repo_root.expect("the root the walk ran under");
+        assert_eq!(
+            repo_root.canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
+    }
+
+    /// A directory outside any repository has no root to report, and saying so
+    /// is what keeps the caller from asking git for one it already failed to
+    /// find.
+    #[test]
+    fn finding_a_config_outside_a_repository_reports_no_root() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let (location, repo_root) = find_project_config_with_root(temp.path()).unwrap();
+
+        assert!(location.is_none());
+        assert!(repo_root.is_none());
+    }
+
+    fn location_in(dir: &std::path::Path) -> ConfigLocation {
+        ConfigLocation {
+            config_path: dir.join(".workmux.yaml"),
+            config_dir: dir.to_path_buf(),
+            rel_dir: std::path::PathBuf::new(),
+        }
+    }
+
+    /// A config inside its repository describes its own directory.
+    #[test]
+    fn defaults_are_anchored_at_a_config_inside_the_repository() {
+        let root = std::path::Path::new("/repo");
+        let backend = std::path::Path::new("/repo/backend");
+
+        let anchor = defaults_root_for(Some(&location_in(backend)), Some(root), backend);
+
+        assert_eq!(anchor, backend);
+    }
+
+    /// The main-worktree fallback finds a config outside the repository the
+    /// caller started in; its defaults belong to the repository, not to a
+    /// directory the caller has no relationship with.
+    #[test]
+    fn defaults_fall_back_to_the_repository_root_for_a_config_outside_it() {
+        let root = std::path::Path::new("/repo");
+        let main_root = std::path::Path::new("/main-repo");
+
+        let anchor = defaults_root_for(
+            Some(&location_in(main_root)),
+            Some(root),
+            std::path::Path::new("/repo/worktree"),
+        );
+
+        assert_eq!(anchor, root);
+    }
+
+    /// Without a repository there is no root to anchor at, so the directory the
+    /// caller asked about is the only answer left.
+    #[test]
+    fn defaults_are_anchored_at_the_start_directory_without_a_repository() {
+        let start = std::path::Path::new("/somewhere");
+
+        assert_eq!(
+            defaults_root_for(Some(&location_in(start)), None, start),
+            start
+        );
+        assert_eq!(defaults_root_for(None, None, start), start);
+    }
+
+    /// Without a location the repository root is the anchor, and it is used
+    /// whether or not a config was found in it.
+    #[test]
+    fn defaults_are_anchored_at_the_repository_root_without_a_location() {
+        let root = std::path::Path::new("/repo");
+
+        let anchor = defaults_root_for(None, Some(root), std::path::Path::new("/repo/src"));
+
+        assert_eq!(anchor, root);
     }
 
     #[test]

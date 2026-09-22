@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::cmd::Cmd;
@@ -457,72 +458,90 @@ pub fn get_worktree_mode(handle: &str) -> MuxMode {
     get_worktree_mode_opt(handle).unwrap_or(MuxMode::Window)
 }
 
-pub fn get_all_worktree_meta_key_in(
-    workdir: Option<&Path>,
-    key_name: &str,
-) -> std::collections::HashMap<String, String> {
-    let pattern = format!(r"^workmux\.worktree\..*\.{}$", regex::escape(key_name));
-    let cmd = Cmd::new("git").args(&["config", "--local", "--get-regexp", &pattern]);
-    let cmd = match workdir {
-        Some(path) => cmd.workdir(path),
-        None => cmd,
-    };
-    let output = cmd.run_and_capture_stdout().unwrap_or_default();
-
-    let mut values = std::collections::HashMap::new();
-    let suffix = format!(".{}", key_name);
-    for line in output.lines() {
-        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-        if parts.len() == 2 {
-            let key = parts[0];
-            let value = parts[1].trim();
-            if let Some(rest) = key.strip_prefix("workmux.worktree.")
-                && let Some(handle) = rest.strip_suffix(&suffix)
-            {
-                values.insert(handle.to_string(), value.to_string());
-            }
-        }
-    }
-    values
+/// Every per-worktree setting workmux keeps in git config, read in one go.
+///
+/// The settings live under `workmux.worktree.<handle>.<key>`, and a listing
+/// wants six of them. Reading one key per `git config` is one process per key,
+/// and on Windows a process is most of a tenth of a second that every listing,
+/// every dashboard refresh and every sidebar poll pays again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorktreeMeta {
+    settings: HashMap<String, HashMap<String, String>>,
 }
 
-/// Batch-load all worktree modes, optionally in a specific workdir.
-pub fn get_all_worktree_modes_in(
-    workdir: Option<&Path>,
-) -> std::collections::HashMap<String, MuxMode> {
-    let cmd = Cmd::new("git").args(&[
-        "config",
-        "--local",
-        "--get-regexp",
-        r"^workmux\.worktree\..*\.mode$",
-    ]);
-    let cmd = match workdir {
-        Some(path) => cmd.workdir(path),
-        None => cmd,
-    };
-    let output = cmd.run_and_capture_stdout().unwrap_or_default();
-
-    let mut modes = std::collections::HashMap::new();
-    for line in output.lines() {
-        // Format: "workmux.worktree.<handle>.mode <value>"
-        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-        if parts.len() == 2 {
-            let key = parts[0];
-            let value = parts[1].trim();
-            // Extract handle from "workmux.worktree.<handle>.mode"
-            if let Some(rest) = key.strip_prefix("workmux.worktree.")
-                && let Some(handle) = rest.strip_suffix(".mode")
-            {
-                let mode = if value == "session" {
-                    MuxMode::Session
-                } else {
-                    MuxMode::Window
-                };
-                modes.insert(handle.to_string(), mode);
-            }
-        }
+impl WorktreeMeta {
+    /// Read every `workmux.worktree.*` setting visible from `workdir`.
+    pub fn load_in(workdir: Option<&Path>) -> Self {
+        let cmd =
+            Cmd::new("git").args(&["config", "--local", "--get-regexp", r"^workmux\.worktree\."]);
+        let cmd = match workdir {
+            Some(path) => cmd.workdir(path),
+            None => cmd,
+        };
+        let output = cmd.run_and_capture_stdout().unwrap_or_default();
+        Self::parse(&output)
     }
-    modes
+
+    /// Read the settings out of `git config --get-regexp` output.
+    ///
+    /// Each line is `<key> <value>`, and the key names one setting of one
+    /// worktree. The handle is everything up to the last dot, so a handle that
+    /// contains dots -- a branch named after a version, say -- keeps all of
+    /// itself.
+    fn parse(output: &str) -> Self {
+        let mut settings: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for line in output.lines() {
+            let Some((key, value)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some(rest) = key.strip_prefix("workmux.worktree.") else {
+                continue;
+            };
+            let Some((handle, name)) = rest.rsplit_once('.') else {
+                continue;
+            };
+            if handle.is_empty() || name.is_empty() {
+                continue;
+            }
+            settings
+                .entry(handle.to_string())
+                .or_default()
+                .insert(name.to_string(), value.trim().to_string());
+        }
+        Self { settings }
+    }
+
+    /// One setting's values, by worktree handle.
+    pub fn key(&self, name: &str) -> HashMap<String, String> {
+        self.settings
+            .iter()
+            .filter_map(|(handle, settings)| {
+                settings
+                    .get(name)
+                    .map(|value| (handle.clone(), value.clone()))
+            })
+            .collect()
+    }
+
+    /// The mux mode of every worktree that recorded one.
+    ///
+    /// An unrecognized mode reads as a window, which is what the caller's
+    /// default is: a worktree whose mode was never written is a window too.
+    pub fn modes(&self) -> HashMap<String, MuxMode> {
+        self.settings
+            .iter()
+            .filter_map(|(handle, settings)| {
+                settings.get("mode").map(|mode| {
+                    let mode = if mode == "session" {
+                        MuxMode::Session
+                    } else {
+                        MuxMode::Window
+                    };
+                    (handle.clone(), mode)
+                })
+            })
+            .collect()
+    }
 }
 
 /// Remove worktree metadata using an explicitly identified repository.
@@ -642,6 +661,98 @@ mod tests {
     use crate::test_support;
     use std::path::PathBuf;
     use std::process::Command;
+
+    /// Every key a listing asks for comes out of one reading of git config.
+    /// The keys used to be fetched one `git config` process at a time.
+    #[test]
+    fn worktree_meta_answers_every_key_from_one_reading() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_support::init_repo(&repo);
+
+        set_worktree_meta_in("feature", "mode", "session", Some(&repo)).unwrap();
+        set_worktree_meta_in("feature", "target-session", "wm-feature", Some(&repo)).unwrap();
+        set_worktree_meta_in("other", "mode", "window", Some(&repo)).unwrap();
+        set_worktree_meta_in("other", "window-token", "token with spaces", Some(&repo)).unwrap();
+
+        let meta = WorktreeMeta::load_in(Some(&repo));
+
+        assert_eq!(
+            meta.modes(),
+            HashMap::from([
+                ("feature".to_string(), MuxMode::Session),
+                ("other".to_string(), MuxMode::Window),
+            ])
+        );
+        assert_eq!(
+            meta.key("target-session"),
+            HashMap::from([("feature".to_string(), "wm-feature".to_string())])
+        );
+        assert_eq!(
+            meta.key("window-token"),
+            HashMap::from([("other".to_string(), "token with spaces".to_string())])
+        );
+        assert!(meta.key("attachment").is_empty());
+    }
+
+    /// A repository that never recorded a setting reports none, rather than
+    /// whatever the last repository did.
+    #[test]
+    fn worktree_meta_is_empty_without_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        test_support::init_repo(&repo);
+
+        let meta = WorktreeMeta::load_in(Some(&repo));
+
+        assert_eq!(meta, WorktreeMeta::default());
+    }
+
+    /// The handle is everything up to the last dot, so a handle that contains
+    /// dots keeps all of itself.
+    #[test]
+    fn worktree_meta_keeps_dots_inside_a_handle() {
+        let output = "workmux.worktree.v1.2.mode session\n\
+                      workmux.worktree.v1.2.window-token w1\n";
+
+        let meta = WorktreeMeta::parse(output);
+
+        assert_eq!(
+            meta.modes(),
+            HashMap::from([("v1.2".to_string(), MuxMode::Session)])
+        );
+        assert_eq!(
+            meta.key("window-token"),
+            HashMap::from([("v1.2".to_string(), "w1".to_string())])
+        );
+    }
+
+    /// Settings outside the section, and lines that name no setting, are not
+    /// worktree metadata.
+    #[test]
+    fn worktree_meta_ignores_what_is_not_a_worktree_setting() {
+        let output = "workmux.hook-shell sh\n\
+                      workmux.worktree.\n\
+                      workmux.worktree.feature. mode\n\
+                      other.setting value\n";
+
+        assert_eq!(WorktreeMeta::parse(output), WorktreeMeta::default());
+    }
+
+    /// A setting written twice keeps the last value, which is the one git
+    /// itself would report for the key.
+    #[test]
+    fn worktree_meta_keeps_the_last_of_a_repeated_setting() {
+        let output = "workmux.worktree.feature.mode window\n\
+                      workmux.worktree.feature.mode session\n";
+
+        assert_eq!(
+            WorktreeMeta::parse(output).modes(),
+            HashMap::from([("feature".to_string(), MuxMode::Session)])
+        );
+    }
 
     #[test]
     fn create_worktree_in_accepts_canonicalized_path() {

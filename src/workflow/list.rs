@@ -137,13 +137,15 @@ pub fn list_in(
         .map(|a| (canon_or_self(&a.path), a.status))
         .collect();
 
-    // Batch-load all worktree modes in a single git config call
-    let worktree_modes = git::get_all_worktree_modes_in(repo);
-    let target_windows = git::get_all_worktree_meta_key_in(repo, "target-window");
-    let target_sessions = git::get_all_worktree_meta_key_in(repo, "target-session");
-    let window_sessions = git::get_all_worktree_meta_key_in(repo, "window-session");
-    let window_tokens = git::get_all_worktree_meta_key_in(repo, "window-token");
-    let attachments = git::get_all_worktree_meta_key_in(repo, "attachment");
+    // Batch-load every worktree setting in a single git config call: one call
+    // per key is one process per key, and a process is the expensive part.
+    let worktree_meta = git::WorktreeMeta::load_in(repo);
+    let worktree_modes = worktree_meta.modes();
+    let target_windows = worktree_meta.key("target-window");
+    let target_sessions = worktree_meta.key("target-session");
+    let window_sessions = worktree_meta.key("window-session");
+    let window_tokens = worktree_meta.key("window-token");
+    let attachments = worktree_meta.key("attachment");
     let active_window_tokens = if mux_running {
         mux.owned_window_tokens().unwrap_or_default()
     } else {
