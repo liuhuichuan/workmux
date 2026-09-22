@@ -1539,6 +1539,7 @@ def linked_admin_dir(worktree_path: Path) -> Path:
     return admin_dir
 
 
+@pytest.mark.posix_only
 def test_synchronous_worktree_lock_removal_failure_is_partial(
     mux_server: MuxEnvironment, workmux_exe_path: Path, mux_repo_path: Path
 ):
@@ -1622,7 +1623,10 @@ def test_deferred_worktree_lock_removal_failure_is_durably_logged(
 
 
 @pytest.mark.tmux_only
-@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="directory permissions are POSIX-only, and root bypasses them",
+)
 def test_deferred_cleanup_retains_record_when_quarantine_deletion_fails(
     mux_server: TmuxEnvironment,
     workmux_exe_path: Path,

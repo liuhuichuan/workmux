@@ -1,13 +1,10 @@
 """Navigation checks with real PTY clients and keybinding-launched popups."""
 
-import fcntl
 import os
-import pty
 import select
 import shlex
 import struct
 import subprocess
-import termios
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -21,6 +18,11 @@ from .conftest import (
     write_workmux_config,
 )
 from .test_workmux_add.conftest import add_branch_and_get_worktree
+
+# An attached client is driven through a pty, which only a POSIX host has.
+fcntl = pytest.importorskip("fcntl")
+pty = pytest.importorskip("pty")
+termios = pytest.importorskip("termios")
 
 pytestmark = pytest.mark.tmux_only
 

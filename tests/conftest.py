@@ -1080,6 +1080,20 @@ def pytest_configure(config):
         "markers",
         "tmux_only: mark test as tmux-specific (skipped for other backends)",
     )
+    config.addinivalue_line(
+        "markers",
+        "posix_only: mark test as needing a POSIX host (skipped on Windows)",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip the tests whose subject Windows does not have."""
+    if not IS_WINDOWS:
+        return
+    posix_only = pytest.mark.skip(reason="needs a POSIX host")
+    for item in items:
+        if item.get_closest_marker("posix_only"):
+            item.add_marker(posix_only)
 
 
 def pytest_xdist_auto_num_workers(config) -> int | None:
