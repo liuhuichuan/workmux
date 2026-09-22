@@ -344,10 +344,9 @@ pub fn count_diff_stats(content: &[u8]) -> (usize, usize) {
 
 /// Check if delta pager is available
 pub fn has_delta() -> bool {
-    std::process::Command::new("which")
-        .arg("delta")
-        .output()
-        .is_ok_and(|o| o.status.success())
+    // Resolved through PATH/PATHEXT instead of shelling out to the POSIX `which`
+    // binary, which never exists on Windows.
+    which::which("delta").is_ok()
 }
 
 /// Render diff content through delta for syntax highlighting
@@ -789,6 +788,7 @@ pub fn get_untracked_files_diff(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     #[test]
     fn test_parse_hunk_header() {
@@ -930,5 +930,64 @@ mod tests {
 
         assert_eq!(files[0].start_line, 0);
         assert_eq!(files[1].start_line, 3);
+    }
+
+    /// Write a runnable `delta` into `dir`, named for the platform's `PATHEXT`.
+    fn write_fake_delta(dir: &Path) {
+        #[cfg(windows)]
+        let name = "delta.exe";
+        #[cfg(not(windows))]
+        let name = "delta";
+        let script = dir.join(name);
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+    }
+
+    /// `PATH` is set per child process so the assertions do not depend on
+    /// whether the machine running the tests has delta installed.
+    #[test]
+    fn has_delta_finds_delta_on_path() {
+        const TEST_NAME: &str = "command::dashboard::diff::tests::has_delta_finds_delta_on_path";
+        if !test_support::is_isolated_child(TEST_NAME) {
+            let temp = tempfile::tempdir().unwrap();
+            let bin = temp.path().join("bin");
+            let cwd = temp.path().join("cwd");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+            write_fake_delta(&bin);
+
+            test_support::run_isolated_test(TEST_NAME, &cwd, &[("PATH", bin.as_path())]);
+            return;
+        }
+
+        println!("{}", test_support::ISOLATED_TEST_CANARY);
+
+        assert!(has_delta(), "delta on PATH should be detected");
+    }
+
+    #[test]
+    fn has_delta_is_false_when_path_has_no_delta() {
+        const TEST_NAME: &str =
+            "command::dashboard::diff::tests::has_delta_is_false_when_path_has_no_delta";
+        if !test_support::is_isolated_child(TEST_NAME) {
+            let temp = tempfile::tempdir().unwrap();
+            let bin = temp.path().join("bin");
+            let cwd = temp.path().join("cwd");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+
+            test_support::run_isolated_test(TEST_NAME, &cwd, &[("PATH", bin.as_path())]);
+            return;
+        }
+
+        println!("{}", test_support::ISOLATED_TEST_CANARY);
+
+        assert!(!has_delta(), "an empty PATH must not report delta");
     }
 }
