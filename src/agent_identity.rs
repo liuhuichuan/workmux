@@ -7,9 +7,11 @@
 //! these, so the result of `classify_agent_kind` is cached on `AgentState`
 //! once it becomes non-None and reused by the sidebar render path.
 //!
-//! Windows has no `pane_current_command` equivalent: the WezTerm backend cannot
-//! read a pane's foreground process, so every Windows pane arrives here without
-//! a command and its title is classified in place of one.
+//! Windows has no `pane_current_command` on the pane, so the WezTerm backend
+//! reads the command from the process table instead (`multiplexer::winproc`).
+//! A pane whose processes workmux has seen arrives with the command it runs; a
+//! pane it has not seen arrives without one, and its title is classified in
+//! place of it.
 //!
 //! The canonical string form (e.g. "claude", "kiro-cli") matches the existing
 //! `AgentProfile::name` so the sidebar can look up the corresponding profile.

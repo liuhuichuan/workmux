@@ -12,6 +12,8 @@ pub mod tmux;
 pub mod types;
 pub mod util;
 pub mod wezterm;
+#[cfg(windows)]
+pub(crate) mod winproc;
 pub mod zellij;
 
 use anyhow::{Context, Result, anyhow};

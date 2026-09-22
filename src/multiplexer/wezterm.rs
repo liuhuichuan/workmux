@@ -17,6 +17,8 @@ use crate::config::SplitDirection;
 use super::Multiplexer;
 use super::types::*;
 use super::util;
+#[cfg(windows)]
+use super::winproc;
 
 /// File name of the WezTerm CLI, which ships beside WezTerm's other binaries.
 const WEZTERM_CLI: &str = if cfg!(windows) {
@@ -471,13 +473,17 @@ impl WezTermBackend {
         Ok(panes)
     }
 
-    /// Get the current foreground process details for a pane tty.
+    /// The process a pane is rooted at, and the command it is running.
     ///
-    /// Unix reads the tty's foreground process group. Windows panes report no
-    /// tty and have no `ps`, so there is nothing to inspect yet.
+    /// Unix reads the tty's foreground process group. Windows has no tty to
+    /// ask, so the pane's processes come from the process table (`winproc`),
+    /// which needs the pane rather than only its tty.
     #[cfg(unix)]
-    fn foreground_process_info(&self, tty_name: Option<&str>) -> (Option<u32>, Option<String>) {
-        let tty = tty_name.map(|t| t.trim_start_matches("/dev/"));
+    fn foreground_process_info(&self, pane: &WezTermPane) -> (Option<u32>, Option<String>) {
+        let tty = pane
+            .tty_name
+            .as_deref()
+            .map(|t| t.trim_start_matches("/dev/"));
 
         let pid = tty
             .and_then(|tty| {
@@ -513,13 +519,53 @@ impl WezTermBackend {
         (pid, current_command)
     }
 
+    /// A pane's process, read from the Windows process table.
+    ///
+    /// WezTerm publishes no process for a pane, so the pane's root is read back
+    /// from a note a run inside the pane wrote down. The command below it is
+    /// read fresh every time: it is what tells an agent that has exited from
+    /// one still running, and a pane whose processes were never seen answers
+    /// with nothing rather than a guess.
     #[cfg(windows)]
-    fn foreground_process_info(&self, _tty_name: Option<&str>) -> (Option<u32>, Option<String>) {
-        (None, None)
+    fn foreground_process_info(&self, pane: &WezTermPane) -> (Option<u32>, Option<String>) {
+        let key = crate::state::PaneKey {
+            backend: self.name().to_string(),
+            instance: self.instance_id(),
+            pane_id: pane.pane_id.to_string(),
+        };
+        let mine = pane_id_from_env(std::env::var("WEZTERM_PANE").ok().as_deref())
+            .is_some_and(|mine| mine == key.pane_id);
+
+        let Ok(processes) = winproc::processes() else {
+            return (None, None);
+        };
+
+        // A run inside the pane can say which process it is; a run outside it
+        // reads what such a run wrote down.
+        let root = mine
+            .then(|| winproc::pane_root(&processes, std::process::id()))
+            .flatten()
+            .or_else(|| winproc::remembered_root(&key));
+
+        let Some(root) = root else {
+            return (None, None);
+        };
+        if processes.iter().all(|process| process.pid != root) {
+            // The note names a process that is gone, so the pane went with it.
+            winproc::forget_root(&key);
+            return (None, None);
+        }
+        if mine && let Err(error) = winproc::remember_root(&key, root) {
+            tracing::debug!(%error, "failed to remember the pane's root process");
+        }
+
+        let command = winproc::foreground(&processes, root)
+            .map(|process| winproc::command_name(&process.name).to_string());
+        (Some(root), command)
     }
 
     fn live_pane_snapshot(&self, p: &WezTermPane, tab_index: Option<u32>) -> util::LivePaneSnapshot {
-        let (pid, current_command) = self.foreground_process_info(p.tty_name.as_deref());
+        let (pid, current_command) = self.foreground_process_info(p);
         util::LivePaneSnapshot {
             pane_id: p.pane_id.to_string(),
             pid,

@@ -69,6 +69,14 @@ ignore = "0.4"
 # nix is Unix-only; every use site is gated behind cfg(unix).
 nix = { version = "0.31.2", features = ["fs", "dir"] }
 
+[target.'cfg(windows)'.dependencies]
+# ToolHelp reads the process table in-process, in milliseconds; the WMI query
+# that would replace it was measured at 980 ms, which is a whole pane listing.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }
 
