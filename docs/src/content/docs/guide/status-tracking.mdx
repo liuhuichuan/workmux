@@ -147,6 +147,12 @@ curl -o "$codex_home/hooks.json" \
 
 If you already have a `hooks.json` in your Codex home, merge the hook entries from the downloaded file into your existing configuration.
 
+Codex runs a hook only after it has reviewed that entry, and skips the ones it has
+not approved. An added or changed hook, which is what an upgrade leaves behind,
+therefore takes effect only once an interactive `codex` session reviews it and you
+choose "Trust all and continue"; `codex exec` skips unapproved hooks without
+saying so. `workmux setup` reports the workmux hooks Codex will skip.
+
 Codex permission prompts use the 💬 waiting state.
 
 ## Gemini CLI setup
