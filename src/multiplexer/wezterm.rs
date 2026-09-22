@@ -733,6 +733,10 @@ pub(crate) struct PaneSummary {
     pub title: String,
     /// Whether this pane holds the focus in its tab.
     pub is_active: bool,
+    /// The pane's own cell extent. Panes tile their tab, so the widest and the
+    /// tallest of a tab's panes are the ones that reach its edges.
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// Every pane of the instance.
@@ -789,6 +793,8 @@ fn summarize(panes: &[WezTermPane]) -> Vec<PaneSummary> {
             workspace: pane.workspace.clone(),
             title: pane.title.clone(),
             is_active: pane.is_active,
+            cols: pane.size.cols,
+            rows: pane.size.rows,
         })
         .collect()
 }
@@ -1605,6 +1611,7 @@ mod tests {
         assert_eq!(summaries[0].window_index, 0);
         assert_eq!(summaries[0].workspace, "default");
         assert!(summaries[0].is_active);
+        assert_eq!((summaries[0].cols, summaries[0].rows), (50, 24));
         assert_eq!(summaries[1].title, "workmux-sidebar");
         assert_eq!(summaries[2].pane_id, "3");
         assert_eq!(summaries[2].window_index, 1);
