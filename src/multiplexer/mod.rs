@@ -411,6 +411,17 @@ pub trait Multiplexer: Send + Sync {
     /// Get all window names in the current session
     fn get_all_window_names(&self) -> Result<HashSet<String>>;
 
+    /// Drop whatever this backend answered from, so the queries that follow
+    /// are put to the mux.
+    ///
+    /// A backend may keep the listing it read (WezTerm does: a `wezterm cli`
+    /// call is a process on Windows, and a sidebar asks once a second in every
+    /// tab), and then every query in the same turn is answered from it. A
+    /// caller that polls asks again at the start of each turn: without this,
+    /// the answer the first turn was given is the answer the loop ends on, and
+    /// it waits for a window that has already closed.
+    fn reread(&self) {}
+
     fn get_window_names_in_session(&self, session_name: &str) -> Result<HashSet<String>> {
         let _ = session_name;
         self.get_all_window_names()
@@ -432,6 +443,8 @@ pub trait Multiplexer: Send + Sync {
 
     /// Filter a list of window names, returning only those that still exist
     fn filter_active_windows(&self, windows: &[String]) -> Result<Vec<String>> {
+        // Whether a window is still there is a question about now.
+        self.reread();
         let all_current = self.get_all_window_names()?;
 
         Ok(windows
@@ -460,6 +473,9 @@ pub trait Multiplexer: Send + Sync {
                 return Ok(());
             }
 
+            // The windows this waits for close while it waits, so every turn
+            // asks the mux again rather than the first turn's answer.
+            self.reread();
             let current_windows = self.get_all_window_names()?;
 
             let any_exists = targets

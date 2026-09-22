@@ -3,7 +3,7 @@ use regex::Regex;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::MuxMode;
 use crate::multiplexer::{Multiplexer, WindowTarget, util::prefixed};
@@ -19,7 +19,24 @@ use super::types::{CleanupResult, DeferredCleanup, SourceTarget, WorktreeCleanup
 const WINDOW_CLOSE_DELAY_MS: u64 = 300;
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TARGET_CLOSE_RETRIES: u32 = 20;
-const DEFERRED_TARGET_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the deferred worker asks whether the target it follows is gone.
+///
+/// Every turn is put to the mux rather than answered from what it said before,
+/// and on Windows that is a process and a round trip measured at 69-230 ms. The
+/// wait is for a window the script closed 300 ms in, so it can afford to ask
+/// less often than a poll that costs nothing.
+const TARGET_CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How long the worker waits for the source target it follows to close.
+///
+/// The close is scheduled through the interpreter that runs deferred scripts:
+/// on Windows that is a PowerShell process and a `wezterm cli` round trip, so
+/// the wait has to outlast both, while on Unix a `sleep` and a `tmux` call sit
+/// behind the same 300 ms delay.
+const DEFERRED_TARGET_CLOSE_TIMEOUT: Duration = if cfg!(windows) {
+    Duration::from_secs(30)
+} else {
+    Duration::from_secs(5)
+};
 
 /// Find all windows matching the base handle pattern (including duplicates).
 /// Matches: {prefix}{handle} and {prefix}{handle}-{N}
@@ -119,8 +136,12 @@ fn matching_target_regex(prefix: &str, target_name: &str) -> Regex {
         .expect("invalid matching-target regex")
 }
 
-fn poll_bounded(mut condition: impl FnMut() -> Result<bool>) -> Result<()> {
+fn poll_bounded(mux: &dyn Multiplexer, mut condition: impl FnMut() -> Result<bool>) -> Result<()> {
     for _ in 0..TARGET_CLOSE_RETRIES {
+        // The condition asks the mux whether something is gone, which is a
+        // question about now: a backend that answers from the listing it read
+        // earlier in this run would keep saying it is still there.
+        mux.reread();
         if condition()? {
             break;
         }
@@ -783,7 +804,9 @@ fn cleanup_impl(
                         result.tmux_window_killed = true;
                         info!(session = session_name, "cleanup:killed session");
 
-                        poll_bounded(|| Ok(!context.mux.session_exists(&session_name)?))?;
+                        poll_bounded(context.mux.as_ref(), || {
+                            Ok(!context.mux.session_exists(&session_name)?)
+                        })?;
                     }
                 }
             } else {
@@ -813,7 +836,7 @@ fn cleanup_impl(
                         "cleanup:killed all matching windows"
                     );
 
-                    poll_bounded(|| {
+                    poll_bounded(context.mux.as_ref(), || {
                         Ok(find_matching_window_targets(
                             context.mux.as_ref(),
                             &context.prefix,
@@ -900,10 +923,29 @@ fn spawn_deferred_cleanup_worker(
     if let Some(id) = source_id {
         command.arg("--source-id").arg(id);
     }
+    detach_worker_from_terminal(&mut command);
+    command.spawn().with_context(|| {
+        format!(
+            "Failed to start deferred cleanup worker from {}",
+            executable.display()
+        )
+    })
+}
+
+/// Start the worker in a terminal of its own, so it outlives the source target.
+///
+/// The worker's first job is to wait for a window to close, and everything
+/// attached to that window's terminal goes down with it. Unix leaves the
+/// session behind with `setsid`; on Windows the console is what closes, and a
+/// process with a console of its own is not attached to that one.
+fn detach_worker_from_terminal(command: &mut Command) {
+    #[cfg(not(any(unix, windows)))]
+    let _ = command;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // The worker must survive closure of the terminal target that started it.
+        // Safety: `pre_exec` runs between `fork` and `exec`, where the child
+        // may only call async-signal-safe functions; `setsid` is one.
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -913,12 +955,13 @@ fn spawn_deferred_cleanup_worker(
             });
         }
     }
-    command.spawn().with_context(|| {
-        format!(
-            "Failed to start deferred cleanup worker from {}",
-            executable.display()
-        )
-    })
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// Run without a window, in a console of the child's own.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
 }
 
 /// Wait for the source target to close, then perform deferred destructive cleanup.
@@ -957,35 +1000,13 @@ fn run_deferred_cleanup_worker_inner(
         parent_session,
         window_id: source_id.clone(),
     };
-    let deadline = std::time::Instant::now() + DEFERRED_TARGET_CLOSE_TIMEOUT;
-    loop {
-        let target_query = match mode {
-            MuxMode::Window => mux.window_target_exists(&source_target),
-            MuxMode::Session => {
-                let source_id = source_id
-                    .as_deref()
-                    .context("Deferred session cleanup requires a stable source session ID")?;
-                mux.session_exists(source_id)
-            }
-        };
-        let exists = match target_query {
-            Ok(exists) => exists,
-            Err(error) => match mux.is_running() {
-                Ok(true) => return Err(error),
-                Ok(false) | Err(_) => false,
-            },
-        };
-        if !exists {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "Timed out waiting for source target '{}' to close; close it and retry removal",
-                source_name
-            );
-        }
-        thread::sleep(TARGET_POLL_INTERVAL);
-    }
+    wait_for_source_target(
+        mux.as_ref(),
+        mode,
+        &source_name,
+        &source_target,
+        source_id.as_deref(),
+    )?;
     perform_destructive_cleanup(
         &cleanup.worktree_path,
         Some(QuarantineIdentity::repository(&cleanup.expected_identity)),
@@ -995,6 +1016,86 @@ fn run_deferred_cleanup_worker_inner(
         cleanup.force,
         &cleanup.expected_identity.repository.common_dir,
     )
+}
+
+/// Wait for the window or session this worker follows to be gone.
+fn wait_for_source_target(
+    mux: &dyn Multiplexer,
+    mode: MuxMode,
+    source_name: &str,
+    source_target: &WindowTarget,
+    source_id: Option<&str>,
+) -> Result<()> {
+    let started = Instant::now();
+    let result = wait_for_source_target_to_close(
+        source_name,
+        DEFERRED_TARGET_CLOSE_TIMEOUT,
+        || mux.reread(),
+        || match source_target_exists(mux, mode, source_target, source_id) {
+            Ok(exists) => Ok(exists),
+            // A multiplexer that has stopped answering will not report the
+            // target again, and the window went with it.
+            Err(error) => match mux.is_running() {
+                Ok(true) => Err(error),
+                Ok(false) | Err(_) => Ok(false),
+            },
+        },
+        || started.elapsed(),
+        thread::sleep,
+    );
+    debug!(
+        source = source_name,
+        waited_ms = started.elapsed().as_millis(),
+        timed_out = result.is_err(),
+        "deferred cleanup worker: waited for source target to close"
+    );
+    result
+}
+
+/// Ask the multiplexer whether the source target is still there.
+fn source_target_exists(
+    mux: &dyn Multiplexer,
+    mode: MuxMode,
+    source_target: &WindowTarget,
+    source_id: Option<&str>,
+) -> Result<bool> {
+    match mode {
+        MuxMode::Window => mux.window_target_exists(source_target),
+        MuxMode::Session => {
+            let source_id = source_id
+                .context("Deferred session cleanup requires a stable source session ID")?;
+            mux.session_exists(source_id)
+        }
+    }
+}
+
+/// Poll `target_exists` until it says the source target has closed.
+///
+/// `elapsed` and `sleep` are the clock, so a test can time the wait out
+/// without spending the time. `reread` is asked at the start of each turn: the
+/// window is followed while it is still open, and a backend that answers from
+/// the listing it read before it closed keeps reporting it as open.
+fn wait_for_source_target_to_close(
+    source_name: &str,
+    timeout: Duration,
+    mut reread: impl FnMut(),
+    mut target_exists: impl FnMut() -> Result<bool>,
+    elapsed: impl Fn() -> Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Result<()> {
+    loop {
+        reread();
+        if !target_exists()? {
+            return Ok(());
+        }
+        if elapsed() >= timeout {
+            anyhow::bail!(
+                "Timed out waiting for source target '{}' to close; close it and retry removal",
+                source_name
+            );
+        }
+        sleep(TARGET_CLOSE_POLL_INTERVAL);
+    }
 }
 
 /// Navigate to the target branch window and close the source window.
@@ -1140,4 +1241,130 @@ pub fn navigate_to_target_and_close(
         "cleanup:scheduled navigation and source close"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// A clock the test moves by hand, so a wait costs no real time.
+    #[derive(Default)]
+    struct Clock {
+        elapsed: Cell<Duration>,
+        sleeps: Cell<u32>,
+    }
+
+    impl Clock {
+        fn sleep(&self, delay: Duration) {
+            self.elapsed.set(self.elapsed.get() + delay);
+            self.sleeps.set(self.sleeps.get() + 1);
+        }
+
+        fn wait(&self, timeout: Duration, exists: impl FnMut() -> Result<bool>) -> Result<()> {
+            self.wait_asking(timeout, exists, || {})
+        }
+
+        /// The same wait, with the caller watching how often the mux is asked
+        /// again.
+        fn wait_asking(
+            &self,
+            timeout: Duration,
+            exists: impl FnMut() -> Result<bool>,
+            reread: impl FnMut(),
+        ) -> Result<()> {
+            wait_for_source_target_to_close(
+                "wm-feature",
+                timeout,
+                reread,
+                exists,
+                || self.elapsed.get(),
+                |delay| self.sleep(delay),
+            )
+        }
+    }
+
+    #[test]
+    fn a_wait_returns_once_the_source_target_is_gone() {
+        let clock = Clock::default();
+        let mut polls = 0;
+        clock
+            .wait(Duration::from_secs(5), || {
+                polls += 1;
+                // Still there for the first two polls, gone on the third.
+                Ok(polls < 3)
+            })
+            .unwrap();
+
+        assert_eq!(polls, 3);
+        assert_eq!(clock.sleeps.get(), 2, "a wait between each poll");
+    }
+
+    #[test]
+    fn a_wait_that_never_ends_names_the_target_it_waited_for() {
+        let clock = Clock::default();
+        let error = clock.wait(Duration::from_secs(2), || Ok(true)).unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("wm-feature"), "{message}");
+        assert!(message.contains("Timed out waiting"), "{message}");
+        assert!(clock.elapsed.get() >= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_wait_surfaces_a_query_that_fails() {
+        let clock = Clock::default();
+        let error = clock
+            .wait(Duration::from_secs(5), || Err(anyhow!("no mux server")))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no mux server"), "{error}");
+    }
+
+    /// The window being waited for closes while the wait runs, and a backend
+    /// that answers from the listing it took earlier in the run would report
+    /// it as open until the budget was gone. Every turn asks the mux again.
+    #[test]
+    fn every_turn_of_the_wait_asks_the_mux_again() {
+        let clock = Clock::default();
+        let mut polls = 0;
+        let mut rereads = 0;
+        clock
+            .wait_asking(
+                Duration::from_secs(5),
+                || {
+                    polls += 1;
+                    Ok(polls < 3)
+                },
+                || rereads += 1,
+            )
+            .unwrap();
+
+        assert_eq!(polls, 3);
+        assert_eq!(rereads, 3, "the mux is asked again on every turn");
+    }
+
+    /// Asking the mux costs a process on Windows, so the wait that asks on
+    /// every turn leaves more time between turns than a poll that is answered
+    /// from what the backend already read.
+    #[test]
+    fn the_wait_asks_the_mux_less_often_than_a_free_poll() {
+        assert!(
+            TARGET_CLOSE_POLL_INTERVAL > TARGET_POLL_INTERVAL,
+            "the wait between turns has to cover the round trip it makes"
+        );
+    }
+
+    /// The close being waited for goes through the interpreter that runs
+    /// deferred scripts, and the Windows one -- a PowerShell process and a
+    /// `wezterm cli` round trip -- takes longer than a `sleep` and a `tmux`
+    /// call, so it gets the larger budget.
+    #[test]
+    fn the_close_budget_gives_windows_the_longer_wait() {
+        if cfg!(windows) {
+            assert_eq!(DEFERRED_TARGET_CLOSE_TIMEOUT, Duration::from_secs(30));
+        } else {
+            assert_eq!(DEFERRED_TARGET_CLOSE_TIMEOUT, Duration::from_secs(5));
+        }
+    }
 }

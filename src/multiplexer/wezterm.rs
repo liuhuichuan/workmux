@@ -1147,6 +1147,15 @@ impl Multiplexer for WezTermBackend {
         Ok(names)
     }
 
+    /// Drop the held listing, so the queries that follow read the mux again.
+    ///
+    /// This is what a caller that polls asks for at the start of each turn: a
+    /// window closing behind the loop is only visible to a listing taken after
+    /// it closed.
+    fn reread(&self) {
+        panes_reading().forget();
+    }
+
     fn wait_until_session_closed(&self, _full_session_name: &str) -> Result<()> {
         Err(anyhow::anyhow!(
             "Session mode is not supported in WezTerm. Use window mode instead."
@@ -1581,6 +1590,20 @@ mod tests {
         let _ = reading.read_now(read).unwrap();
         let _ = reading.get_or_read(read).unwrap();
         assert_eq!(reads.get(), 2);
+    }
+
+    /// A caller that polls asks for this at the start of every turn: the
+    /// held listing goes, so a window that closed behind the loop is no
+    /// longer reported by the next query.
+    #[test]
+    fn rereading_drops_the_held_listing() {
+        let read = || Ok(vec![pane_at("file:///C:/repo")]);
+        let _ = panes_reading().read_now(read).unwrap();
+        assert!(panes_reading().held().is_some());
+
+        WezTermBackend::new().reread();
+
+        assert!(panes_reading().held().is_none());
     }
 
     /// A mux that does not answer is asked again rather than remembered as
