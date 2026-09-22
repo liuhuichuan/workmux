@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use crate::cmd::Cmd;
 use crate::config::{
     AgentIcons, Config, SidebarPosition, SidebarWidth, StatusIcons, ThemeConfig, ThemeMode,
@@ -760,7 +761,7 @@ impl SidebarApp {
             let pane_id = agent.pane_id.clone();
             let _ = self.mux.switch_to_pane(&pane_id, None);
             // Signal daemon directly to bypass tmux hook round-trip latency
-            super::daemon_ctrl::signal_daemon_for(self.mux.as_ref());
+            super::signal_refresh(self.mux.as_ref());
         }
     }
 
@@ -773,6 +774,7 @@ impl SidebarApp {
             SidebarLayoutMode::Tiles => SidebarLayoutMode::Compact,
         };
         // Persist to tmux so all sidebar instances pick it up immediately
+        #[cfg(unix)]
         let _ = Cmd::new("tmux")
             .args(&[
                 "set-option",
@@ -781,14 +783,15 @@ impl SidebarApp {
                 self.layout_mode.as_str(),
             ])
             .run();
-        // Persist to settings.json so it survives tmux restarts
+        // Persist to settings.json so it survives a restart. On WezTerm this is
+        // the only copy: there are no global options to share it through.
         if let Ok(store) = crate::state::StateStore::new()
             && let Ok(mut settings) = store.load_settings()
         {
             settings.sidebar_layout = Some(self.layout_mode.as_str().to_string());
             let _ = store.save_settings(&settings);
         }
-        super::daemon_ctrl::signal_daemon_for(self.mux.as_ref());
+        super::signal_refresh(self.mux.as_ref());
     }
 
     /// Toggle the sleeping state of the selected agent.
@@ -804,14 +807,18 @@ impl SidebarApp {
             return;
         };
 
-        // Read current set from tmux (source of truth) to avoid losing
-        // toggles made by other sidebar clients since our last snapshot.
+        // Read the current set from its owner to avoid losing toggles made by
+        // other sidebar clients since our last snapshot: tmux keeps it in a
+        // global option, WezTerm in workmux's settings file.
+        #[cfg(unix)]
         let mut current: std::collections::HashSet<String> = Cmd::new("tmux")
             .args(&["show-option", "-gqv", "@workmux_sleeping_panes"])
             .run_and_capture_stdout()
             .ok()
             .map(|s| s.split_whitespace().map(String::from).collect())
             .unwrap_or_default();
+        #[cfg(windows)]
+        let mut current = super::read_sidebar_sleeping();
 
         if !current.insert(pane_id.clone()) {
             current.remove(&pane_id);
@@ -820,25 +827,31 @@ impl SidebarApp {
         // Update local state for immediate rendering
         self.sleeping_pane_ids = current.clone();
 
-        // Write back to tmux
-        let panes: String = current.into_iter().collect::<Vec<_>>().join(" ");
-        if panes.is_empty() {
-            let _ = Cmd::new("tmux")
-                .args(&["set-option", "-gu", "@workmux_sleeping_panes"])
-                .run();
-        } else {
-            let _ = Cmd::new("tmux")
-                .args(&["set-option", "-g", "@workmux_sleeping_panes", &panes])
-                .run();
+        // Write back where it was read from
+        #[cfg(unix)]
+        {
+            let panes: String = current.iter().cloned().collect::<Vec<_>>().join(" ");
+            if panes.is_empty() {
+                let _ = Cmd::new("tmux")
+                    .args(&["set-option", "-gu", "@workmux_sleeping_panes"])
+                    .run();
+            } else {
+                let _ = Cmd::new("tmux")
+                    .args(&["set-option", "-g", "@workmux_sleeping_panes", &panes])
+                    .run();
+            }
         }
+        #[cfg(windows)]
+        super::set_sidebar_sleeping(&current);
 
         // Signal daemon for immediate refresh (re-sort + broadcast)
-        super::daemon_ctrl::signal_daemon_for(self.mux.as_ref());
+        super::signal_refresh(self.mux.as_ref());
     }
 
     pub fn toggle_filter_mode(&mut self) {
         self.filter_mode = self.filter_mode.toggle();
         // Persist to tmux so all sidebar instances pick it up immediately
+        #[cfg(unix)]
         if let Err(error) = Cmd::new("tmux")
             .args(&[
                 "set-option",
@@ -860,7 +873,7 @@ impl SidebarApp {
             Err(error) => warn!(%error, "failed to persist sidebar filter mode to settings"),
         }
         // Signal daemon for immediate refresh
-        super::daemon_ctrl::signal_daemon_for(self.mux.as_ref());
+        super::signal_refresh(self.mux.as_ref());
     }
 
     pub fn window_prefix(&self) -> &str {
@@ -1097,6 +1110,7 @@ fn parse_templates(config: &Config) -> (ParsedTemplates, Option<TemplateError>) 
     )
 }
 
+#[cfg(unix)]
 fn query_tmux_format_for_current_pane(format: &str) -> Option<String> {
     let pane_id = std::env::var("TMUX_PANE").unwrap_or_default();
     let mut args = vec!["display-message", "-p"];
@@ -1111,37 +1125,74 @@ fn query_tmux_format_for_current_pane(format: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+#[cfg(unix)]
 fn query_tmux_u16_for_current_pane(format: &str) -> Option<u16> {
     query_tmux_format_for_current_pane(format).and_then(|s| s.parse().ok())
 }
 
+#[cfg(unix)]
 fn query_tmux_positive_u16_for_current_pane(format: &str) -> Option<u16> {
     query_tmux_u16_for_current_pane(format).filter(|&extent| extent > 0)
 }
 
 /// Query the window width for the current tmux pane (standalone for use before
 /// `Self` exists).
+#[cfg(unix)]
 fn query_window_width_for_pane() -> Option<u16> {
     query_tmux_u16_for_current_pane("#{window_width}")
 }
 
+/// WezTerm sizes its own panes and cannot report a window extent, so the tab
+/// the sidebar lives in stands in for the window it fills.
+#[cfg(windows)]
+fn query_window_width_for_pane() -> Option<u16> {
+    host_pane().map(|pane| pane.tab_cols)
+}
+
+#[cfg(unix)]
 fn query_window_height_for_pane() -> Option<u16> {
     query_tmux_u16_for_current_pane("#{window_height}")
+}
+
+#[cfg(windows)]
+fn query_window_height_for_pane() -> Option<u16> {
+    host_pane().map(|pane| pane.tab_rows)
 }
 
 /// Query the actual pane width from tmux. Used to verify the sidebar pane
 /// size after a manual resize, since crossterm's SIGWINCH-derived cols may
 /// differ from what tmux reports via #{pane_width}.
+#[cfg(unix)]
 fn query_pane_width_for_pane() -> Option<u16> {
     query_pane_extent_for_pane("#{pane_width}")
 }
 
+/// As above, read from WezTerm: crossterm's cols come from the console, but
+/// WezTerm's own count is what a drag of the split divider changed.
+#[cfg(windows)]
+fn query_pane_width_for_pane() -> Option<u16> {
+    host_pane().map(|pane| pane.cols)
+}
+
+#[cfg(unix)]
 fn query_pane_height_for_pane() -> Option<u16> {
     query_pane_extent_for_pane("#{pane_height}")
 }
 
+#[cfg(windows)]
+fn query_pane_height_for_pane() -> Option<u16> {
+    host_pane().map(|pane| pane.rows)
+}
+
+#[cfg(unix)]
 fn query_pane_extent_for_pane(format: &str) -> Option<u16> {
     query_tmux_positive_u16_for_current_pane(format)
+}
+
+/// What WezTerm reports about the pane this sidebar renders in.
+#[cfg(windows)]
+fn host_pane() -> Option<crate::multiplexer::wezterm::HostPane> {
+    crate::multiplexer::wezterm::current_host_pane()
 }
 
 /// Parse new template strings, mutating `templates` and the cached strings.
@@ -1198,6 +1249,7 @@ fn try_reparse_templates(
 }
 
 /// Detect the sidebar's stable host identity from its tmux pane.
+#[cfg(unix)]
 fn detect_host_identity() -> Option<HostIdentity> {
     let pane_id = std::env::var("TMUX_PANE")
         .ok()
@@ -1215,6 +1267,19 @@ fn detect_host_identity() -> Option<HostIdentity> {
 
     let identity = parse_host_identity(&output)?;
     (identity.pane_id == pane_id).then_some(identity)
+}
+
+/// Detect the sidebar's stable host identity from its WezTerm pane.
+///
+/// WezTerm has no session ids, so the workspace names both the session and its
+/// id and the tab id is the window.
+#[cfg(windows)]
+fn detect_host_identity() -> Option<HostIdentity> {
+    let host = host_pane()?;
+    parse_host_identity(&format!(
+        "{}\t{}\t{}\t{}",
+        host.workspace, host.workspace, host.tab_id, host.pane_id
+    ))
 }
 
 fn parse_host_identity(output: &str) -> Option<HostIdentity> {

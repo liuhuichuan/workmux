@@ -215,6 +215,13 @@ pub struct GlobalSettings {
     /// Sidebar filter mode: "none" or "session"
     #[serde(default)]
     pub sidebar_filter: Option<String>,
+
+    /// Pane IDs the user marked as sleeping, space separated.
+    ///
+    /// tmux owns this set in a global option, so only the WezTerm sidebar needs
+    /// it in workmux's own store.
+    #[serde(default)]
+    pub sidebar_sleeping: Option<String>,
 }
 
 /// Tracks which pane last-done navigated to, so repeated presses cycle

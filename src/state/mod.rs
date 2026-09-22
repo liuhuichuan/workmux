@@ -18,7 +18,7 @@ use crate::multiplexer::{AgentStatus, Multiplexer};
 
 pub use store::StateStore;
 pub(crate) use store::{AgentStateCache, AgentStateSource, ResurrectionAgentState};
-pub use types::{AgentState, LastDoneCycleState, PaneKey, RuntimeState};
+pub use types::{AgentState, GlobalSettings, LastDoneCycleState, PaneKey, RuntimeState};
 
 /// Persist an agent state update to the StateStore.
 ///

@@ -312,6 +312,9 @@ impl KittyBackend {
             title: p.title,
             session: format!("os-window-{}", p.os_window_id),
             window: p.tab_title,
+            window_id: None,
+            window_index: None,
+            session_id: None,
         }
     }
 }

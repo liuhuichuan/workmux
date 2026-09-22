@@ -2,10 +2,7 @@
 
 use anyhow::Result;
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-        MouseEventKind,
-    },
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -19,9 +16,10 @@ use crate::cmd::Cmd;
 use crate::multiplexer::{create_backend, detect_backend};
 use crate::shell::shell_quote;
 
-use super::app::{HostIdentity, SidebarApp};
+use super::app::SidebarApp;
 use super::client;
 use super::daemon_ctrl::ensure_daemon_running;
+use super::input::{LastPaneCheck, quit_for_last_pane};
 use super::panes::shutdown_all_sidebars;
 use super::ui::render_sidebar;
 
@@ -229,18 +227,6 @@ fn advance_refresh_if_due(
     }
 }
 
-fn handle_resize_event(
-    app: &mut SidebarApp,
-    cols: u16,
-    rows: u16,
-    needs_render: &mut bool,
-    needs_clear: &mut bool,
-) {
-    app.on_resize_event(cols, rows);
-    *needs_render = true;
-    *needs_clear = true;
-}
-
 fn pane_kill_command(pane_id: &str) -> String {
     format!(
         "sleep 0.05; tmux kill-pane -t {} 2>/dev/null || true",
@@ -268,59 +254,6 @@ fn sidebar_is_only_pane(window_id: &str, pane_id: &str) -> bool {
         .is_ok_and(|output| sole_pane_is_sidebar(&output, pane_id))
 }
 
-struct LastPaneCheck {
-    grace_deadline: Option<Instant>,
-    pane_count: Option<usize>,
-}
-
-impl LastPaneCheck {
-    fn new(grace_deadline: Instant) -> Self {
-        Self {
-            grace_deadline: Some(grace_deadline),
-            pane_count: None,
-        }
-    }
-
-    fn timeout(&self, now: Instant) -> Option<Duration> {
-        self.grace_deadline
-            .map(|deadline| deadline.saturating_duration_since(now))
-    }
-
-    /// Consume the startup deadline once, including when input wakes the loop.
-    fn grace_expired(&mut self, now: Instant) -> bool {
-        if self.grace_deadline.is_some_and(|deadline| now >= deadline) {
-            self.grace_deadline = None;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn should_exit(
-        &self,
-        identity: Option<&HostIdentity>,
-        verify_live_panes: impl FnOnce(&str, &str) -> bool,
-    ) -> bool {
-        if self.grace_deadline.is_some() || self.pane_count.is_none_or(|count| count > 1) {
-            return false;
-        }
-        let Some(identity) = identity else {
-            return false;
-        };
-        verify_live_panes(&identity.window_id, &identity.pane_id)
-    }
-}
-
-fn quit_for_last_pane(app: &mut SidebarApp) {
-    let window_id = app.host_window_id().unwrap_or("unknown");
-    app.quit_reason = Some(format!(
-        "last-pane: sidebar is sole pane in window {}",
-        window_id
-    ));
-    app.quit_silent = true;
-    app.should_quit = true;
-}
-
 fn process_event(
     event: AppEvent,
     app: &mut SidebarApp,
@@ -343,174 +276,17 @@ fn process_event(
                 *needs_render = true;
             }
         }
-        AppEvent::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-            handle_key_press(app, key.code, key.modifiers);
-            *needs_render = true;
+        AppEvent::Input(event) => {
+            let outcome = super::input::apply_input(app, event);
+            *needs_render |= outcome.render;
+            *needs_clear |= outcome.clear;
         }
-        AppEvent::Input(Event::Mouse(_)) if app.pending_exit => {}
-        AppEvent::Input(Event::Mouse(mouse)) => {
-            match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(idx) = app.hit_test(mouse.column, mouse.row) {
-                        app.select_index(idx);
-                        app.jump_to_selected();
-                    }
-                }
-                MouseEventKind::ScrollUp => {
-                    app.scroll_up();
-                }
-                MouseEventKind::ScrollDown => {
-                    app.scroll_down();
-                }
-                _ => {}
-            }
-            *needs_render = true;
-        }
-        AppEvent::Input(Event::Resize(cols, rows)) => {
-            handle_resize_event(app, cols, rows, needs_render, needs_clear);
-        }
-        AppEvent::Input(_) => {}
-    }
-}
-
-fn handle_key_press(
-    app: &mut SidebarApp,
-    code: KeyCode,
-    modifiers: crossterm::event::KeyModifiers,
-) {
-    if app.pending_exit {
-        if code == KeyCode::Char('y') {
-            app.quit_reason = Some("confirmed user exit".to_string());
-            app.should_quit = true;
-        } else {
-            app.pending_exit = false;
-        }
-        return;
-    }
-
-    match (code, modifiers) {
-        (KeyCode::Char('q'), _)
-        | (KeyCode::Esc, _)
-        | (KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL) => {
-            app.pending_exit = true;
-        }
-        (KeyCode::Char('j'), _) | (KeyCode::Down, _) => app.next(),
-        (KeyCode::Char('k'), _) | (KeyCode::Up, _) => app.previous(),
-        (KeyCode::Enter, _) => app.jump_to_selected(),
-        (KeyCode::Char('G'), _) => app.select_last(),
-        (KeyCode::Char('g'), _) => app.select_first(),
-        (KeyCode::Char('v'), _) => app.toggle_layout_mode(),
-        (KeyCode::Char('z'), _) => app.toggle_sleeping(),
-        (KeyCode::Char('f'), _) => app.toggle_filter_mode(),
-        _ => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::sidebar::app::TemplateError;
-    use crossterm::event::KeyModifiers;
-
-    fn test_app() -> SidebarApp {
-        SidebarApp::test_with_template_error(TemplateError {
-            location: String::new(),
-            message: String::new(),
-        })
-    }
-
-    fn test_identity() -> HostIdentity {
-        HostIdentity {
-            session_name: "main".to_string(),
-            session_id: "$1".to_string(),
-            window_id: "@42".to_string(),
-            pane_id: "%12".to_string(),
-        }
-    }
-
-    #[test]
-    fn startup_recheck_exits_without_another_snapshot() {
-        let identity = test_identity();
-        let startup = Instant::now();
-        let grace = Duration::from_secs(3);
-        let mut check = LastPaneCheck::new(startup + grace);
-        check.pane_count = Some(1);
-
-        assert_eq!(check.timeout(startup), Some(grace));
-        assert!(!check.grace_expired(startup + grace - Duration::from_nanos(1)));
-        assert!(!check.should_exit(Some(&identity), |_, _| {
-            panic!("startup grace must skip live verification")
-        }));
-
-        assert_eq!(check.timeout(startup + grace), Some(Duration::ZERO));
-        assert!(check.grace_expired(startup + grace));
-        assert!(check.should_exit(Some(&identity), |window, pane| {
-            window == "@42" && pane == "%12"
-        }));
-        assert_eq!(check.timeout(startup + grace), None);
-        assert!(!check.grace_expired(startup + grace + Duration::from_secs(1)));
-    }
-
-    #[test]
-    fn startup_recheck_live_verifies_stale_snapshot_only_once() {
-        let identity = test_identity();
-        let deadline = Instant::now();
-        let mut check = LastPaneCheck::new(deadline);
-        check.pane_count = Some(1);
-        let mut live_checks = 0;
-
-        for now in [deadline, deadline + Duration::from_secs(60)] {
-            if check.grace_expired(now) {
-                assert!(!check.should_exit(Some(&identity), |_, _| {
-                    live_checks += 1;
-                    false
-                }));
-            }
-        }
-        assert_eq!(live_checks, 1);
-        assert_eq!(check.timeout(deadline), None);
-    }
-
-    #[test]
-    fn startup_recheck_uses_latest_snapshot_count() {
-        let identity = test_identity();
-        let deadline = Instant::now();
-        let mut check = LastPaneCheck::new(deadline);
-        check.pane_count = Some(1);
-        check.pane_count = Some(2);
-        assert!(check.grace_expired(deadline));
-        assert!(!check.should_exit(Some(&identity), |_, _| {
-            panic!("content pane created during grace must skip live verification")
-        }));
-        assert_eq!(check.timeout(deadline), None);
-
-        // Snapshot-driven checks remain available after the one-shot deadline.
-        check.pane_count = Some(1);
-        assert!(check.should_exit(Some(&identity), |_, _| true));
-    }
-
-    #[test]
-    fn last_pane_exit_requires_snapshot_and_live_confirmation() {
-        let identity = test_identity();
-        let deadline = Instant::now();
-        let mut check = LastPaneCheck::new(deadline);
-        assert!(check.grace_expired(deadline));
-
-        for count in [None, Some(2)] {
-            check.pane_count = count;
-            assert!(!check.should_exit(Some(&identity), |_, _| {
-                panic!("missing count or multiple panes must skip live verification")
-            }));
-        }
-        check.pane_count = Some(1);
-        assert!(!check.should_exit(None, |_, _| {
-            panic!("missing identity must skip live verification")
-        }));
-        assert!(!check.should_exit(Some(&identity), |_, _| false));
-        assert!(check.should_exit(Some(&identity), |window, pane| {
-            window == "@42" && pane == "%12"
-        }));
-    }
 
     #[test]
     fn pane_kill_command_targets_captured_sidebar_pane() {
@@ -526,41 +302,5 @@ mod tests {
         assert!(!sole_pane_is_sidebar("%12\n%13\n", "%12"));
         assert!(!sole_pane_is_sidebar("%13\n", "%12"));
         assert!(!sole_pane_is_sidebar("", "%12"));
-    }
-
-    #[test]
-    fn resize_requests_full_redraw() {
-        let mut app = test_app();
-        let mut needs_render = false;
-        let mut needs_clear = false;
-
-        handle_resize_event(&mut app, 120, 3, &mut needs_render, &mut needs_clear);
-
-        assert!(needs_render);
-        assert!(needs_clear);
-    }
-
-    #[test]
-    fn q_q_does_not_quit_sidebar() {
-        let mut app = test_app();
-
-        handle_key_press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
-        assert!(app.pending_exit);
-        assert!(!app.should_quit);
-
-        handle_key_press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
-        assert!(!app.pending_exit);
-        assert!(!app.should_quit);
-    }
-
-    #[test]
-    fn y_confirms_pending_exit() {
-        let mut app = test_app();
-
-        handle_key_press(&mut app, KeyCode::Char('q'), KeyModifiers::NONE);
-        handle_key_press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
-
-        assert!(app.should_quit);
-        assert_eq!(app.quit_reason.as_deref(), Some("confirmed user exit"));
     }
 }

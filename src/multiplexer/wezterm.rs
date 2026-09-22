@@ -63,6 +63,10 @@ struct WezTermPane {
     tab_id: u64,
     pane_id: u64,
     workspace: String,
+    /// Cell extent of this pane, and where it starts within its tab.
+    size: WezTermPaneSize,
+    left_col: u16,
+    top_row: u16,
     /// Terminal title (set by running process via escape sequences)
     title: String,
     /// Explicit tab title (we set this for window names)
@@ -78,6 +82,13 @@ struct WezTermPane {
     cursor_x: u64,
     #[allow(dead_code)]
     cursor_y: u64,
+}
+
+/// Cell extent of a pane, as `wezterm cli list` reports it.
+#[derive(Debug, Deserialize)]
+struct WezTermPaneSize {
+    rows: u16,
+    cols: u16,
 }
 
 impl WezTermPane {
@@ -240,7 +251,7 @@ impl WezTermBackend {
         (None, None)
     }
 
-    fn live_pane_snapshot(&self, p: &WezTermPane) -> util::LivePaneSnapshot {
+    fn live_pane_snapshot(&self, p: &WezTermPane, tab_index: Option<u32>) -> util::LivePaneSnapshot {
         let (pid, current_command) = self.foreground_process_info(p.tty_name.as_deref());
         util::LivePaneSnapshot {
             pane_id: p.pane_id.to_string(),
@@ -250,6 +261,11 @@ impl WezTermBackend {
             title: p.title.clone(),
             session: p.workspace.clone(),
             window: p.tab_title.clone(),
+            // A WezTerm tab holds one workmux window's panes, so the tab id is
+            // the window identity that state merging and the sidebar match on.
+            window_id: Some(p.tab_id.to_string()),
+            window_index: tab_index,
+            session_id: None,
         }
     }
 
@@ -350,6 +366,110 @@ impl WezTermBackend {
 
         Ok(output.trim().to_string())
     }
+}
+
+/// What WezTerm reports about the pane a process runs in.
+///
+/// The sidebar reads geometry through this: the backend's trait surface has no
+/// pane-extent query, and `wezterm cli list` is where the numbers are.
+pub(crate) struct HostPane {
+    /// Workspace holding the pane, the closest thing WezTerm has to a session.
+    pub workspace: String,
+    pub tab_id: u64,
+    pub pane_id: u64,
+    /// Cell extent of this pane.
+    pub cols: u16,
+    pub rows: u16,
+    /// Cell extent of the whole tab, which its panes tile.
+    pub tab_cols: u16,
+    pub tab_rows: u16,
+}
+
+/// Measure the pane named by `WEZTERM_PANE`.
+pub(crate) fn current_host_pane() -> Option<HostPane> {
+    let pane_id: u64 = std::env::var("WEZTERM_PANE").ok()?.parse().ok()?;
+    let panes = WezTermBackend::new().list_panes().ok()?;
+    let pane = panes.iter().find(|p| p.pane_id == pane_id)?;
+    let (tab_cols, tab_rows) = tab_extent(
+        panes
+            .iter()
+            .filter(|p| p.tab_id == pane.tab_id && p.window_id == pane.window_id),
+    )?;
+
+    Some(HostPane {
+        workspace: pane.workspace.clone(),
+        tab_id: pane.tab_id,
+        pane_id: pane.pane_id,
+        cols: pane.size.cols,
+        rows: pane.size.rows,
+        tab_cols,
+        tab_rows,
+    })
+}
+
+/// One pane of the WezTerm instance this process is attached to, in the shape
+/// the sidebar reads.
+pub(crate) struct PaneSummary {
+    pub pane_id: String,
+    pub tab_id: u64,
+    /// The tab id, which is what workmux stores as a window id for WezTerm.
+    pub window_id: String,
+    /// Position of the tab among its window's tabs, in creation order.
+    pub window_index: u32,
+    /// The workspace holding the pane, WezTerm's closest thing to a session.
+    pub workspace: String,
+    /// Pane title, which a program can claim with an OSC 0 sequence.
+    pub title: String,
+    /// Whether this pane holds the focus in its tab.
+    pub is_active: bool,
+}
+
+/// Every pane of the instance.
+pub(crate) fn panes() -> Result<Vec<PaneSummary>> {
+    let panes = WezTermBackend::new().list_panes()?;
+    Ok(summarize(&panes))
+}
+
+fn summarize(panes: &[WezTermPane]) -> Vec<PaneSummary> {
+    let indexes = tab_indexes(panes);
+    panes
+        .iter()
+        .map(|pane| PaneSummary {
+            pane_id: pane.pane_id.to_string(),
+            tab_id: pane.tab_id,
+            window_id: pane.tab_id.to_string(),
+            window_index: indexes.get(&pane.tab_id).copied().unwrap_or(0),
+            workspace: pane.workspace.clone(),
+            title: pane.title.clone(),
+            is_active: pane.is_active,
+        })
+        .collect()
+}
+
+/// Run a `wezterm cli` subcommand and return its standard output.
+pub(crate) fn cli(args: &[&str]) -> Result<String> {
+    WezTermBackend::new()
+        .wezterm_cmd()
+        .args(args)
+        .run_and_capture_stdout()
+        .with_context(|| format!("Failed to run wezterm {}", args.join(" ")))
+}
+
+/// Outer corner of the panes of one tab, in cells.
+///
+/// Panes tile their tab but leave a separator cell between neighbours, so
+/// summing their sizes would count those separators as content; the outermost
+/// corner is the extent the tab actually has.
+fn tab_extent<'a>(panes: impl Iterator<Item = &'a WezTermPane>) -> Option<(u16, u16)> {
+    let mut cols = 0;
+    let mut rows = 0;
+    let mut seen = false;
+    for pane in panes {
+        seen = true;
+        cols = cols.max(pane.size.cols.saturating_add(pane.left_col));
+        rows = rows.max(pane.size.rows.saturating_add(pane.top_row));
+    }
+    seen.then_some((cols, rows))
 }
 
 impl Multiplexer for WezTermBackend {
@@ -804,10 +924,14 @@ impl Multiplexer for WezTermBackend {
         let pane_id_num: u64 = pane_id.parse().ok().unwrap_or(0);
 
         let panes = self.list_panes()?;
+        let indexes = tab_indexes(&panes);
         let pane = panes.into_iter().find(|p| p.pane_id == pane_id_num);
 
         match pane {
-            Some(p) => Ok(Some(self.live_pane_snapshot(&p).into_pair().1)),
+            Some(p) => {
+                let tab_index = indexes.get(&p.tab_id).copied();
+                Ok(Some(self.live_pane_snapshot(&p, tab_index).into_pair().1))
+            }
             None => Ok(None),
         }
     }
@@ -821,11 +945,12 @@ impl Multiplexer for WezTermBackend {
     }
 
     fn get_all_live_pane_info(&self) -> Result<HashMap<String, LivePaneInfo>> {
-        Ok(util::live_pane_map(
-            self.list_panes()?
-                .iter()
-                .map(|p| self.live_pane_snapshot(p)),
-        ))
+        let panes = self.list_panes()?;
+        let indexes = tab_indexes(&panes);
+        Ok(util::live_pane_map(panes.iter().map(|p| {
+            let tab_index = indexes.get(&p.tab_id).copied();
+            self.live_pane_snapshot(p, tab_index)
+        })))
     }
 
     fn split_pane(
@@ -846,6 +971,27 @@ impl Multiplexer for WezTermBackend {
             command,
         )
     }
+}
+
+/// Number the tabs of each WezTerm window in creation order.
+///
+/// WezTerm numbers tabs globally, while the tmux backend numbers windows per
+/// session (the status-bar index) and the sidebar sorts by that number.
+fn tab_indexes(panes: &[WezTermPane]) -> HashMap<u64, u32> {
+    let mut tabs_by_window: HashMap<u64, Vec<u64>> = HashMap::new();
+    for pane in panes {
+        tabs_by_window.entry(pane.window_id).or_default().push(pane.tab_id);
+    }
+
+    let mut indexes = HashMap::new();
+    for tabs in tabs_by_window.values_mut() {
+        tabs.sort_unstable();
+        tabs.dedup();
+        for (index, tab_id) in tabs.iter().enumerate() {
+            indexes.insert(*tab_id, index as u32);
+        }
+    }
+    indexes
 }
 
 /// A `wezterm cli` invocation for a deferred script.
@@ -916,12 +1062,80 @@ mod tests {
             title: String::new(),
             tab_title: "test".to_string(),
             cwd: cwd.to_string(),
+            size: WezTermPaneSize { rows: 24, cols: 80 },
+            left_col: 0,
+            top_row: 0,
             tty_name: None,
             is_active: true,
             is_zoomed: false,
             cursor_x: 0,
             cursor_y: 0,
         }
+    }
+
+    /// A pane of the given extent, placed at the given cell offset in `tab`.
+    fn pane_in_tab(
+        pane_id: u64,
+        tab_id: u64,
+        cols: u16,
+        rows: u16,
+        left_col: u16,
+        top_row: u16,
+    ) -> WezTermPane {
+        let mut pane = pane_at("file:///C:/tmp");
+        pane.pane_id = pane_id;
+        pane.tab_id = tab_id;
+        pane.size = WezTermPaneSize { rows, cols };
+        pane.left_col = left_col;
+        pane.top_row = top_row;
+        pane
+    }
+
+    /// A tab's extent is its outermost pane corner. Panes tile their tab but
+    /// leave a separator cell between neighbours, so adding their sizes up
+    /// would count those separators as content.
+    #[test]
+    fn tab_extent_is_the_outermost_pane_corner() {
+        let side_by_side = vec![
+            pane_in_tab(1, 7, 30, 24, 0, 0),
+            pane_in_tab(2, 7, 49, 24, 31, 0),
+        ];
+        assert_eq!(tab_extent(side_by_side.iter()), Some((80, 24)));
+
+        let stacked = vec![
+            pane_in_tab(3, 8, 80, 3, 0, 0),
+            pane_in_tab(4, 8, 80, 20, 0, 4),
+        ];
+        assert_eq!(tab_extent(stacked.iter()), Some((80, 24)));
+    }
+
+    #[test]
+    fn tab_extent_of_no_panes_is_unknown() {
+        assert_eq!(tab_extent(std::iter::empty::<&WezTermPane>()), None);
+    }
+
+    /// The sidebar numbers tabs so its window order matches the tmux one, and
+    /// reads pane titles to tell its own panes from the agents'.
+    #[test]
+    fn summarize_numbers_tabs_and_carries_titles() {
+        let mut sidebar = pane_in_tab(2, 10, 30, 24, 0, 0);
+        sidebar.title = "workmux-sidebar".to_string();
+        let panes = vec![
+            pane_in_tab(1, 10, 50, 24, 31, 0),
+            sidebar,
+            pane_in_tab(3, 11, 80, 24, 0, 0),
+        ];
+
+        let summaries = summarize(&panes);
+
+        assert_eq!(summaries[0].pane_id, "1");
+        assert_eq!(summaries[0].window_id, "10");
+        assert_eq!(summaries[0].window_index, 0);
+        assert_eq!(summaries[0].workspace, "default");
+        assert!(summaries[0].is_active);
+        assert_eq!(summaries[1].title, "workmux-sidebar");
+        assert_eq!(summaries[2].pane_id, "3");
+        assert_eq!(summaries[2].window_index, 1);
     }
 
     /// A cwd that is not a URL is a path already.

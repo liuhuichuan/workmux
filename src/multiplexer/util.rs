@@ -182,12 +182,20 @@ pub struct LivePaneSnapshot {
     pub title: String,
     pub session: String,
     pub window: String,
+    /// Stable window identity: the tmux window id, or the WezTerm tab id
+    /// (workmux treats a tab as the analogue of a tmux window).
+    pub window_id: Option<String>,
+    /// Window position within its session: the tmux status-bar index, or the
+    /// tab's ordinal within its WezTerm window.
+    pub window_index: Option<u32>,
+    /// Stable session identity, for backends that expose one.
+    pub session_id: Option<String>,
 }
 
 impl LivePaneSnapshot {
     pub fn into_pair(self) -> (String, LivePaneInfo) {
-        let pane_id = self.pane_id;
-        let info = build_live_pane_info(
+        let pane_id = self.pane_id.clone();
+        let mut info = build_live_pane_info(
             self.pid,
             self.current_command,
             self.working_dir,
@@ -195,6 +203,9 @@ impl LivePaneSnapshot {
             self.session,
             self.window,
         );
+        info.window_id = self.window_id;
+        info.window_index = self.window_index;
+        info.session_id = self.session_id;
         (pane_id, info)
     }
 }

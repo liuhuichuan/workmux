@@ -1826,6 +1826,7 @@ mod tests {
             sidebar_width: None,
             sidebar_height: None,
             sidebar_filter: None,
+            sidebar_sleeping: None,
         };
 
         store.save_settings(&settings).unwrap();

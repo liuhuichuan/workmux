@@ -1,9 +1,12 @@
 //! Sidebar TUI for monitoring active workmux agents.
 //!
-//! Uses a daemon process that polls tmux and pushes state snapshots to
+//! On Unix, a daemon process polls tmux and pushes state snapshots to
 //! render-only sidebar clients via Unix socket. Each sidebar pane connects
 //! to the daemon and receives updates, enabling instant window-switch response
 //! without per-pane polling.
+//!
+//! On Windows there is no daemon to push: each sidebar pane polls WezTerm and
+//! the state store itself (`windows`), and the terminal multiplexes the panes.
 //!
 //! # Module structure
 //!
@@ -12,13 +15,14 @@
 //! - `daemon` - background process that polls tmux and broadcasts snapshots
 //! - `daemon_ctrl` - daemon lifecycle (spawn, kill, signal, health checks)
 //! - `hooks` - tmux hook installation and removal
+//! - `input` - key handling and event-loop bookkeeping shared by both runtimes
 //! - `layout_tree` - tmux layout tree parser, reflow, and sidebar removal
 //! - `panes` - sidebar pane creation, destruction, and shutdown
 //! - `runtime` - TUI event loop
 //! - `snapshot` - snapshot data types and builder
 //! - `ui` - ratatui rendering (compact and tile layouts)
+//! - `windows` - polling TUI event loop and pane management for WezTerm
 
-#[cfg(unix)]
 mod app;
 #[cfg(unix)]
 mod client;
@@ -28,24 +32,22 @@ mod daemon;
 mod daemon_ctrl;
 #[cfg(unix)]
 mod hooks;
+mod input;
 #[cfg(unix)]
 mod layout_tree;
 #[cfg(unix)]
 mod panes;
 #[cfg(unix)]
 mod runtime;
-#[cfg(unix)]
 mod snapshot;
-#[cfg(unix)]
 mod template;
-#[cfg(unix)]
 mod ui;
+#[cfg(windows)]
+mod windows;
 
 #[cfg(unix)]
 use crate::cmd::Cmd;
-#[cfg(unix)]
 use crate::config::{SidebarHeight, SidebarPosition, SidebarWidth};
-#[cfg(unix)]
 use anyhow::{Result, anyhow, bail};
 
 #[cfg(unix)]
@@ -60,15 +62,10 @@ use self::panes::{
 
 #[cfg(unix)]
 const SIDEBAR_ROLE_VALUE: &str = "sidebar";
-#[cfg(unix)]
 const MIN_WIDTH: u16 = 25;
-#[cfg(unix)]
 const MAX_WIDTH: u16 = 50;
-#[cfg(unix)]
 const MAX_SANE_WIDTH: u16 = 80;
-#[cfg(unix)]
 const MIN_HEIGHT: u16 = 1;
-#[cfg(unix)]
 const MAX_HEIGHT: u16 = 5;
 
 #[cfg(unix)]
@@ -246,7 +243,6 @@ fn clear_sidebar_globals() {
     }
 }
 
-#[cfg(unix)]
 fn configured_position(
     config: &crate::config::Config,
     position: Option<SidebarPosition>,
@@ -270,6 +266,13 @@ pub(super) fn read_sidebar_position(config: &crate::config::Config) -> SidebarPo
     configured_position(config, None)
 }
 
+#[cfg(windows)]
+pub(super) fn read_sidebar_position(config: &crate::config::Config) -> SidebarPosition {
+    // tmux mirrors the live position in a global option so every pane sees a
+    // change at once; WezTerm has no such store, so the config decides here.
+    configured_position(config, None)
+}
+
 #[cfg(unix)]
 fn set_sidebar_position(position: SidebarPosition) {
     let value = match position {
@@ -281,7 +284,6 @@ fn set_sidebar_position(position: SidebarPosition) {
         .run();
 }
 
-#[cfg(unix)]
 fn default_width_for(tw: u16) -> u16 {
     if tw == 0 {
         return MIN_WIDTH;
@@ -289,12 +291,10 @@ fn default_width_for(tw: u16) -> u16 {
     (tw * 10 / 100).clamp(MIN_WIDTH, MAX_WIDTH)
 }
 
-#[cfg(unix)]
 pub(super) fn width_exceeds_defensive_max(width: u16) -> bool {
     width > MAX_SANE_WIDTH
 }
 
-#[cfg(unix)]
 /// Resolve sidebar width for a given terminal/window width.
 ///
 /// Priority: explicit config > synced (persisted resize) > default (10%).
@@ -318,7 +318,6 @@ fn resolve_width_for(config: &crate::config::Config, tw: u16, synced_width: Opti
     default_width_for(tw)
 }
 
-#[cfg(unix)]
 fn resolve_height_for(config: &crate::config::Config, th: u16, synced_height: Option<u16>) -> u16 {
     let max_h = th.saturating_sub(3).max(1);
     if let Some(ref h) = config.sidebar.height {
@@ -337,6 +336,63 @@ fn resolve_height_for(config: &crate::config::Config, th: u16, synced_height: Op
     default.clamp(1, max_h)
 }
 
+/// Sidebar geometry lives in workmux's own settings file. tmux also mirrors it
+/// in global options so every pane picks up a manual resize at once; WezTerm has
+/// no global-option store, so there the file is the only home for it.
+fn load_sidebar_settings() -> Option<crate::state::GlobalSettings> {
+    crate::state::StateStore::new()
+        .ok()
+        .and_then(|store| store.load_settings().ok())
+}
+
+fn update_sidebar_settings(update: impl FnOnce(&mut crate::state::GlobalSettings)) {
+    if let Ok(store) = crate::state::StateStore::new()
+        && let Ok(mut settings) = store.load_settings()
+    {
+        update(&mut settings);
+        let _ = store.save_settings(&settings);
+    }
+}
+
+fn persisted_sidebar_width() -> Option<u16> {
+    load_sidebar_settings().and_then(|settings| settings.sidebar_width)
+}
+
+fn persisted_sidebar_height() -> Option<u16> {
+    load_sidebar_settings().and_then(|settings| settings.sidebar_height)
+}
+
+fn persist_sidebar_width(width: u16) {
+    update_sidebar_settings(|settings| settings.sidebar_width = Some(width));
+}
+
+fn persist_sidebar_height(height: u16) {
+    update_sidebar_settings(|settings| settings.sidebar_height = Some(height));
+}
+
+/// The panes the user marked as sleeping.
+///
+/// tmux keeps this set in a global option so every sidebar pane shares one
+/// view; WezTerm has no global-option store, so workmux's settings file is its
+/// only home.
+#[cfg(windows)]
+pub(super) fn read_sidebar_sleeping() -> std::collections::HashSet<String> {
+    load_sidebar_settings()
+        .and_then(|settings| settings.sidebar_sleeping)
+        .map(|raw| raw.split_whitespace().map(String::from).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(windows)]
+pub(super) fn set_sidebar_sleeping(panes: &std::collections::HashSet<String>) {
+    let mut sorted: Vec<&str> = panes.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let joined = sorted.join(" ");
+    update_sidebar_settings(|settings| {
+        settings.sidebar_sleeping = (!joined.is_empty()).then(|| joined.clone());
+    });
+}
+
 #[cfg(unix)]
 /// Read the synced sidebar width from tmux global option, falling back to settings.
 fn read_sidebar_width() -> Option<u16> {
@@ -349,13 +405,12 @@ fn read_sidebar_width() -> Option<u16> {
         return Some(w);
     }
 
-    if let Ok(store) = crate::state::StateStore::new()
-        && let Ok(settings) = store.load_settings()
-    {
-        return settings.sidebar_width;
-    }
+    persisted_sidebar_width()
+}
 
-    None
+#[cfg(windows)]
+fn read_sidebar_width() -> Option<u16> {
+    persisted_sidebar_width()
 }
 
 #[cfg(unix)]
@@ -369,13 +424,12 @@ fn read_sidebar_height() -> Option<u16> {
         return Some(h);
     }
 
-    if let Ok(store) = crate::state::StateStore::new()
-        && let Ok(settings) = store.load_settings()
-    {
-        return settings.sidebar_height;
-    }
+    persisted_sidebar_height()
+}
 
-    None
+#[cfg(windows)]
+fn read_sidebar_height() -> Option<u16> {
+    persisted_sidebar_height()
 }
 
 #[cfg(unix)]
@@ -390,12 +444,12 @@ fn set_sidebar_width(width: u16) {
         ])
         .run();
 
-    if let Ok(store) = crate::state::StateStore::new()
-        && let Ok(mut settings) = store.load_settings()
-    {
-        settings.sidebar_width = Some(width);
-        let _ = store.save_settings(&settings);
-    }
+    persist_sidebar_width(width);
+}
+
+#[cfg(windows)]
+fn set_sidebar_width(width: u16) {
+    persist_sidebar_width(width);
 }
 
 #[cfg(unix)]
@@ -409,28 +463,25 @@ fn set_sidebar_height(height: u16) {
         ])
         .run();
 
-    if let Ok(store) = crate::state::StateStore::new()
-        && let Ok(mut settings) = store.load_settings()
-    {
-        settings.sidebar_height = Some(height);
-        let _ = store.save_settings(&settings);
-    }
+    persist_sidebar_height(height);
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn set_sidebar_height(height: u16) {
+    persist_sidebar_height(height);
+}
+
 /// Resolve effective sidebar width, checking synced width first.
 fn effective_width_for(config: &crate::config::Config, window_w: u16) -> u16 {
     let synced = read_sidebar_width();
     resolve_width_for(config, window_w, synced)
 }
 
-#[cfg(unix)]
 fn effective_height_for(config: &crate::config::Config, window_h: u16) -> u16 {
     let synced = read_sidebar_height();
     resolve_height_for(config, window_h, synced)
 }
 
-#[cfg(unix)]
 fn effective_size_for(
     config: &crate::config::Config,
     position: SidebarPosition,
@@ -540,7 +591,33 @@ pub(super) fn reflow_all_to_window_extent(
     Ok(())
 }
 
+/// WezTerm sizes panes itself: a program cannot ask for a pane width, so there
+/// is nothing for the sidebar to reflow. The pane still renders at whatever size
+/// the user gave it, and its own resize events drive the layout.
+#[cfg(windows)]
+fn reflow_all_to_window_extent(
+    _window_extent: Option<u16>,
+    _exclude_window: Option<&str>,
+) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn reflow_all_sidebars_except(_exclude_window_id: &str) {}
+
+/// Ask a running sidebar to redraw after a state change.
+///
+/// tmux wakes the daemon, which pushes a fresh snapshot to every client that is
+/// already connected. The WezTerm sidebar has no daemon and re-reads state on its
+/// own tick, so there is nothing to wake.
 #[cfg(unix)]
+pub(super) fn signal_refresh(mux: &dyn crate::multiplexer::Multiplexer) {
+    daemon_ctrl::signal_daemon_for(mux);
+}
+
+#[cfg(windows)]
+pub(super) fn signal_refresh(_mux: &dyn crate::multiplexer::Multiplexer) {}
+
 fn apply_cli_dimensions(
     config: &mut crate::config::Config,
     width: Option<SidebarWidth>,
@@ -951,7 +1028,6 @@ fn pane_session_ids() -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
-#[cfg(unix)]
 fn parse_sidebar_filter_mode(raw: &str) -> Result<app::SidebarFilterMode> {
     match raw.trim().to_lowercase().as_str() {
         "none" | "all" => Ok(app::SidebarFilterMode::None),
@@ -980,6 +1056,26 @@ fn read_sidebar_filter_mode() -> app::SidebarFilterMode {
     }
 
     app::SidebarFilterMode::default()
+}
+
+/// tmux keeps the filter mode in a global option so every pane sees it at once;
+/// WezTerm has no such store, so workmux's settings file is the only home.
+#[cfg(windows)]
+fn read_sidebar_filter_mode() -> app::SidebarFilterMode {
+    load_sidebar_settings()
+        .and_then(|settings| settings.sidebar_filter)
+        .and_then(|mode| parse_sidebar_filter_mode(&mode).ok())
+        .unwrap_or_default()
+}
+
+/// The layout mode to draw, as the store remembers it.
+#[cfg(windows)]
+fn read_sidebar_layout_mode() -> app::SidebarLayoutMode {
+    load_sidebar_settings()
+        .and_then(|settings| settings.sidebar_layout)
+        .filter(|mode| mode == app::SidebarLayoutMode::Compact.as_str())
+        .map(|_| app::SidebarLayoutMode::Compact)
+        .unwrap_or_default()
 }
 
 #[cfg(unix)]
@@ -1379,107 +1475,160 @@ mod tests {
 }
 
 // ============================================================================
-// Windows stubs
+// Windows (WezTerm) sidebar
 // ============================================================================
 //
 // The sidebar is built on tmux: it renders into tmux panes, reflows through
-// tmux hooks, and keeps its state in tmux global options. Windows has no tmux,
-// and WezTerm exposes no equivalent pane/hook API, so the sidebar cannot run
-// there. These stubs keep the CLI surface identical and fail loudly with an
-// actionable message rather than appearing to work.
-
-#[cfg(windows)]
-const UNSUPPORTED: &str = "the sidebar requires tmux, which is unavailable on Windows";
+// tmux hooks, and keeps its state in tmux global options. WezTerm offers panes
+// and nothing else, so on Windows the sidebar is a single pane that polls for
+// itself, keeps that state in workmux's own settings file, and finds its
+// siblings by the title each one claims.
 
 /// Navigation action for sidebar hotkeys.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub enum NavAction {
     Next,
     Prev,
     Jump(usize),
 }
 
+/// The pane the sidebar is being asked to manage, or why there is none.
 #[cfg(windows)]
+fn require_wezterm_pane() -> Result<crate::multiplexer::wezterm::HostPane> {
+    crate::multiplexer::wezterm::current_host_pane()
+        .ok_or_else(|| anyhow!("the sidebar needs to run inside a WezTerm pane"))
+}
+
+#[cfg(windows)]
+/// Ensure the sidebar is running in every tab of this WezTerm workspace.
 pub fn on(
-    _position: Option<crate::config::SidebarPosition>,
-    _width: Option<crate::config::SidebarWidth>,
-    _height: Option<crate::config::SidebarHeight>,
-) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(UNSUPPORTED))
+    position: Option<SidebarPosition>,
+    width: Option<SidebarWidth>,
+    height: Option<SidebarHeight>,
+) -> Result<()> {
+    let host = require_wezterm_pane()?;
+    let mut config = crate::config::Config::load(None)?;
+    apply_cli_dimensions(&mut config, width, height);
+    let position = configured_position(&config, position);
+    let window_extent = match position {
+        SidebarPosition::Left => host.tab_cols,
+        SidebarPosition::Top => host.tab_rows,
+    };
+    let cells = effective_size_for(&config, position, window_extent);
+
+    let _ = std::thread::spawn(crate::tips::mark_sidebar_used);
+    for target in windows::tabs_without_sidebar(&host.workspace)? {
+        windows::open(&target, position, cells)?;
+    }
+    // Every split took the focus, and the last one may have been in another
+    // tab; the user was looking at the host pane when they asked for this.
+    windows::activate(&host.pane_id.to_string())?;
+    Ok(())
 }
 
 #[cfg(windows)]
-pub fn off() -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(UNSUPPORTED))
+/// Ensure the sidebar is stopped.
+pub fn off() -> Result<()> {
+    windows::close(None)
 }
 
 #[cfg(windows)]
+/// Toggle the sidebar in this WezTerm workspace.
 pub fn toggle(
-    _position: Option<crate::config::SidebarPosition>,
-    _width: Option<crate::config::SidebarWidth>,
-    _height: Option<crate::config::SidebarHeight>,
-) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(UNSUPPORTED))
+    position: Option<SidebarPosition>,
+    width: Option<SidebarWidth>,
+    height: Option<SidebarHeight>,
+) -> Result<()> {
+    let host = require_wezterm_pane()?;
+    if windows::sidebar_panes(Some(&host.workspace))?.is_empty() {
+        on(position, width, height)
+    } else {
+        // Only this workspace: `on` is what put a sidebar here, and a sidebar
+        // in another workspace is one the user cannot see and did not toggle.
+        windows::close(Some(&host.workspace))
+    }
 }
 
 #[cfg(windows)]
+/// Ensure the sidebar is running for this WezTerm workspace.
+///
+/// A workspace is WezTerm's closest thing to a tmux session, and the sidebar is
+/// already scoped to one, so this is the same command as the global one.
 pub fn on_session(
-    _position: Option<crate::config::SidebarPosition>,
-    _width: Option<crate::config::SidebarWidth>,
-    _height: Option<crate::config::SidebarHeight>,
-) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(UNSUPPORTED))
+    position: Option<SidebarPosition>,
+    width: Option<SidebarWidth>,
+    height: Option<SidebarHeight>,
+) -> Result<()> {
+    on(position, width, height)
 }
 
 #[cfg(windows)]
-pub fn off_session() -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(UNSUPPORTED))
+/// Stop the sidebar in this WezTerm workspace.
+pub fn off_session() -> Result<()> {
+    let host = require_wezterm_pane()?;
+    windows::close(Some(&host.workspace))
 }
 
 #[cfg(windows)]
 pub fn toggle_session(
-    _position: Option<crate::config::SidebarPosition>,
-    _width: Option<crate::config::SidebarWidth>,
-    _height: Option<crate::config::SidebarHeight>,
-) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(UNSUPPORTED))
+    position: Option<SidebarPosition>,
+    width: Option<SidebarWidth>,
+    height: Option<SidebarHeight>,
+) -> Result<()> {
+    toggle(position, width, height)
 }
 
 #[cfg(windows)]
-pub fn navigate(_action: NavAction) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(UNSUPPORTED))
+pub fn navigate(_action: NavAction) -> Result<()> {
+    Err(anyhow!(
+        "sidebar navigation is not available on Windows yet: nothing publishes \
+         the agent order the sidebar renders"
+    ))
 }
 
 #[cfg(windows)]
-pub fn set_filter_mode(_mode: Option<&str>) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(UNSUPPORTED))
+/// Set sidebar filter mode from CLI. Toggles if no mode is given.
+pub fn set_filter_mode(mode: Option<&str>) -> Result<()> {
+    let new_mode = match mode {
+        Some(mode) => parse_sidebar_filter_mode(mode)?,
+        None => read_sidebar_filter_mode().toggle(),
+    };
+    update_sidebar_settings(|settings| {
+        settings.sidebar_filter = Some(new_mode.as_str().to_string());
+    });
+    Ok(())
 }
 
 #[cfg(windows)]
-pub fn run_sidebar() -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(UNSUPPORTED))
+/// Run the sidebar TUI (called by the hidden `_sidebar-run` command).
+pub fn run_sidebar() -> Result<()> {
+    windows::run_sidebar()
 }
 
 #[cfg(windows)]
-pub fn run_daemon() -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(UNSUPPORTED))
+/// There is no daemon on Windows: the sidebar pane polls for itself.
+pub fn run_daemon() -> Result<()> {
+    Err(anyhow!("the sidebar has no daemon on Windows"))
 }
 
 #[cfg(windows)]
-pub fn sync(_window_id: Option<&str>) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(UNSUPPORTED))
+/// Sidebar layout is synced by tmux hooks, which have no WezTerm counterpart.
+pub fn sync(_window_id: Option<&str>) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(windows)]
-pub fn reflow(_window_id: Option<&str>) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(UNSUPPORTED))
+/// WezTerm keeps its split ratios itself, so a sidebar is never reflowed.
+pub fn reflow(_window_id: Option<&str>) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(windows)]
-pub fn reflow_all(_exclude_window: Option<&str>) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(UNSUPPORTED))
+pub fn reflow_all(_exclude_window: Option<&str>) -> Result<()> {
+    Ok(())
 }
 
-/// No sidebar means nothing to refresh; status changes stay cheap on Windows.
+/// The sidebar pane polls for itself, so a status change needs no wake-up.
 #[cfg(windows)]
 pub(crate) fn request_refresh_for(_mux: &dyn crate::multiplexer::Multiplexer) {}
