@@ -463,6 +463,37 @@ pub(crate) fn panes() -> Result<Vec<PaneSummary>> {
     Ok(summarize(&panes))
 }
 
+/// Every pane of the instance, in both of the shapes workmux reads them.
+///
+/// A caller that needs both asks once: every `wezterm cli` call is a process on
+/// Windows, and the sidebar asks once a second in every tab it runs in.
+pub(crate) struct InstancePanes {
+    /// The panes as the sidebar renders them.
+    pub summaries: Vec<PaneSummary>,
+    /// The panes as the state store reconciles agents against.
+    pub live: HashMap<String, LivePaneInfo>,
+}
+
+/// Read the instance once, for callers that need both shapes.
+pub(crate) fn instance_panes() -> Result<InstancePanes> {
+    let backend = WezTermBackend::new();
+    let panes = backend.list_panes()?;
+    Ok(instance_panes_from(&backend, &panes))
+}
+
+/// The two projections of one listing, split out so a test can drive them.
+fn instance_panes_from(backend: &WezTermBackend, panes: &[WezTermPane]) -> InstancePanes {
+    let indexes = tab_indexes(panes);
+    InstancePanes {
+        summaries: summarize(panes),
+        live: util::live_pane_map(
+            panes
+                .iter()
+                .map(|pane| backend.live_pane_snapshot(pane, indexes.get(&pane.tab_id).copied())),
+        ),
+    }
+}
+
 fn summarize(panes: &[WezTermPane]) -> Vec<PaneSummary> {
     let indexes = tab_indexes(panes);
     panes
@@ -978,12 +1009,7 @@ impl Multiplexer for WezTermBackend {
     }
 
     fn get_all_live_pane_info(&self) -> Result<HashMap<String, LivePaneInfo>> {
-        let panes = self.list_panes()?;
-        let indexes = tab_indexes(&panes);
-        Ok(util::live_pane_map(panes.iter().map(|p| {
-            let tab_index = indexes.get(&p.tab_id).copied();
-            self.live_pane_snapshot(p, tab_index)
-        })))
+        Ok(instance_panes()?.live)
     }
 
     fn split_pane(
@@ -1185,6 +1211,45 @@ mod tests {
         assert_eq!(summaries[1].title, "workmux-sidebar");
         assert_eq!(summaries[2].pane_id, "3");
         assert_eq!(summaries[2].window_index, 1);
+    }
+
+    /// One listing feeds both shapes -- the sidebar's summaries and the state
+    /// store's live-pane map -- so a poll of the instance costs one
+    /// `wezterm.exe` rather than one per reader.
+    #[test]
+    fn one_listing_serves_the_summaries_and_the_live_pane_map() {
+        let panes = vec![
+            pane_in_tab(1, 10, 50, 24, 31, 0),
+            pane_in_tab(2, 10, 30, 24, 0, 0),
+            pane_in_tab(3, 11, 80, 24, 0, 0),
+        ];
+
+        let instance = instance_panes_from(&WezTermBackend::new(), &panes);
+
+        let listed: Vec<&str> = instance
+            .summaries
+            .iter()
+            .map(|pane| pane.pane_id.as_str())
+            .collect();
+        assert_eq!(listed, ["1", "2", "3"]);
+        assert_eq!(
+            instance
+                .summaries
+                .iter()
+                .filter(|pane| pane.window_id == "10")
+                .count(),
+            2,
+            "the summaries keep the tab each pane belongs to"
+        );
+
+        let mut live: Vec<&str> = instance.live.keys().map(String::as_str).collect();
+        live.sort();
+        assert_eq!(
+            live,
+            ["1", "2", "3"],
+            "the same panes, in the store's shape"
+        );
+        assert_eq!(instance.live["3"].session.as_deref(), Some("default"));
     }
 
     /// A cwd that is not a URL is a path already.

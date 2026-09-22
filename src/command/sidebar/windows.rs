@@ -25,7 +25,7 @@ use crate::config::{Config, SidebarPosition};
 use crate::git::{self, GitStatus};
 use crate::multiplexer::wezterm;
 use crate::multiplexer::{AgentPane, Multiplexer, create_backend, detect_backend};
-use crate::state::{GlobalSettings, StateStore};
+use crate::state::{AgentStateCache, GlobalSettings, StateStore};
 
 use super::app::{SidebarApp, SidebarFilterMode};
 use super::input::{LastPaneCheck, apply_input, quit_for_last_pane};
@@ -341,66 +341,95 @@ fn kill(pane_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether the sidebar is the only pane left in its tab.
-fn sidebar_is_only_pane(window_id: &str, pane_id: &str) -> bool {
-    wezterm::panes().is_ok_and(|panes| {
-        let mut in_tab = panes.iter().filter(|pane| pane.window_id == window_id);
-        in_tab.next().is_some_and(|first| first.pane_id == pane_id) && in_tab.next().is_none()
-    })
+/// Whether the sidebar is the only pane left in its tab, as of `panes`.
+fn sidebar_is_only_pane(panes: &[wezterm::PaneSummary], window_id: &str, pane_id: &str) -> bool {
+    let mut in_tab = panes.iter().filter(|pane| pane.window_id == window_id);
+    in_tab.next().is_some_and(|first| first.pane_id == pane_id) && in_tab.next().is_none()
 }
 
-/// Build what the sidebar renders from the current state of the world.
+/// What a poll reads, and what it keeps from one poll to the next.
 ///
-/// The preferences come from workmux's own store rather than from the app: the
-/// snapshot overwrites the app's copy of them, so reading them back out of the
-/// app would make the last value its own source.
-fn build_view(
-    mux: &dyn Multiplexer,
-    git_statuses: HashMap<PathBuf, GitStatus>,
-) -> Result<SidebarSnapshot> {
-    let config = Config::load(None).unwrap_or_default();
-    let position = super::read_sidebar_position(&config);
-    let layout_mode = super::read_sidebar_layout_mode();
-    let filter_mode = super::read_sidebar_filter_mode();
-    let agents = StateStore::new()?.load_reconciled_agents(mux)?;
-    let panes = wezterm::panes()?;
+/// The store and the cache of already-parsed state files outlive a poll:
+/// without the cache every poll re-reads every agent's file, which is what the
+/// tmux daemon's own cache is for.
+struct Reader<'a> {
+    store: StateStore,
+    cache: AgentStateCache,
+    mux: &'a dyn Multiplexer,
+}
 
-    let mut pane_window_ids = HashMap::new();
-    let mut pane_window_indexes = HashMap::new();
-    let mut window_pane_counts: HashMap<String, usize> = HashMap::new();
-    let mut active_pane_ids = HashSet::new();
-    let mut active_windows = HashSet::new();
-
-    for pane in &panes {
-        pane_window_ids.insert(pane.pane_id.clone(), pane.window_id.clone());
-        pane_window_indexes.insert(pane.pane_id.clone(), pane.window_index);
-        *window_pane_counts.entry(pane.window_id.clone()).or_default() += 1;
-        if pane.is_active {
-            active_pane_ids.insert(pane.pane_id.clone());
-            active_windows.insert((pane.workspace.clone(), pane.window_id.clone()));
-        }
+impl<'a> Reader<'a> {
+    fn new(mux: &'a dyn Multiplexer) -> Result<Self> {
+        Ok(Self {
+            store: StateStore::new()?,
+            cache: AgentStateCache::default(),
+            mux,
+        })
     }
 
-    Ok(build_snapshot(
-        agents,
-        // tmux's window-status icons have no WezTerm counterpart, and a pane
-        // that is absent from the map is simply never suppressed.
-        &HashMap::new(),
-        &pane_window_ids,
-        &pane_window_indexes,
-        active_windows,
-        active_pane_ids,
-        window_pane_counts,
-        position,
-        layout_mode,
-        filter_mode,
-        config.sidebar.sort.unwrap_or_default(),
-        &config.status_icons,
-        git_statuses,
-        HashMap::new(),
-        HashMap::new(),
-        &super::read_sidebar_sleeping(),
-    ))
+    /// Build what the sidebar renders out of one reading of the world.
+    ///
+    /// The preferences come from workmux's own store rather than from the app:
+    /// the snapshot overwrites the app's copy of them, so reading them back out
+    /// of the app would make the last value its own source.
+    fn view(
+        &mut self,
+        panes: &wezterm::InstancePanes,
+        git_statuses: HashMap<PathBuf, GitStatus>,
+    ) -> Result<SidebarSnapshot> {
+        let config = Config::load(None).unwrap_or_default();
+        let position = super::read_sidebar_position(&config);
+        let layout_mode = super::read_sidebar_layout_mode();
+        let filter_mode = super::read_sidebar_filter_mode();
+        // Read per poll rather than once: a server that restarts mid-session
+        // hands out pane ids that the state written before it no longer fits.
+        let boot_id = self.mux.server_boot_id().ok().flatten();
+        let (agents, _) = self.store.load_reconciled_agents_from_snapshot_cached(
+            &mut self.cache,
+            self.mux,
+            &panes.live,
+            boot_id.as_deref(),
+        )?;
+
+        let mut pane_window_ids = HashMap::new();
+        let mut pane_window_indexes = HashMap::new();
+        let mut window_pane_counts: HashMap<String, usize> = HashMap::new();
+        let mut active_pane_ids = HashSet::new();
+        let mut active_windows = HashSet::new();
+
+        for pane in &panes.summaries {
+            pane_window_ids.insert(pane.pane_id.clone(), pane.window_id.clone());
+            pane_window_indexes.insert(pane.pane_id.clone(), pane.window_index);
+            *window_pane_counts
+                .entry(pane.window_id.clone())
+                .or_default() += 1;
+            if pane.is_active {
+                active_pane_ids.insert(pane.pane_id.clone());
+                active_windows.insert((pane.workspace.clone(), pane.window_id.clone()));
+            }
+        }
+
+        Ok(build_snapshot(
+            agents,
+            // tmux's window-status icons have no WezTerm counterpart, and a pane
+            // that is absent from the map is simply never suppressed.
+            &HashMap::new(),
+            &pane_window_ids,
+            &pane_window_indexes,
+            active_windows,
+            active_pane_ids,
+            window_pane_counts,
+            position,
+            layout_mode,
+            filter_mode,
+            config.sidebar.sort.unwrap_or_default(),
+            &config.status_icons,
+            git_statuses,
+            HashMap::new(),
+            HashMap::new(),
+            &super::read_sidebar_sleeping(),
+        ))
+    }
 }
 
 /// The agent pane ids in the order the sidebar lists them.
@@ -410,7 +439,9 @@ fn build_view(
 /// function of the live panes, the state store and the settings, so it is
 /// recomputed instead: there is no copy to fall out of step.
 pub(super) fn listed_agent_panes(workspace: &str, mux: &dyn Multiplexer) -> Result<Vec<String>> {
-    let snapshot = build_view(mux, HashMap::new())?;
+    let panes = wezterm::instance_panes()?;
+    let mut reader = Reader::new(mux)?;
+    let snapshot = reader.view(&panes, HashMap::new())?;
     Ok(listed_pane_ids(
         snapshot.agents,
         snapshot.filter_mode,
@@ -436,13 +467,14 @@ fn listed_pane_ids(
 
 /// Take one poll: rebuild the list and notice a window that has emptied out.
 fn poll(
-    mux: &Arc<dyn Multiplexer>,
+    reader: &mut Reader,
     app: &mut SidebarApp,
     last_pane_check: &mut LastPaneCheck,
     git_statuses: &HashMap<PathBuf, GitStatus>,
     git_paths: &Arc<Mutex<Vec<PathBuf>>>,
+    panes: &wezterm::InstancePanes,
 ) -> Result<()> {
-    let snapshot = build_view(mux.as_ref(), git_statuses.clone())?;
+    let snapshot = reader.view(panes, git_statuses.clone())?;
 
     if let Ok(mut published) = git_paths.lock() {
         let mut paths: Vec<PathBuf> = snapshot.agents.iter().map(|a| a.path.clone()).collect();
@@ -455,7 +487,9 @@ fn poll(
         .host_window_id()
         .and_then(|window_id| snapshot.window_pane_counts.get(window_id))
         .copied();
-    if last_pane_check.should_exit(app.host_identity(), sidebar_is_only_pane) {
+    if last_pane_check.should_exit(app.host_identity(), |window_id, pane_id| {
+        sidebar_is_only_pane(&panes.summaries, window_id, pane_id)
+    }) {
         quit_for_last_pane(app);
     }
 
@@ -524,6 +558,16 @@ pub(super) fn run_sidebar() -> Result<()> {
     let mut last_poll: Option<Instant> = None;
     let mut last_tick = Instant::now();
     let mut quit = Quit::Workspace;
+    let mut reader = match Reader::new(mux.as_ref()) {
+        Ok(reader) => Some(reader),
+        Err(error) => {
+            tracing::warn!(%error, "sidebar has no state store to read");
+            None
+        }
+    };
+    // The last reading of the panes: the poll replaces it, and the last-pane
+    // check between polls reads it rather than asking again.
+    let mut panes: Option<wezterm::InstancePanes> = None;
 
     loop {
         if needs_render {
@@ -582,9 +626,23 @@ pub(super) fn run_sidebar() -> Result<()> {
         let now = Instant::now();
 
         if last_poll.is_none_or(|last| now.duration_since(last) >= POLL_INTERVAL) {
-            if let Err(error) = poll(&mux, &mut app, &mut last_pane_check, &git_statuses, &git_paths)
-            {
-                tracing::warn!(%error, "sidebar poll failed");
+            match wezterm::instance_panes() {
+                Ok(fresh) => {
+                    if let Some(reader) = reader.as_mut()
+                        && let Err(error) = poll(
+                            reader,
+                            &mut app,
+                            &mut last_pane_check,
+                            &git_statuses,
+                            &git_paths,
+                            &fresh,
+                        )
+                    {
+                        tracing::warn!(%error, "sidebar poll failed");
+                    }
+                    panes = Some(fresh);
+                }
+                Err(error) => tracing::warn!(%error, "sidebar cannot read the panes"),
             }
             needs_render = true;
             // From the end of the poll, not its start: a slow poll must not
@@ -593,7 +651,10 @@ pub(super) fn run_sidebar() -> Result<()> {
         }
 
         if last_pane_check.grace_expired(now)
-            && last_pane_check.should_exit(app.host_identity(), sidebar_is_only_pane)
+            && let Some(panes) = panes.as_ref()
+            && last_pane_check.should_exit(app.host_identity(), |window_id, pane_id| {
+                sidebar_is_only_pane(&panes.summaries, window_id, pane_id)
+            })
         {
             quit_for_last_pane(&mut app);
         }
@@ -811,6 +872,31 @@ mod tests {
 
         drop_sidebar_panes(&mut settings, &["21".to_string(), "23".to_string()]);
         assert_eq!(settings.sidebar_panes, vec!["22"]);
+    }
+
+    /// A sidebar quits when its tab holds nothing but it, and only then: the
+    /// reading has to name this pane as the one tab's first pane.
+    #[test]
+    fn a_tab_holding_only_the_sidebar_is_a_last_pane() {
+        let panes = vec![
+            pane("1", 10, "default", "cmd.exe"),
+            pane("2", 10, "default", "workmux-sidebar"),
+            pane("3", 11, "default", "workmux-sidebar"),
+        ];
+
+        assert!(
+            !sidebar_is_only_pane(&panes, "10", "2"),
+            "the shell beside it is still there"
+        );
+        assert!(sidebar_is_only_pane(&panes, "11", "3"));
+        assert!(
+            !sidebar_is_only_pane(&panes, "11", "1"),
+            "a pane of another tab is not one of this tab's panes"
+        );
+        assert!(
+            !sidebar_is_only_pane(&[], "11", "3"),
+            "a reading that names no panes is not an empty tab"
+        );
     }
 
     /// `sidebar next` walks what the sidebar lists, so the session filter it
