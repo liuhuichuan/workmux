@@ -196,14 +196,23 @@ class MuxEnvironment(ABC):
         self.env["XDG_CONFIG_HOME"] = str(self.home_path / ".config")
 
         # Create fake git editor
-        fake_editor_script = self.home_path / "fake_git_editor.sh"
-        fake_editor_script.write_text(
-            "#!/bin/sh\n"
-            'if ! grep -q "^[^#]" "$1" 2>/dev/null; then\n'
-            '  echo "Test commit" > "$1"\n'
-            "fi\n"
-        )
-        self.env["GIT_EDITOR"] = f"/bin/sh {shlex.quote(str(fake_editor_script))}"
+        if IS_WINDOWS:
+            fake_editor_script = self.home_path / "fake_git_editor.cmd"
+            fake_editor_script.write_text(
+                "@echo off\n"
+                'findstr /r /b "[^#]" "%~1" >nul 2>nul\n'
+                'if errorlevel 1 echo Test commit> "%~1"\n'
+            )
+            self.env["GIT_EDITOR"] = f'cmd //c "{fake_editor_script}"'
+        else:
+            fake_editor_script = self.home_path / "fake_git_editor.sh"
+            fake_editor_script.write_text(
+                "#!/bin/sh\n"
+                'if ! grep -q "^[^#]" "$1" 2>/dev/null; then\n'
+                '  echo "Test commit" > "$1"\n'
+                "fi\n"
+            )
+            self.env["GIT_EDITOR"] = f"/bin/sh {shlex.quote(str(fake_editor_script))}"
 
     def install_script(self, path: Path, body: str) -> Path:
         """Install a PATH-discoverable test double with a shared entry point."""
@@ -286,11 +295,13 @@ class MuxEnvironment(ABC):
         pass
 
     @abstractmethod
-    def run_shell_background(self, script: str) -> None:
+    def run_shell_background(self, script: Union[str, Path]) -> None:
         """
         Run a shell script in the background.
 
-        Used for commands that may kill their own window (like merge/remove).
+        `script` is either shell text or a script file written by
+        `pane_result_script`. Used for commands that may kill their own window
+        (like merge/remove).
         """
         pass
 
@@ -409,10 +420,11 @@ class TmuxEnvironment(MuxEnvironment):
             args.append("C-m")
         self.mux_command(args)
 
-    def run_shell_background(self, script: str) -> None:
+    def run_shell_background(self, script: Union[str, Path]) -> None:
         """Run from the test pane, independently of the active worktree window."""
         assert self.runner_pane_id is not None, "tmux server has not been started"
-        command = make_env_script(self, script, {})
+        text = script.read_text() if isinstance(script, Path) else script
+        command = make_env_script(self, text, {})
         self.send_keys(self.runner_pane_id, f"nohup {command} >/dev/null 2>&1 &")
 
     def set_session_env(self, key: str, value: str) -> None:
@@ -582,9 +594,24 @@ class WezTermEnvironment(MuxEnvironment):
         if enter:
             self.mux_command(["send-text", "--pane-id", pane_id, "--no-paste", "\r"])
 
-    def run_shell_background(self, script: str) -> None:
-        """Run script in background via nohup."""
-        bg_script = f"nohup sh -c {repr(script)} >/dev/null 2>&1 &"
+    def run_shell_background(self, script: Union[str, Path]) -> None:
+        """Run a script beside the windows under test, not inside one of them."""
+        if IS_WINDOWS:
+            # cmd.exe has no nohup: `start /b` gives the script a second
+            # cmd.exe and comes straight back, which is what the `&` below is
+            # for.
+            invocation = (
+                pane_invocation(script)
+                if isinstance(script, Path)
+                else make_env_script(self, script, {})
+            )
+            # Without a null device the script inherits the pane's console and a
+            # prompt that asks a question waits for an answer nobody can give;
+            # nohup hands a POSIX script the same end-of-file.
+            self.send_keys("test:", f'start "" /b {invocation} < nul', enter=True)
+            return
+        text = script.read_text() if isinstance(script, Path) else script
+        bg_script = f"nohup sh -c {repr(text)} >/dev/null 2>&1 &"
         self.send_keys("test:", bg_script, enter=True)
 
     def set_session_env(self, key: str, value: str) -> None:
@@ -1644,6 +1671,69 @@ def pane_stdin_input(env: MuxEnvironment, text: str) -> str:
     return f"printf %s {shlex.quote(text)} | "
 
 
+def pane_stdin_pipe(env: MuxEnvironment, text: str) -> str:
+    """A prefix that feeds `text` to the command that follows it.
+
+    A prompt that reads a line wants the newline `echo` ends it with; the file
+    cmd.exe reads from is what stands in for the pipe it does not have.
+    """
+    if IS_WINDOWS:
+        return pane_stdin_input(env, text)
+    return f"echo '{text}' | "
+
+
+def pane_script(env: MuxEnvironment, name: str, text: str) -> Path:
+    """Write a script the pane's shell can run, and return its path."""
+    script_file = pane_script_path(env, name)
+    script_file.write_text(text)
+    return script_file
+
+
+def pane_result_script(
+    env: MuxEnvironment,
+    name: str,
+    command: str,
+    *,
+    workdir: Path,
+    stdout_file: Path,
+    stderr_file: Path,
+    exit_code_file: Path,
+    started_file: Optional[Path] = None,
+    stdin_input: Optional[str] = None,
+    env_vars: Optional[Dict[str, str]] = None,
+) -> Path:
+    """Write the script that runs `command` and records how it ended.
+
+    `command` is written the way the pane's own shell takes it; quoting a whole
+    command line for cmd.exe would make it one long word. `started_file`, when
+    given, is created by the script itself so a caller can tell that a pane
+    picked the work up.
+    """
+    lines = ["@echo off"] if IS_WINDOWS else ["#!/bin/sh"]
+    if started_file is not None:
+        lines.append(pane_echo("started", started_file))
+    # A pane inherits the environment of the multiplexer that spawned it, which
+    # knows nothing of this test, so every run is told where its home is.
+    lines.extend(
+        pane_env_lines({**pane_home_env(env), **(env_vars or {})}).splitlines()
+    )
+    stdin_pipe = pane_stdin_pipe(env, stdin_input) if stdin_input else ""
+    if IS_WINDOWS:
+        redirects = f"> {pane_quote(stdout_file)} 2> {pane_quote(stderr_file)}"
+        lines.append(pane_cd(workdir))
+        lines.append(f"{stdin_pipe}{command} {redirects}")
+        lines.append(pane_exit_status(exit_code_file))
+    else:
+        redirects = (
+            f"> {shlex.quote(str(stdout_file))} 2> {shlex.quote(str(stderr_file))}"
+        )
+        lines.append(
+            f"cd {shlex.quote(str(workdir))} && {stdin_pipe}{command} {redirects}; "
+            f"{pane_exit_status(exit_code_file)}"
+        )
+    return pane_script(env, name, "\n".join(lines) + "\n")
+
+
 def norm_path(value: Any) -> str:
     """A path in one form, for comparing it against workmux's own output.
 
@@ -1985,7 +2075,8 @@ def run_workmux_remove(
     gone_flag = "--gone " if gone else ""
     all_flag = "--all " if all else ""
     branch_arg = branch_name if branch_name else ""
-    input_cmd = f"echo '{user_input}' | " if user_input else ""
+    flags = f"{force_flag}{keep_branch_flag}{gone_flag}{all_flag}"
+    command = f"{pane_quote(workmux_exe_path)} remove {flags}{branch_arg}"
     started_file: Optional[Path] = None
 
     if from_window:
@@ -1995,22 +2086,28 @@ def run_workmux_remove(
         started_file = scripts_dir / "workmux_remove_started.txt"
         if started_file.exists():
             started_file.unlink()
-        remove_script = (
-            f"echo started > {shlex.quote(str(started_file))}; "
-            f"cd {shlex.quote(str(worktree_path))} && "
-            f"{input_cmd}"
-            f"{shlex.quote(str(workmux_exe_path))} remove {force_flag}{keep_branch_flag}{gone_flag}{all_flag}{branch_arg} "
-            f"> {shlex.quote(str(stdout_file))} 2> {shlex.quote(str(stderr_file))}; "
-            f"echo $? > {shlex.quote(str(exit_code_file))}"
+        remove_script = pane_result_script(
+            env,
+            "workmux_remove_window",
+            command,
+            workdir=worktree_path,
+            stdout_file=stdout_file,
+            stderr_file=stderr_file,
+            exit_code_file=exit_code_file,
+            started_file=started_file,
+            stdin_input=user_input,
         )
-        env.send_keys(from_window, remove_script)
+        env.send_keys(from_window, pane_invocation(remove_script))
     else:
-        remove_script = (
-            f"cd {repo_path} && "
-            f"{input_cmd}"
-            f"{workmux_exe_path} remove {force_flag}{keep_branch_flag}{gone_flag}{all_flag}{branch_arg} "
-            f"> {stdout_file} 2> {stderr_file}; "
-            f"echo $? > {exit_code_file}"
+        remove_script = pane_result_script(
+            env,
+            "workmux_remove",
+            command,
+            workdir=repo_path,
+            stdout_file=stdout_file,
+            stderr_file=stderr_file,
+            exit_code_file=exit_code_file,
+            stdin_input=user_input,
         )
 
         env.run_shell_background(remove_script)
@@ -2143,25 +2240,40 @@ def run_workmux_merge(
     else:
         workdir = repo_path
 
-    # Create a simple editor script for non-interactive git commits
-    editor_script = scripts_dir / "git_editor.sh"
-    editor_script.write_text('#!/bin/sh\necho "Auto commit from test" > "$1"\n')
-    editor_command = f"/bin/sh {shlex.quote(str(editor_script))}"
+    # A commit that needs a message of its own gets one from this editor; a
+    # message Git already wrote, a merge's, is left alone. cmd.exe has to be
+    # asked for the script through `cmd /c` because Git runs an editor with a
+    # shell, and `//c` is how the shell passes that flag on unchanged.
+    if IS_WINDOWS:
+        editor_script = pane_script(
+            env,
+            "git_editor",
+            "@echo off\n"
+            'findstr /r /b "[^#]" "%~1" >nul 2>nul\n'
+            'if errorlevel 1 echo Auto commit from test> "%~1"\n',
+        )
+        editor_env = {"GIT_EDITOR": f'cmd //c "{editor_script}"'}
+    else:
+        editor_script = scripts_dir / "git_editor.sh"
+        editor_script.write_text('#!/bin/sh\necho "Auto commit from test" > "$1"\n')
+        editor_env = {
+            "GIT_EDITOR": f"/bin/sh {shlex.quote(str(editor_script))}",
+        }
 
-    started_command = (
-        f"echo started > {shlex.quote(str(started_file))}; " if started_file else ""
-    )
-    merge_script = (
-        f"{started_command}"
-        f"export GIT_EDITOR={shlex.quote(editor_command)} && "
-        f"cd {shlex.quote(str(workdir))} && "
-        f"{shlex.quote(str(workmux_exe_path))} merge {flags_str} {branch_arg} "
-        f"> {shlex.quote(str(stdout_file))} 2> {shlex.quote(str(stderr_file))}; "
-        f"echo $? > {shlex.quote(str(exit_code_file))}"
+    merge_script = pane_result_script(
+        env,
+        "workmux_merge_window" if from_window else "workmux_merge",
+        f"{pane_quote(workmux_exe_path)} merge {flags_str} {branch_arg}",
+        workdir=workdir,
+        stdout_file=stdout_file,
+        stderr_file=stderr_file,
+        exit_code_file=exit_code_file,
+        started_file=started_file,
+        env_vars=editor_env,
     )
 
     if from_window:
-        env.send_keys(from_window, merge_script)
+        env.send_keys(from_window, pane_invocation(merge_script))
         assert started_file is not None
         assert poll_until_file_has_content(started_file, timeout=5.0), (
             "workmux merge did not start in target window"

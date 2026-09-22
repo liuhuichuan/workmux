@@ -12,6 +12,8 @@ from .conftest import (
     get_worktree_path,
     poll_until,
     poll_until_file_has_content,
+    pane_quote,
+    pane_result_script,
     run_workmux_add,
     run_workmux_command,
     write_workmux_config,
@@ -40,11 +42,14 @@ def run_workmux_close(
             f.unlink()
 
     name_arg = name if name else ""
-    close_script = (
-        f"cd {repo_path} && "
-        f"{workmux_exe_path} close {name_arg} "
-        f"> {stdout_file} 2> {stderr_file}; "
-        f"echo $? > {exit_code_file}"
+    close_script = pane_result_script(
+        env,
+        "workmux_close",
+        f"{pane_quote(workmux_exe_path)} close {name_arg}",
+        workdir=repo_path,
+        stdout_file=stdout_file,
+        stderr_file=stderr_file,
+        exit_code_file=exit_code_file,
     )
 
     env.run_shell_background(close_script)

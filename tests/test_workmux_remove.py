@@ -253,7 +253,7 @@ def test_remove_existing_worktree_with_missing_git_admin_dir_requires_keep_branc
     admin_dir = Path(git_file.read_text().strip().removeprefix("gitdir: "))
     if not admin_dir.is_absolute():
         admin_dir = worktree_path / admin_dir
-    env.run_command(["rm", "-rf", str(admin_dir)])
+    shutil.rmtree(admin_dir)
 
     run_workmux_remove(
         env,
@@ -291,7 +291,7 @@ def test_remove_missing_admin_dir_does_not_guess_branch_from_handle(
     admin_dir = Path(git_file.read_text().strip().removeprefix("gitdir: "))
     if not admin_dir.is_absolute():
         admin_dir = worktree_path / admin_dir
-    env.run_command(["rm", "-rf", str(admin_dir)])
+    shutil.rmtree(admin_dir)
     env.run_command(["git", "branch", handle], cwd=mux_repo_path)
 
     run_workmux_remove(
