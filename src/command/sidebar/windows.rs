@@ -125,35 +125,55 @@ fn spawn_git_worker(
     published
 }
 
-pub(super) fn tabs_without_sidebar(workspace: &str) -> Result<Vec<String>> {
+pub(super) fn tabs_without_sidebar(
+    workspace: &str,
+    position: SidebarPosition,
+) -> Result<Vec<String>> {
     let panes = wezterm::panes()?;
     let sidebars = live_sidebar_ids(&panes);
-    Ok(plan_tabs(&panes, &sidebars, workspace))
+    Ok(plan_tabs(&panes, &sidebars, workspace, position))
 }
 
 /// One pane per tab of `workspace` that has no sidebar yet.
 ///
-/// Whatever pane is found first in a tab is the one to split; `--top-level`
-/// makes the new pane span the tab regardless of which pane it was aimed at.
-/// Tabs are visited in id order so a run is reproducible.
+/// The pane named is the one the sidebar is split off, and the pane to split is
+/// the one that reaches the tab's edge: a split puts the new pane against the
+/// edge of the pane it split, so the tallest pane carries a sidebar down the
+/// side and the widest one carries a sidebar across the top. A pane reaching the
+/// edge always exists -- panes tile their tab, and the outermost of them extends
+/// to it -- apart from a layout with a split inside every one of its edges,
+/// where the first pane of the tab is split instead and the sidebar is as long
+/// as that pane. Ties go to the pane listed first. Tabs are visited in id order
+/// so a run is reproducible.
 fn plan_tabs(
     panes: &[wezterm::PaneSummary],
     sidebars: &HashSet<String>,
     workspace: &str,
+    position: SidebarPosition,
 ) -> Vec<String> {
-    let mut tabs: BTreeMap<u64, (String, bool)> = BTreeMap::new();
+    // Per tab: the pane to split, how far it reaches across the sidebar's axis,
+    // and whether the tab holds a sidebar already.
+    let mut tabs: BTreeMap<u64, (String, u16, bool)> = BTreeMap::new();
 
     for pane in panes.iter().filter(|pane| pane.workspace == workspace) {
+        let extent = match position {
+            SidebarPosition::Left => pane.rows,
+            SidebarPosition::Top => pane.cols,
+        };
         let entry = tabs
             .entry(pane.tab_id)
-            .or_insert_with(|| (pane.pane_id.clone(), false));
-        entry.1 |= sidebars.contains(&pane.pane_id);
+            .or_insert_with(|| (pane.pane_id.clone(), extent, false));
+        // Strictly greater, so the pane listed first wins a tie.
+        if extent > entry.1 {
+            entry.0 = pane.pane_id.clone();
+            entry.1 = extent;
+        }
+        entry.2 |= sidebars.contains(&pane.pane_id);
     }
 
-    tabs
-        .into_values()
-        .filter(|(_, has_sidebar)| !has_sidebar)
-        .map(|(pane_id, _)| pane_id)
+    tabs.into_values()
+        .filter(|(_, _, has_sidebar)| !has_sidebar)
+        .map(|(pane_id, _, _)| pane_id)
         .collect()
 }
 
@@ -265,29 +285,21 @@ fn sidebar_pane_ids(
         .collect()
 }
 
-/// Split the tab holding `target_pane_id` and run the sidebar in the new pane.
+/// Split `target_pane_id` and run the sidebar in the new pane.
+///
+/// The pane is split rather than the tab. WezTerm can split a whole tab
+/// (`--top-level`, tmux's full-window split), but on Windows it makes that split
+/// in two steps: it first resizes the tab down to the part the panes already
+/// there keep, and the tab keeps that smaller size afterwards. Every pane in it
+/// then draws inside a strip of the window, with a band of the window left
+/// empty, until something resizes the window -- and nothing does. A split of a
+/// pane has no such step, and the sidebar reaches the tab's edge wherever the
+/// pane it was split off does.
 pub(super) fn open(target_pane_id: &str, position: SidebarPosition, cells: u16) -> Result<String> {
     let exe = std::env::current_exe().context("failed to locate the workmux executable")?;
     let exe = exe.to_string_lossy().into_owned();
     let cells = cells.to_string();
-    let direction = match position {
-        SidebarPosition::Left => "--left",
-        SidebarPosition::Top => "--top",
-    };
-
-    let pane_id = wezterm::cli(&[
-        "cli",
-        "split-pane",
-        "--pane-id",
-        target_pane_id,
-        "--top-level",
-        direction,
-        "--cells",
-        &cells,
-        "--",
-        &exe,
-        "_sidebar-run",
-    ])?;
+    let pane_id = wezterm::cli(&open_args(&exe, target_pane_id, position, &cells))?;
     let pane_id = pane_id.trim().to_string();
     if pane_id.is_empty() {
         bail!("wezterm cli split-pane returned no pane id");
@@ -300,6 +312,30 @@ pub(super) fn open(target_pane_id: &str, position: SidebarPosition, cells: u16) 
     // looking at the pane we split, so hand it back.
     activate(target_pane_id)?;
     Ok(pane_id)
+}
+
+/// The `wezterm cli` arguments that open a sidebar pane.
+fn open_args<'a>(
+    exe: &'a str,
+    target_pane_id: &'a str,
+    position: SidebarPosition,
+    cells: &'a str,
+) -> Vec<&'a str> {
+    vec![
+        "cli",
+        "split-pane",
+        "--pane-id",
+        target_pane_id,
+        match position {
+            SidebarPosition::Left => "--left",
+            SidebarPosition::Top => "--top",
+        },
+        "--cells",
+        cells,
+        "--",
+        exe,
+        "_sidebar-run",
+    ]
 }
 
 /// Focus a pane.
@@ -882,6 +918,8 @@ mod tests {
     use super::*;
     use crate::multiplexer::wezterm::PaneSummary;
 
+    /// A pane filling its tab, for the tests that do not care where a sidebar
+    /// lands.
     fn pane(pane_id: &str, tab_id: u64, workspace: &str, title: &str) -> PaneSummary {
         PaneSummary {
             pane_id: pane_id.to_string(),
@@ -891,6 +929,23 @@ mod tests {
             workspace: workspace.to_string(),
             title: title.to_string(),
             is_active: false,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    /// The same pane, reaching only part of its tab.
+    fn pane_of_extent(
+        pane_id: &str,
+        tab_id: u64,
+        workspace: &str,
+        cols: u16,
+        rows: u16,
+    ) -> PaneSummary {
+        PaneSummary {
+            cols,
+            rows,
+            ..pane(pane_id, tab_id, workspace, "cmd.exe")
         }
     }
 
@@ -1031,10 +1086,10 @@ mod tests {
         let sidebars = ids(&["2", "4"]);
 
         assert_eq!(
-            plan_tabs(&panes, &sidebars, "default"),
+            plan_tabs(&panes, &sidebars, "default", SidebarPosition::Left),
             vec!["3".to_string(), "5".to_string()]
         );
-        assert!(plan_tabs(&panes, &sidebars, "other").is_empty());
+        assert!(plan_tabs(&panes, &sidebars, "other", SidebarPosition::Left).is_empty());
     }
 
     /// A sidebar is the pane the record names -- WezTerm withholds the title of
@@ -1255,5 +1310,54 @@ mod tests {
         );
         assert_ne!(path, store.refresh_signal_path("tmux", r"\\?\C:\socket"));
         assert_ne!(path, store.refresh_signal_path("wezterm", "socket"));
+    }
+
+    /// The sidebar is split off a pane, not off the whole tab: WezTerm's
+    /// whole-tab split leaves the tab sized for the part it did not split.
+    #[test]
+    fn a_sidebar_is_a_split_of_a_pane() {
+        assert_eq!(
+            open_args(r"C:\workmux\workmux.exe", "12", SidebarPosition::Left, "30"),
+            [
+                "cli",
+                "split-pane",
+                "--pane-id",
+                "12",
+                "--left",
+                "--cells",
+                "30",
+                "--",
+                r"C:\workmux\workmux.exe",
+                "_sidebar-run",
+            ]
+        );
+        assert_eq!(
+            open_args(r"C:\workmux\workmux.exe", "12", SidebarPosition::Top, "13")[4],
+            "--top"
+        );
+    }
+
+    /// A tab is split at the pane that reaches its edge: down the side that is
+    /// the tallest pane, across the top the widest, whichever order they are
+    /// listed in.
+    #[test]
+    fn a_sidebar_is_split_off_the_pane_that_reaches_the_tabs_edge() {
+        // A tab held by a tall pane beside a stack of two short ones.
+        let panes = vec![
+            pane_of_extent("1", 10, "default", 60, 12),
+            pane_of_extent("2", 10, "default", 60, 12),
+            pane_of_extent("3", 10, "default", 30, 24),
+        ];
+
+        assert_eq!(
+            plan_tabs(&panes, &ids(&[]), "default", SidebarPosition::Left),
+            vec!["3".to_string()],
+            "only the pane reaching the bottom of the tab carries a sidebar to it"
+        );
+        assert_eq!(
+            plan_tabs(&panes, &ids(&[]), "default", SidebarPosition::Top),
+            vec!["1".to_string()],
+            "the widest panes tie, and the first listed one wins"
+        );
     }
 }
