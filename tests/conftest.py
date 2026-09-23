@@ -1760,7 +1760,14 @@ def pane_home_env(env: MuxEnvironment) -> Dict[str, str]:
     the XDG variables are the only thing isolating a pane's run there.
     """
     keys = ("HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME")
-    return {key: env.env[key] for key in keys if env.env.get(key)}
+    values = {key: env.env[key] for key in keys if env.env.get(key)}
+    # A `worktree_dir: ~/...` asks for the account's home rather than `$HOME`,
+    # and the profile variable is the one Windows answers that with. Left
+    # alone, it points at the real profile, and the worktree a test creates
+    # outlives the test in the user's own home directory.
+    if IS_WINDOWS:
+        values["USERPROFILE"] = str(env.home_path)
+    return values
 
 
 def pane_cd(path: Path) -> str:

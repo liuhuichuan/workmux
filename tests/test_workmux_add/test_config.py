@@ -1,7 +1,6 @@
 """Tests for config file precedence and global/project config merging."""
 
 from pathlib import Path
-import shlex
 
 import yaml
 
@@ -13,9 +12,14 @@ from ..conftest import (
     assert_symlink_to,
     assert_window_exists,
     create_commit,
+    create_file_command,
     file_for_commit,
     get_window_name,
     get_worktree_path,
+    make_env_script,
+    pane_cd,
+    pane_home_env,
+    pane_quote,
     run_workmux_command,
     slugify,
     wait_for_file,
@@ -63,7 +67,7 @@ class TestConfigPrecedence:
         branch_name = "feature-global-only"
         hook_file = "global_only_hook.txt"
 
-        write_global_workmux_config(env, post_create=[f"touch {hook_file}"])
+        write_global_workmux_config(env, post_create=[create_file_command(hook_file)])
 
         worktree_path = add_branch_and_get_worktree(
             env, workmux_exe_path, mux_repo_path, branch_name
@@ -87,10 +91,14 @@ class TestGlobalPlaceholderPostCreate:
         before_hook = "project_before.txt"
         after_hook = "project_after.txt"
 
-        write_global_workmux_config(env, post_create=[f"touch {global_hook}"])
+        write_global_workmux_config(env, post_create=[create_file_command(global_hook)])
         write_workmux_config(
             mux_repo_path,
-            post_create=[f"touch {before_hook}", "<global>", f"touch {after_hook}"],
+            post_create=[
+                create_file_command(before_hook),
+                "<global>",
+                create_file_command(after_hook),
+            ],
         )
 
         worktree_dir = add_branch_and_get_worktree(
@@ -113,7 +121,7 @@ class TestGlobalPlaceholderPostCreate:
 
         write_workmux_config(
             mux_repo_path,
-            post_create=["<global>", f"touch {project_hook}"],
+            post_create=["<global>", create_file_command(project_hook)],
         )
 
         worktree_dir = add_branch_and_get_worktree(
@@ -315,11 +323,14 @@ class TestGlobalAgentDefault:
         # Use absolute path for output to avoid cwd/shell-init races
         agent_output = env.tmp_path / "global_agent_ran.txt"
 
-        # Install fake agent; use absolute path for both agent command and output
-        # to avoid PATH resolution issues when the login shell re-initializes PATH
+        # Install fake agent; use an absolute path for the agent command to
+        # avoid PATH resolution issues when the login shell re-initializes
+        # PATH. The body is read by that shell, so the output path in it is
+        # spelled the POSIX way: a backslash is an escape there, and a Windows
+        # path written with them names a file called `C:UsersAdministrator...`.
         agent_path = fake_agent_installer.install(
             "global_agent",
-            f"#!/bin/sh\necho ran > {agent_output}\n",
+            f"#!/bin/sh\necho ran > {agent_output.as_posix()}\n",
         )
 
         # Write global config with absolute agent path but NO explicit panes
@@ -352,11 +363,21 @@ class TestBaseBranchConfig:
         new_branch: str,
         expected_file: Path,
     ) -> Path:
+        """Open the dashboard in the test pane, and add a worktree from it.
+
+        The words have to be the pane shell's own. `cd 'C:\\dir' && 'tool.exe'`
+        is spelled for `sh`, and cmd.exe answers it with a volume-label error; a
+        helper script written for the platform says the same thing in the
+        spelling that shell reads, and carries this test's own home with it.
+        """
         command = (
-            f"cd {shlex.quote(str(mux_repo_path))} && "
-            f"{shlex.quote(str(workmux_exe_path))} dashboard --tab worktrees"
+            f"{pane_cd(mux_repo_path)} && "
+            f"{pane_quote(workmux_exe_path)} dashboard --tab worktrees"
         )
-        env.send_keys("test:", command)
+        # A run of workmux that is not told it is under test stops to ask about
+        # the terminal's font, and a pane has nobody to answer it.
+        env_vars = {**pane_home_env(env), "WORKMUX_TEST": "1"}
+        env.send_keys("test:", make_env_script(env, command, env_vars))
         wait_for_pane_output(env, "test", "Worktrees", timeout=10.0)
         env.send_keys("test:", "a", enter=False)
         wait_for_pane_output(env, "test", "Add Worktree", timeout=10.0)
@@ -812,7 +833,7 @@ class TestConfigOverride:
         global_hook = "global_from_merge.txt"
         override_prefix = "merged-"
 
-        write_global_workmux_config(env, post_create=[f"touch {global_hook}"])
+        write_global_workmux_config(env, post_create=[create_file_command(global_hook)])
 
         # Alternate config only overrides window_prefix, not post_create
         alt_config = mux_repo_path / ".workmux.merge.yaml"
