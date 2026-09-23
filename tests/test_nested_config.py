@@ -2,18 +2,17 @@
 
 import subprocess
 from pathlib import Path
-
-import pytest
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from .conftest import (
     MuxEnvironment,
     TmuxEnvironment,
+    hook_env_echo,
+    hook_print_cwd,
     run_workmux_command,
     run_workmux_open,
 )
-
-# These tests use tmux-specific features (get pane cwd, kill-window)
-pytestmark = pytest.mark.tmux_only
 
 
 def run_cmd(
@@ -24,12 +23,21 @@ def run_cmd(
 
 
 def get_pane_cwd(env: MuxEnvironment, window_name: str) -> Path:
-    """Get the current working directory of a tmux pane by window name."""
-    assert isinstance(env, TmuxEnvironment), "get_pane_cwd requires tmux backend"
-    result = env.tmux(
-        ["display-message", "-p", "-t", window_name, "#{pane_current_path}"]
-    )
-    return Path(result.stdout.strip())
+    """The directory the pane of `window_name` runs in.
+
+    tmux answers with `#{pane_current_path}`. WezTerm carries the same value in
+    the `cwd` of its listing, as a `file://` URL -- which is what its own Rust
+    side reads it out of.
+    """
+    if isinstance(env, TmuxEnvironment):
+        result = env.tmux(
+            ["display-message", "-p", "-t", window_name, "#{pane_current_path}"]
+        )
+        return Path(result.stdout.strip())
+
+    pane = env._find_pane_by_tab_title(window_name)
+    assert pane is not None, f"No pane in tab '{window_name}'"
+    return Path(url2pathname(urlparse(pane["cwd"]).path))
 
 
 def wait_for_file_with_content(
@@ -136,7 +144,7 @@ class TestWorkingDirectory:
         workmux_exe_path: Path,
         repo_path: Path,
     ):
-        """wm add from nested config opens tmux in nested directory."""
+        """wm add from nested config opens the pane in the nested directory."""
         env = mux_server
         backend = repo_path / "backend"
         backend.mkdir()
@@ -150,7 +158,7 @@ class TestWorkingDirectory:
         )
         assert result.exit_code == 0
 
-        # Verify tmux pane is in the nested directory
+        # Verify the pane is in the nested directory
         pane_cwd = get_pane_cwd(env, "wm-feature-nested")
         worktrees_dir = repo_path.parent / f"{repo_path.name}__worktrees"
         expected = worktrees_dir / "feature-nested" / "backend"
@@ -162,7 +170,7 @@ class TestWorkingDirectory:
         workmux_exe_path: Path,
         repo_path: Path,
     ):
-        """wm open from nested config opens tmux in nested directory."""
+        """wm open from nested config opens the pane in the nested directory."""
         env = mux_server
         backend = repo_path / "backend"
         backend.mkdir()
@@ -176,9 +184,8 @@ class TestWorkingDirectory:
             env, workmux_exe_path, repo_path, "add test-branch", working_dir=backend
         )
 
-        # Close the tmux window (but keep worktree on disk)
-        assert isinstance(env, TmuxEnvironment)
-        env.tmux(["kill-window", "-t", "wm-test-branch"])
+        # Close the window (but keep worktree on disk)
+        env.kill_window("wm-test-branch")
 
         # Reopen from backend/
         result = run_workmux_open(
@@ -246,8 +253,9 @@ class TestHooksEnvironment:
 
         backend = repo_path / "backend"
         backend.mkdir()
+        hook = hook_env_echo("WM_CONFIG_DIR", output_file)
         (backend / ".workmux.yaml").write_text(
-            f"agent: claude\npost_create:\n  - 'echo $WM_CONFIG_DIR > {output_file}'\n"
+            f"agent: claude\npost_create:\n  - '{hook}'\n"
         )
 
         run_cmd(["git", "add", "."], cwd=repo_path, env=env)
@@ -279,8 +287,9 @@ class TestHooksEnvironment:
 
         backend = repo_path / "backend"
         backend.mkdir()
+        hook = hook_env_echo("WM_PROJECT_ROOT", output_file)
         (backend / ".workmux.yaml").write_text(
-            f"agent: claude\npost_create:\n  - 'echo $WM_PROJECT_ROOT > {output_file}'\n"
+            f"agent: claude\npost_create:\n  - '{hook}'\n"
         )
 
         run_cmd(["git", "add", "."], cwd=repo_path, env=env)
@@ -309,8 +318,9 @@ class TestHooksEnvironment:
 
         backend = repo_path / "backend"
         backend.mkdir()
+        hook = hook_print_cwd(output_file)
         (backend / ".workmux.yaml").write_text(
-            f"agent: claude\npost_create:\n  - 'pwd > {output_file}'\n"
+            f"agent: claude\npost_create:\n  - '{hook}'\n"
         )
 
         run_cmd(["git", "add", "."], cwd=repo_path, env=env)

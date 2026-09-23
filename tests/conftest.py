@@ -1770,6 +1770,17 @@ def hook_make_dir(path: str) -> str:
     return f'mkdir -p "{path}"'
 
 
+def hook_print_cwd(path: Path) -> str:
+    """A hook line that writes the directory the hook runs in to `path`.
+
+    `pwd` is a POSIX tool, and the shell that runs a hook on Windows is cmd,
+    whose `cd` with no argument is what prints the current directory.
+    """
+    if IS_WINDOWS:
+        return f"cd > {pane_quote(path)}"
+    return f"pwd > {shlex.quote(str(path))}"
+
+
 def hook_copy_file(source: str, target: str) -> str:
     """A hook line that copies `source` into the directory `target`.
 
