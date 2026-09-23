@@ -10,6 +10,12 @@ from .conftest import (
     run_workmux_remove,
     write_workmux_config,
     create_commit,
+    create_file_command,
+    hook_copy_file,
+    hook_env,
+    hook_env_echo,
+    hook_make_dir,
+    hook_path,
 )
 
 
@@ -29,7 +35,7 @@ class TestPreRemoveHooksRemove:
 
         write_workmux_config(
             repo_path,
-            pre_remove=[f"touch {marker_file}"],
+            pre_remove=[create_file_command(marker_file)],
         )
 
         run_workmux_add(env, workmux_exe_path, repo_path, branch_name)
@@ -54,7 +60,7 @@ class TestPreRemoveHooksRemove:
 
         write_workmux_config(
             repo_path,
-            pre_remove=["<global>", f"touch {marker_file}"],
+            pre_remove=["<global>", create_file_command(marker_file)],
         )
 
         run_workmux_add(env, workmux_exe_path, repo_path, branch_name)
@@ -77,7 +83,7 @@ class TestPreRemoveHooksRemove:
 
         write_workmux_config(
             repo_path,
-            pre_remove=[f'echo "$WM_HANDLE" > {env_file}'],
+            pre_remove=[hook_env_echo("WM_HANDLE", env_file)],
         )
 
         run_workmux_add(env, workmux_exe_path, repo_path, branch_name)
@@ -102,7 +108,7 @@ class TestPreRemoveHooksRemove:
 
         write_workmux_config(
             repo_path,
-            pre_remove=[f'echo "$WM_WORKTREE_PATH" > {env_file}'],
+            pre_remove=[hook_env_echo("WM_WORKTREE_PATH", env_file)],
         )
 
         run_workmux_add(env, workmux_exe_path, repo_path, branch_name)
@@ -129,7 +135,7 @@ class TestPreRemoveHooksRemove:
 
         write_workmux_config(
             repo_path,
-            pre_remove=[f'echo "$WM_PROJECT_ROOT" > {env_file}'],
+            pre_remove=[hook_env_echo("WM_PROJECT_ROOT", env_file)],
         )
 
         run_workmux_add(env, workmux_exe_path, repo_path, branch_name)
@@ -152,13 +158,19 @@ class TestPreRemoveHooksRemove:
         branch_name = "feature-copy-test"
         artifacts_dir = "artifacts"
 
+        # Where the hook is to leave the worktree's own file, said in the words
+        # of whichever shell runs the hook.
+        artifacts = hook_path(
+            hook_env("WM_PROJECT_ROOT"), artifacts_dir, hook_env("WM_HANDLE")
+        )
+
         # Hook creates artifacts dir and copies a file there
         write_workmux_config(
             repo_path,
-            post_create=["echo 'test content' > artifact.txt"],
+            post_create=[create_file_command("artifact.txt", "test content")],
             pre_remove=[
-                f'mkdir -p "$WM_PROJECT_ROOT/{artifacts_dir}/$WM_HANDLE"',
-                f'cp artifact.txt "$WM_PROJECT_ROOT/{artifacts_dir}/$WM_HANDLE/"',
+                hook_make_dir(artifacts),
+                hook_copy_file("artifact.txt", artifacts),
             ],
         )
 
@@ -187,7 +199,7 @@ class TestPreRemoveHooksMerge:
 
         write_workmux_config(
             repo_path,
-            pre_remove=[f"touch {marker_file}"],
+            pre_remove=[create_file_command(marker_file)],
             env=env,  # Commit config to avoid uncommitted changes error
         )
 
@@ -213,7 +225,7 @@ class TestPreRemoveHooksMerge:
 
         write_workmux_config(
             repo_path,
-            pre_remove=[f"touch {marker_file}"],
+            pre_remove=[create_file_command(marker_file)],
             env=env,
         )
 
@@ -242,9 +254,9 @@ class TestPreRemoveHooksMerge:
         write_workmux_config(
             repo_path,
             pre_remove=[
-                f'echo "HANDLE=$WM_HANDLE" >> {env_file}',
-                f'echo "PATH=$WM_WORKTREE_PATH" >> {env_file}',
-                f'echo "ROOT=$WM_PROJECT_ROOT" >> {env_file}',
+                hook_env_echo("WM_HANDLE", env_file, label="HANDLE", append=True),
+                hook_env_echo("WM_WORKTREE_PATH", env_file, label="PATH", append=True),
+                hook_env_echo("WM_PROJECT_ROOT", env_file, label="ROOT", append=True),
             ],
             env=env,
         )

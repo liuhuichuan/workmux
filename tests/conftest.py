@@ -1731,15 +1731,55 @@ def pane_script_path(env: MuxEnvironment, name: str) -> Path:
     return get_scripts_dir(env) / f"{name}{suffix}"
 
 
-def hook_env_echo(var: str, path: Path) -> str:
+def hook_env(var: str) -> str:
+    """How the shell that runs a hook spells an environment variable.
+
+    A hook is run through the platform's own shell, so the `$NAME` of a POSIX
+    hook is a literal `$NAME` to cmd.exe, which asks for `%NAME%` instead.
+    """
+    return f"%{var}%" if IS_WINDOWS else f"${var}"
+
+
+def hook_path(*parts: str) -> str:
+    """Join path parts the way the shell that runs a hook spells them.
+
+    A part may be an environment reference from `hook_env`, which the shell
+    expands after it has read the separator.
+    """
+    return os.sep.join(parts)
+
+
+def hook_env_echo(var: str, path: Path, label: str = "", append: bool = False) -> str:
     """A hook line that writes the value of an environment variable to `path`.
 
-    A hook runs in this host's own shell -- `sh -c` asks for `$NAME`, and
-    cmd.exe, which has no `$` at all, asks for `%NAME%`.
+    `label` puts the value behind `label=`, and `append` adds a line to the
+    file rather than replacing it, so a hook that wants several values writes
+    one line each.
+    """
+    value = f'"{label}={hook_env(var)}"' if label else hook_env(var)
+    redirect = ">>" if append else ">"
+    if IS_WINDOWS:
+        return f"echo {value} {redirect} {pane_quote(path)}"
+    return f"echo {value} {redirect} {shlex.quote(str(path))}"
+
+
+def hook_make_dir(path: str) -> str:
+    """A hook line that creates a directory, in whichever shell runs it."""
+    if IS_WINDOWS:
+        return f'mkdir "{path}"'
+    return f'mkdir -p "{path}"'
+
+
+def hook_copy_file(source: str, target: str) -> str:
+    """A hook line that copies `source` into the directory `target`.
+
+    Both `cp` and cmd's `copy` put a file into an existing directory when the
+    target names one, so the target carries no trailing separator -- cmd would
+    read the one before a closing quote as escaping that quote.
     """
     if IS_WINDOWS:
-        return f"echo %{var}% > {pane_quote(path)}"
-    return f"echo ${var} > {shlex.quote(str(path))}"
+        return f'copy "{source}" "{target}"'
+    return f'cp "{source}" "{target}"'
 
 
 def pane_invocation(script: Path) -> str:

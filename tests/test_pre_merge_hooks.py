@@ -9,6 +9,8 @@ from .conftest import (
     run_workmux_merge,
     write_workmux_config,
     create_commit,
+    create_file_command,
+    hook_env_echo,
 )
 
 
@@ -28,7 +30,7 @@ class TestPreMergeHooks:
 
         write_workmux_config(
             repo_path,
-            pre_merge=[f"touch {marker_file}"],
+            pre_merge=[create_file_command(marker_file)],
             env=env,
         )
 
@@ -55,11 +57,13 @@ class TestPreMergeHooks:
         write_workmux_config(
             repo_path,
             pre_merge=[
-                f'echo "BRANCH=$WM_BRANCH_NAME" >> {env_file}',
-                f'echo "TARGET=$WM_TARGET_BRANCH" >> {env_file}',
-                f'echo "PATH=$WM_WORKTREE_PATH" >> {env_file}',
-                f'echo "ROOT=$WM_PROJECT_ROOT" >> {env_file}',
-                f'echo "HANDLE=$WM_HANDLE" >> {env_file}',
+                hook_env_echo("WM_BRANCH_NAME", env_file, label="BRANCH", append=True),
+                hook_env_echo(
+                    "WM_TARGET_BRANCH", env_file, label="TARGET", append=True
+                ),
+                hook_env_echo("WM_WORKTREE_PATH", env_file, label="PATH", append=True),
+                hook_env_echo("WM_PROJECT_ROOT", env_file, label="ROOT", append=True),
+                hook_env_echo("WM_HANDLE", env_file, label="HANDLE", append=True),
             ],
             env=env,
         )
@@ -118,7 +122,7 @@ class TestPreMergeHooks:
         # Configure a hook that creates a file
         write_workmux_config(
             repo_path,
-            pre_merge=[f"touch {marker_file}"],
+            pre_merge=[create_file_command(marker_file)],
             env=env,
         )
 
@@ -174,8 +178,8 @@ class TestPreMergeHooks:
 
         write_workmux_config(
             repo_path,
-            pre_merge=[f"touch {pre_merge_marker}"],
-            pre_remove=[f"touch {pre_remove_marker}"],
+            pre_merge=[create_file_command(pre_merge_marker)],
+            pre_remove=[create_file_command(pre_remove_marker)],
             env=env,
         )
 
