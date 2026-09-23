@@ -4,7 +4,6 @@ import json
 import time
 from pathlib import Path
 
-
 from .conftest import (
     MuxEnvironment,
     get_worktree_path,
@@ -12,6 +11,7 @@ from .conftest import (
     run_workmux_command,
     write_workmux_config,
 )
+from .support.executable import as_posix_path
 
 
 def create_fake_claude_session(
@@ -242,7 +242,13 @@ def write_codex_shim(env: MuxEnvironment, bin_dir: Path) -> tuple[Path, Path]:
     bin_dir.mkdir(parents=True, exist_ok=True)
     argv_file = bin_dir / "codex-argv.txt"
     shim = bin_dir / "codex"
-    env.install_script(shim, f'#!/bin/sh\nprintf "%s\\n" "$@" > {argv_file}\n')
+    # The body is a POSIX shell script on either host -- on Windows the entry
+    # point beside it hands it to the shell Git brought -- and such a shell
+    # reads a backslash as an escape, so the file it writes to is spelled the
+    # way that shell spells a path.
+    env.install_script(
+        shim, f'#!/bin/sh\nprintf "%s\\n" "$@" > {as_posix_path(str(argv_file))}\n'
+    )
     return shim, argv_file
 
 
