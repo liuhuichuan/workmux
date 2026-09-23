@@ -103,7 +103,7 @@ def test_send_from_file_to_agent(
         status="waiting",
     )
 
-    prompt_file = Path("/tmp/wm_prompt.txt")
+    prompt_file = env.tmp_path / "wm_prompt.txt"
     prompt_file.write_text("hello-from-file\n")
 
     result = run_workmux_command(
