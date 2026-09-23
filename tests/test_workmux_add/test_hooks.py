@@ -6,6 +6,7 @@ from pathlib import Path
 from ..conftest import (
     MuxEnvironment,
     ShellCommands,
+    create_file_command,
     get_window_name,
     wait_for_pane_output,
     write_workmux_config,
@@ -27,7 +28,9 @@ class TestPostCreateHooks:
         branch_name = "feature-hooks"
         hook_file = "hook_was_executed.txt"
 
-        write_workmux_config(mux_repo_path, post_create=[f"touch {hook_file}"])
+        write_workmux_config(
+            mux_repo_path, post_create=[create_file_command(hook_file)]
+        )
 
         worktree_path = add_branch_and_get_worktree(
             env, workmux_exe_path, mux_repo_path, branch_name
@@ -47,7 +50,9 @@ class TestPostCreateHooks:
         branch_name = "feature-skip-hooks"
         hook_file = "hook_should_not_exist.txt"
 
-        write_workmux_config(mux_repo_path, post_create=[f"touch {hook_file}"])
+        write_workmux_config(
+            mux_repo_path, post_create=[create_file_command(hook_file)]
+        )
 
         worktree_path = add_branch_and_get_worktree(
             env,
@@ -94,7 +99,9 @@ class TestPaneCommands:
         branch_name = "feature-skip-pane-cmds"
         marker_file = "pane_command_output.txt"
 
-        write_workmux_config(mux_repo_path, panes=[{"command": f"touch {marker_file}"}])
+        write_workmux_config(
+            mux_repo_path, panes=[{"command": create_file_command(marker_file)}]
+        )
 
         worktree_path = add_branch_and_get_worktree(
             env,

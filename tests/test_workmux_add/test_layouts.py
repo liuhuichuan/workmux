@@ -1,12 +1,13 @@
 """Tests for named layout selection with -l/--layout."""
 
-import shlex
 from pathlib import Path
 
 from ..conftest import (
     FakeAgentInstaller,
     MuxEnvironment,
+    ShellCommands,
     get_window_name,
+    pane_quote,
     run_workmux_command,
     wait_for_file,
     write_workmux_config,
@@ -23,11 +24,17 @@ class TestLayoutSelection:
         workmux_exe_path: Path,
         mux_repo_path: Path,
         fake_agent_installer: FakeAgentInstaller,
+        shell_cmd: ShellCommands,
     ):
         """The -l flag should use the layout's panes instead of top-level panes."""
         env = mux_server
         branch_name = "feature-layout-basic"
         window_name = get_window_name(branch_name)
+
+        # A pane finds a double by name only through a shell whose startup file
+        # this harness writes, which is where the fake bin directory is put on
+        # PATH; the default shell of a Windows host is not one of them.
+        env.configure_default_shell(shell_cmd.path)
 
         fake_agent_installer.install(
             "claude",
@@ -72,12 +79,15 @@ echo "layout-agent-ran" > layout_marker.txt
         workmux_exe_path: Path,
         mux_repo_path: Path,
         fake_agent_installer: FakeAgentInstaller,
+        shell_cmd: ShellCommands,
     ):
         """Layout panes with a known agent command should receive prompt injection."""
         env = mux_server
         branch_name = "feature-layout-prompt"
         window_name = get_window_name(branch_name)
         prompt_text = "layout prompt injection test"
+
+        env.configure_default_shell(shell_cmd.path)
 
         fake_agent_installer.install(
             "claude",
@@ -102,7 +112,7 @@ printf '%s' "$2" > claude_received.txt
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"-l review --prompt {shlex.quote(prompt_text)}",
+            extra_args=f"-l review --prompt {pane_quote(prompt_text)}",
         )
 
         agent_output = worktree_path / "claude_received.txt"

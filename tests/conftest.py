@@ -1711,6 +1711,20 @@ def pane_quote(value: Any) -> str:
     return shlex.quote(text)
 
 
+def create_file_command(filename: str, text: str = "created") -> str:
+    """A command that makes `filename` appear, in whichever shell runs it.
+
+    A `post_create` hook or a pane command is run through the platform's own
+    shell - `sh -c` on a POSIX host, `cmd.exe` on Windows - and `echo` with a
+    redirect is the one thing both spell the same way. `touch` is a POSIX tool
+    that a Windows host does not have, so a hook written with it fails and the
+    test that expects the file fails with it. A test that expects the file NOT
+    to appear passes either way, which is worse: it stops being able to tell
+    the two apart.
+    """
+    return f"echo {text} > {filename}"
+
+
 def pane_script_path(env: MuxEnvironment, name: str) -> Path:
     """Path of a helper script the pane's shell can run."""
     suffix = ".cmd" if IS_WINDOWS else ".sh"
