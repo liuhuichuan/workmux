@@ -358,6 +358,24 @@ pub fn path_from_git(text: &str) -> PathBuf {
     }
 }
 
+/// A path, spelled the way a POSIX shell reads it.
+///
+/// The counterpart of `path_from_git`. Windows writes a path with backslashes
+/// and a POSIX shell reads one as an escape: `cat .workmux\PROMPT.md` asks for a
+/// file called `.workmuxPROMPT.md` and finds nothing, so a command workmux types
+/// into a pane's shell has to name the file the way that shell does. A path
+/// that came from a POSIX host is already spelled this way.
+pub fn path_for_posix_shell(text: &str) -> String {
+    #[cfg(windows)]
+    {
+        text.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        text.to_string()
+    }
+}
+
 /// Extensions Windows looks a bare name up with, in the order it tries them.
 #[cfg(any(windows, test))]
 const SHELL_PATH_EXT: &str = ".COM;.EXE;.BAT;.CMD";
@@ -648,6 +666,21 @@ mod tests {
             path_from_git("C:/repo/worktree").to_string_lossy(),
             expected
         );
+    }
+
+    /// The spelling `path_from_git` undoes, kept for the commands workmux types
+    /// into a pane: a POSIX shell reads a backslash as an escape, so a Windows
+    /// path has to arrive with forward slashes or it names a file that is not
+    /// there. On a POSIX host a backslash is part of a file name and stays.
+    #[test]
+    fn a_path_a_posix_shell_reads_loses_this_platforms_separators() {
+        let expected = if cfg!(windows) {
+            ".workmux/PROMPT.md"
+        } else {
+            r".workmux\PROMPT.md"
+        };
+
+        assert_eq!(path_for_posix_shell(r".workmux\PROMPT.md"), expected);
     }
 
     #[test]

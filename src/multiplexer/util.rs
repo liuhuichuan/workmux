@@ -30,11 +30,10 @@ pub fn prefixed(prefix: &str, window_name: &str) -> String {
 /// Used to determine whether agent commands need to be wrapped in `sh -c '...'`
 /// for shells like nushell or fish that don't support POSIX command substitution.
 pub fn is_posix_shell(shell: &str) -> bool {
-    let shell_name = Path::new(shell)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("sh");
-    matches!(shell_name, "bash" | "zsh" | "sh" | "dash" | "ksh" | "ash")
+    matches!(
+        crate::shell::shell_name(shell).as_str(),
+        "bash" | "zsh" | "sh" | "dash" | "ksh" | "ash"
+    )
 }
 
 /// Canonical spelling of a backend instance identity.
@@ -132,7 +131,9 @@ impl PaneCommandShell {
     /// line, and a subexpression in a quoted string joins those with spaces.
     pub fn file_argument(self, path: &str) -> String {
         match self {
-            Self::Posix | Self::PosixWrapped => format!("$(cat {path})"),
+            Self::Posix | Self::PosixWrapped => {
+                format!("$(cat {})", crate::util::path_for_posix_shell(path))
+            }
             Self::PowerShell | Self::PowerShellWrapped => {
                 format!("$(Get-Content -Raw '{}')", path.replace('\'', "''"))
             }
@@ -610,6 +611,17 @@ mod tests {
         assert!(is_posix_shell("/usr/bin/bash"));
     }
 
+    /// A Windows install spells the same shell with a suffix, in any case, and
+    /// a pane has to be seen as the shell it is or its command is written for
+    /// the wrong one.
+    #[test]
+    fn test_is_posix_shell_windows_spelling() {
+        assert!(is_posix_shell(r"C:\Program Files\Git\bin\bash.EXE"));
+        assert!(is_posix_shell("ZSH.EXE"));
+        assert!(!is_posix_shell(r"C:\Program Files\Git\bin\fish.exe"));
+        assert!(!is_posix_shell("nu.exe"));
+    }
+
     #[test]
     fn test_is_posix_shell_zsh() {
         assert!(is_posix_shell("/bin/zsh"));
@@ -657,6 +669,17 @@ mod tests {
         );
     }
 
+    /// A POSIX shell a Windows install spells with a suffix is that shell, not
+    /// a cmd pane: wrapping it in PowerShell made bash read PowerShell's
+    /// `$(Get-Content ...)` as a command of its own and lose the prompt with it.
+    #[test]
+    fn pane_command_shell_of_reads_a_windows_spelled_posix_shell() {
+        let shell = PaneCommandShell::of(r"C:\Program Files\Git\bin\bash.EXE");
+        assert_eq!(shell, PaneCommandShell::Posix);
+        assert_eq!(shell.file_argument("PROMPT.md"), "$(cat PROMPT.md)");
+        assert_eq!(shell.wrap("claude -- prompt"), "claude -- prompt");
+    }
+
     /// `cmd.exe` substitutes nothing and Windows has no `sh`, so a command it
     /// cannot evaluate is handed to a PowerShell; a PowerShell pane evaluates
     /// `$(...)` itself.
@@ -698,6 +721,23 @@ mod tests {
         assert_eq!(
             PaneCommandShell::PowerShellWrapped.file_argument("it's.md"),
             "$(Get-Content -Raw 'it''s.md')"
+        );
+
+        // A pane's command names the file the way the shell reading it spells
+        // paths: a POSIX shell has only forward slashes, so a Windows path has
+        // to lose its backslashes on the way in.
+        let path = if cfg!(windows) {
+            r".workmux\PROMPT.md"
+        } else {
+            ".workmux/PROMPT.md"
+        };
+        assert_eq!(
+            PaneCommandShell::Posix.file_argument(path),
+            "$(cat .workmux/PROMPT.md)"
+        );
+        assert_eq!(
+            PaneCommandShell::PowerShell.file_argument(path),
+            format!("$(Get-Content -Raw '{path}')")
         );
     }
 

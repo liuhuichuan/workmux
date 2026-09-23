@@ -356,10 +356,15 @@ impl PaneHandshake for MarkerFileHandshake {
         // Inside the script quoting is ordinary: only the command line is
         // rewritten by `cmd.exe`. The redirect follows `echo` with no space so
         // the marker file holds no leading blank.
+        let shell_line = crate::shell::interactive_shell_argv(shell)
+            .iter()
+            .map(|word| format!("\"{word}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
         let script = format!(
-            "@echo off\r\necho ready> \"{}\"\r\n\"{}\"\r\n",
+            "@echo off\r\necho ready> \"{}\"\r\n{}\r\n",
             self.marker_path.display(),
-            shell
+            shell_line
         );
         std::fs::write(&self.script_path, script).with_context(|| {
             format!(
@@ -440,6 +445,40 @@ mod tests {
         assert!(
             marker_path.exists(),
             "wrapper did not write the readiness marker"
+        );
+    }
+
+    /// The shell the pane is left with is the one the user's own profile
+    /// describes, so it is started as a login shell. Windows panes run a POSIX
+    /// shell whenever `$SHELL` names one, and both POSIX handshakes pass `-l`
+    /// for exactly this reason; without it here the profile that sets a pane's
+    /// PATH, aliases and environment never runs.
+    #[test]
+    fn script_content_starts_a_profile_reading_shell_as_a_login_shell() {
+        let temp = tempfile::tempdir().unwrap();
+        let shell = temp.path().join("bash.cmd");
+        let arguments = temp.path().join("arguments.txt");
+        std::fs::write(
+            &shell,
+            format!("@echo off\r\necho %* > \"{}\"\r\n", arguments.display()),
+        )
+        .unwrap();
+
+        let handshake = MarkerFileHandshake::new().unwrap();
+        let script = handshake.script_content(shell.to_str().unwrap()).unwrap();
+        let argv = crate::shell::snippet_argv(&script);
+        let (program, args) = argv.split_first().unwrap();
+        let output = Command::new(program).args(args).output().unwrap();
+
+        assert!(
+            output.status.success(),
+            "wrapper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let seen = std::fs::read_to_string(&arguments).unwrap();
+        assert!(
+            seen.trim().trim_matches('"') == "-l",
+            "the shell was not started as a login shell: {seen:?}"
         );
     }
 }

@@ -13,15 +13,28 @@ pub enum ShellDialect {
     PowerShell,
 }
 
-/// Classify a shell path or program name.
-pub fn dialect_of(shell: &str) -> ShellDialect {
+/// The name a shell answers to: its path's last component, without case and
+/// without the suffix a Windows install gives an executable.
+///
+/// A shell is written down as a path on one host and as a bare name on another,
+/// and Windows spells the same program `bash.EXE` where Unix spells it `bash`.
+/// Every table that asks what a shell can do is keyed by this name, so that a
+/// shell is recognised wherever its path came from.
+pub fn shell_name(shell: &str) -> String {
     let name = std::path::Path::new(shell)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(shell)
         .to_ascii_lowercase();
-    let stem = name.strip_suffix(".exe").unwrap_or(&name);
-    match stem {
+    match name.strip_suffix(".exe") {
+        Some(stem) => stem.to_string(),
+        None => name,
+    }
+}
+
+/// Classify a shell path or program name.
+pub fn dialect_of(shell: &str) -> ShellDialect {
+    match shell_name(shell).as_str() {
         "pwsh" | "powershell" => ShellDialect::PowerShell,
         "cmd" => ShellDialect::Cmd,
         "bash" | "zsh" | "sh" | "dash" | "ksh" | "ash" => ShellDialect::Posix,
@@ -37,6 +50,21 @@ pub const fn default_interactive_shell() -> &'static str {
     } else {
         "/bin/bash"
     }
+}
+
+/// The words that start `shell` as an interactive pane's shell.
+///
+/// A shell that reads a profile is started as a login shell, which is what the
+/// POSIX pane handshakes have always done (`exec '<shell>' -l`): the profile is
+/// where a pane's PATH, aliases and environment come from, so a pane started
+/// without it runs a shell the user would not recognise as their own. `cmd.exe`
+/// and PowerShell have no such flag and are started as they are.
+pub fn interactive_shell_argv(shell: &str) -> Vec<String> {
+    let mut argv = vec![shell.to_string()];
+    if dialect_of(shell) == ShellDialect::Posix {
+        argv.push("-l".to_string());
+    }
+    argv
 }
 
 /// Suffix that discards a command's output in the interpreter that runs
@@ -307,6 +335,31 @@ mod tests {
         assert_eq!(dialect_of("powershell"), ShellDialect::PowerShell);
         // Unknown shells keep the POSIX default so existing configs behave.
         assert_eq!(dialect_of("nu"), ShellDialect::Posix);
+    }
+
+    /// A shell written as a Windows path is the same shell: the tables are
+    /// keyed by the name it answers to, not by how it was spelled.
+    #[test]
+    fn shell_name_is_the_name_a_shell_answers_to() {
+        assert_eq!(shell_name(r"C:\Program Files\Git\bin\bash.EXE"), "bash");
+        assert_eq!(shell_name("/usr/bin/zsh"), "zsh");
+        assert_eq!(shell_name("PowerShell.exe"), "powershell");
+        assert_eq!(shell_name("cmd.exe"), "cmd");
+        assert_eq!(shell_name("nu"), "nu");
+    }
+
+    /// A pane's shell is started the way its own profile expects: a shell that
+    /// reads a profile arrives as a login shell, and an interpreter with no such
+    /// flag arrives as itself.
+    #[test]
+    fn interactive_shell_argv_logs_in_only_for_a_profile_reading_shell() {
+        assert_eq!(
+            interactive_shell_argv(r"C:\Program Files\Git\bin\bash.exe"),
+            vec![r"C:\Program Files\Git\bin\bash.exe", "-l"]
+        );
+        assert_eq!(interactive_shell_argv("/bin/zsh"), vec!["/bin/zsh", "-l"]);
+        assert_eq!(interactive_shell_argv("cmd.exe"), vec!["cmd.exe"]);
+        assert_eq!(interactive_shell_argv("pwsh.exe"), vec!["pwsh.exe"]);
     }
 
     /// The null-device suffix is only valid for the interpreter that reads the
