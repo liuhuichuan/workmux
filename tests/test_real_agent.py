@@ -35,7 +35,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 ANSWER = "PONG"
-PROMPT = f"Reply with exactly the word {ANSWER} and nothing else."
+# The word is never spelled out in the prompt. A prompt that named it would be
+# visible in the pane the moment the agent echoed it, and the check below would
+# pass on workmux's own words instead of on the agent's answer.
+PROMPT = (
+    "Reply with exactly the one word you get by writing the letters "
+    "P, O, N, G in that order with no spaces, and nothing else."
+)
 ANSWER_TIMEOUT = 300.0
 
 
