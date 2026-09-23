@@ -8,6 +8,7 @@ import pytest
 from ..conftest import (
     MuxEnvironment,
     RepoBuilder,
+    create_file_command,
     get_window_name,
     get_worktree_path,
     run_workmux_command,
@@ -332,7 +333,9 @@ class TestRescueFlags:
         branch_name = "feature-rescue-no-hooks"
         hook_file = "hook_executed.txt"
 
-        write_workmux_config(mux_repo_path, post_create=[f"touch {hook_file}"])
+        write_workmux_config(
+            mux_repo_path, post_create=[create_file_command(hook_file)]
+        )
 
         # Create uncommitted changes
         test_file = mux_repo_path / "test.txt"
@@ -455,7 +458,9 @@ class TestRescueHooks:
         branch_name = "feature-rescue-hooks"
         hook_file = "hook_executed.txt"
 
-        write_workmux_config(mux_repo_path, post_create=[f"touch {hook_file}"])
+        write_workmux_config(
+            mux_repo_path, post_create=[create_file_command(hook_file)]
+        )
 
         # Create uncommitted changes
         test_file = mux_repo_path / "test.txt"
@@ -479,6 +484,9 @@ class TestRescueHooks:
 class TestRescueFileModes:
     """Tests for file mode preservation with --with-changes."""
 
+    # An executable bit is what this checks, and Windows has none: `chmod` there
+    # only moves the read-only flag, and Git records no mode to preserve.
+    @pytest.mark.posix_only
     def test_rescue_preserves_file_modes(
         self,
         mux_server: MuxEnvironment,
