@@ -385,13 +385,17 @@ fn paths_match(left: &Path, right: &Path) -> bool {
 /// Resolve a conversation forker for the given agent name.
 /// Returns None if the agent doesn't support conversation forking.
 pub fn resolve_forker(agent_name: &str) -> Option<Box<dyn ConversationForker>> {
-    // Normalize: strip path, take basename
-    let basename = agent_name.rsplit('/').next().unwrap_or(agent_name);
-    let name = basename
-        .split_whitespace()
-        .next()
-        .unwrap_or(basename)
-        .to_lowercase();
+    // What names the agent is the program's own name. The value may be a bare
+    // command, a path in this host's spelling, or either with arguments after
+    // it -- and a Windows path carries both separators and may have a space
+    // inside it, so the path is cut at the last separator before the arguments
+    // are cut at the first space.
+    let basename = agent_name.rsplit(['/', '\\']).next().unwrap_or(agent_name);
+    let program = basename.split_whitespace().next().unwrap_or(basename);
+    let name = Path::new(program)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| program.to_lowercase());
 
     match name.as_str() {
         "claude" => Some(Box::new(ClaudeForker::new())),
@@ -445,6 +449,16 @@ mod tests {
     #[test]
     fn test_resolve_forker_unknown() {
         assert!(resolve_forker("unknown-agent").is_none());
+    }
+
+    /// A Windows agent is named the way Windows names one: a path, with
+    /// backslashes, and often the suffix the install gave the executable.
+    #[test]
+    fn test_resolve_forker_windows_path() {
+        assert!(resolve_forker(r"C:\tools\codex").is_some());
+        assert!(resolve_forker(r"C:\Users\me\AppData\Roaming\npm\codex.cmd").is_some());
+        assert!(resolve_forker(r"C:\Program Files\Claude\claude.exe --flag").is_some());
+        assert!(resolve_forker(r"C:\tools\not-an-agent.exe").is_none());
     }
 
     #[test]
