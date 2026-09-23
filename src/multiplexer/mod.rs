@@ -499,7 +499,7 @@ pub trait Multiplexer: Send + Sync {
     fn select_pane(&self, pane_id: &str) -> Result<()>;
 
     /// Zoom (fullscreen) a pane by ID.
-    /// Only supported by tmux. Other backends silently ignore this.
+    /// Supported by tmux and WezTerm. Other backends silently ignore this.
     fn zoom_pane(&self, _pane_id: &str) -> Result<()> {
         Ok(())
     }

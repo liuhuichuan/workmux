@@ -738,6 +738,16 @@ fn split_args(
     Ok(args)
 }
 
+/// The `wezterm cli` arguments that zoom a pane.
+///
+/// `--zoom` and not `--toggle`, which is what tmux's own zoom is
+/// (`resize-pane -Z`): the caller asks for the pane to be zoomed, not for its
+/// zoom state to be flipped, and it asks once. WezTerm's `--zoom` leaves an
+/// already-zoomed pane zoomed, so the ask reads the same either way.
+fn zoom_args(pane_id: &str) -> [&str; 5] {
+    ["cli", "zoom-pane", "--pane-id", pane_id, "--zoom"]
+}
+
 /// What WezTerm reports about the pane a process runs in.
 ///
 /// The sidebar reads geometry through this: the backend's trait surface has no
@@ -1168,6 +1178,13 @@ impl Multiplexer for WezTermBackend {
         self.cli(&["cli", "activate-pane", "--pane-id", pane_id])
             .run()
             .context("Failed to select pane")?;
+        Ok(())
+    }
+
+    fn zoom_pane(&self, pane_id: &str) -> Result<()> {
+        self.cli(&zoom_args(pane_id))
+            .run()
+            .context("Failed to zoom pane")?;
         Ok(())
     }
 
@@ -2086,6 +2103,17 @@ mod tests {
         assert_eq!(args[args.len() - argv.len() - 1], "--");
         assert!(args.ends_with(&argv), "{args:?}");
         assert_eq!(args.len(), 8 + argv.len());
+    }
+
+    /// A zoom is asked for as a zoom and not as a flip of the pane's zoom
+    /// state: the caller asks once, and asks after the focus change that comes
+    /// with zooming a pane, so a flip there would undo the zoom.
+    #[test]
+    fn a_zoom_is_asked_for_by_the_pane_it_names() {
+        assert_eq!(
+            zoom_args("12"),
+            ["cli", "zoom-pane", "--pane-id", "12", "--zoom"]
+        );
     }
 
     /// Panes die with the server and their ids are handed out again, so the
