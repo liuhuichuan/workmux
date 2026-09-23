@@ -17,6 +17,7 @@ from ..conftest import (
     get_window_name,
     get_worktree_path,
     run_workmux_command,
+    run_workmux_open,
     setup_git_repo,
     write_workmux_config,
 )
@@ -28,6 +29,12 @@ def repo_path(mux_server: MuxEnvironment) -> Path:
     path = mux_server.tmp_path
     setup_git_repo(path, mux_server.env)
     return path
+
+
+def skip_on_tmux(env: MuxEnvironment) -> None:
+    """Skip a test that checks what happens where tmux is *not* the backend."""
+    if env.backend_name == "tmux":
+        pytest.skip("session mode is what tmux does, so tmux has nothing to refuse")
 
 
 class TestWorktreeCreation:
@@ -61,3 +68,55 @@ class TestWorktreeCreation:
 
         expected_window = get_window_name(branch_name)
         assert_window_exists(mux_server, expected_window)
+
+
+class TestSessionModeIsRefusedOffTmux:
+    """A backend without sessions has to refuse session mode out loud.
+
+    The session suite itself is tmux-only (tests/test_workmux_add/test_session.py),
+    which leaves the refusal untested everywhere else. This is where that half
+    lives: the command must fail with the backend named, and must fail before it
+    has touched the repository.
+    """
+
+    def test_add_refuses_session_mode(
+        self, mux_server: MuxEnvironment, workmux_exe_path: Path, repo_path: Path
+    ):
+        """`workmux add --session` fails, and leaves no worktree behind."""
+        skip_on_tmux(mux_server)
+        branch_name = "test-session-refused"
+
+        write_workmux_config(repo_path)
+        result = run_workmux_command(
+            mux_server,
+            workmux_exe_path,
+            repo_path,
+            f"add {branch_name} --session --background",
+            expect_fail=True,
+        )
+
+        assert "only supported with tmux" in result.stderr, result.stderr
+        assert not get_worktree_path(repo_path, branch_name).exists()
+
+    def test_open_refuses_session_mode(
+        self, mux_server: MuxEnvironment, workmux_exe_path: Path, repo_path: Path
+    ):
+        """`workmux open --session` fails for a worktree created in window mode."""
+        skip_on_tmux(mux_server)
+        branch_name = "test-open-session-refused"
+
+        write_workmux_config(repo_path)
+        run_workmux_command(
+            mux_server, workmux_exe_path, repo_path, f"add {branch_name}"
+        )
+
+        result = run_workmux_open(
+            mux_server,
+            workmux_exe_path,
+            repo_path,
+            branch_name,
+            session=True,
+            expect_fail=True,
+        )
+
+        assert "only supported with tmux" in result.stderr, result.stderr
