@@ -12,6 +12,8 @@ from .conftest import (
     assert_session_exists,
     assert_session_not_exists,
     assert_window_not_exists,
+    create_file_command,
+    expected_target_label,
     get_session_name,
     get_window_name,
     get_worktree_path,
@@ -391,7 +393,7 @@ def test_open_with_run_hooks_reexecutes_post_create_commands(
     branch_name = "feature-open-hooks"
     hook_file = "open_hook.txt"
 
-    write_workmux_config(repo_path, post_create=[f"touch {hook_file}"])
+    write_workmux_config(repo_path, post_create=[create_file_command(hook_file)])
     run_workmux_add(env, workmux_exe_path, repo_path, branch_name)
 
     worktree_path = get_worktree_path(repo_path, branch_name)
@@ -1095,7 +1097,7 @@ def test_open_target_name_owner_can_switch_existing_target(
         target_name="owned-open",
     )
 
-    assert "Switched to existing tmux window" in result.stdout
+    assert f"Switched to existing {expected_target_label(env)}" in result.stdout
 
 
 @pytest.mark.tmux_only
@@ -1287,6 +1289,7 @@ def test_open_target_name_session_owner_can_switch_existing_target(
     assert "no current client" in result.stderr
 
 
+@pytest.mark.tmux_only  # a session-mode worktree is a tmux session
 def test_open_rejects_parent_session_in_session_mode(
     mux_server: MuxEnvironment, workmux_exe_path: Path, repo_path: Path
 ):
