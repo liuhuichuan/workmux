@@ -677,7 +677,9 @@ def test_add_gitlab_reports_missing_glab(
     for executable in ("git", env.backend_name):
         executable_path = shutil.which(executable)
         assert executable_path is not None
-        (isolated_bin / executable).symlink_to(executable_path)
+        # Windows starts the image a name resolves to, so the link carries the
+        # suffix the tool is installed with: `git.exe`, not `git`.
+        (isolated_bin / Path(executable_path).name).symlink_to(executable_path)
 
     result = run_workmux_command(
         env,
