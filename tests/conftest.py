@@ -1623,6 +1623,24 @@ def get_window_name(branch_name: str) -> str:
     return f"{DEFAULT_WINDOW_PREFIX}{handle}"
 
 
+def expected_target_label(env: MuxEnvironment, mode: str = "window") -> str:
+    """The words workmux prints for the target it would create.
+
+    Mirrors `multiplexer::handle::target_label`. The plan names the thing the
+    user is looking at in that backend's own words, so a WezTerm tab is not a
+    tmux window and the check does not depend on which backend is under test.
+    """
+    labels = {
+        ("tmux", "window"): "tmux window",
+        ("tmux", "session"): "tmux session",
+        ("wezterm", "window"): "WezTerm tab",
+        ("wezterm", "session"): "WezTerm workspace",
+        ("zellij", "window"): "Zellij tab",
+        ("kitty", "window"): "kitty tab",
+    }
+    return labels.get((env.backend_name, mode), mode)
+
+
 def park_worktree(
     env: MuxEnvironment,
     branch_name: str,

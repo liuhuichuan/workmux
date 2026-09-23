@@ -12,6 +12,7 @@ from ..conftest import (
     assert_window_exists,
     assert_window_not_exists,
     create_commit,
+    expected_target_label,
     file_for_commit,
     get_session_name,
     get_window_name,
@@ -56,7 +57,10 @@ class TestDryRun:
         assert f"Worktree: {worktree_path}" in result.stdout
         assert f"Branch:   {branch_name}" in result.stdout
         assert "Base:     main" in result.stdout
-        assert "Target:   wm-feature-dry-run (window)" in result.stdout
+        assert (
+            f"Target:   wm-feature-dry-run ({expected_target_label(env)})"
+            in result.stdout
+        )
         assert ".env -> .env (copy)" in result.stdout
         assert "shared.txt -> shared.txt (symlink)" in result.stdout
         assert f"touch {hook_file}" in result.stdout
@@ -72,12 +76,11 @@ class TestDryRun:
         env = mux_server
         branch_name = "fix/issue-123"
         worktree_path = get_worktree_path(mux_repo_path, branch_name)
-        write_global_workmux_config(
-            env,
-            auto_name={
-                "command": "sh -c 'printf \"fix/issue-123\\n\"'",
-            },
+        env.install_script(
+            env.fake_bin_dir / "name-double",
+            "#!/bin/sh\nprintf 'fix/issue-123\\n'\n",
         )
+        write_global_workmux_config(env, auto_name={"command": "name-double"})
 
         result = run_workmux_command(
             env,
@@ -99,12 +102,11 @@ class TestDryRun:
         )
         worktree_path = get_worktree_path(mux_repo_path, generated_name)
         windows_before = env.list_window_ids()
-        write_global_workmux_config(
-            env,
-            auto_name={
-                "command": f"sh -c 'printf \"{generated_name}\\n\"'",
-            },
+        env.install_script(
+            env.fake_bin_dir / "name-double",
+            f"#!/bin/sh\nprintf '{generated_name}\\n'\n",
         )
+        write_global_workmux_config(env, auto_name={"command": "name-double"})
 
         result = run_workmux_command(
             env,
@@ -128,12 +130,11 @@ class TestDryRun:
             ["git", "update-ref", "refs/remotes/origin/topic", "HEAD"],
             cwd=mux_repo_path,
         )
-        write_global_workmux_config(
-            env,
-            auto_name={
-                "command": "sh -c 'printf \"origin/topic\\n\"'",
-            },
+        env.install_script(
+            env.fake_bin_dir / "name-double",
+            "#!/bin/sh\nprintf 'origin/topic\\n'\n",
         )
+        write_global_workmux_config(env, auto_name={"command": "name-double"})
 
         result = run_workmux_command(
             env,
@@ -396,7 +397,9 @@ class TestWorktreeCreation:
         worktree_list = env.run_command(
             ["git", "worktree", "list"], cwd=mux_repo_path
         ).stdout
-        assert str(expected_path) in worktree_list
+        # git spells a path the way the platform it runs on does, and on
+        # Windows that is with forward slashes.
+        assert str(expected_path).replace("\\", "/") in worktree_list
 
 
 class TestCountFlag:
@@ -701,6 +704,7 @@ class TestExistingBranch:
         assert worktree_path.is_dir()
         assert_window_exists(env, get_window_name(branch_name))
 
+    @pytest.mark.tmux_only
     def test_add_open_if_exists_preserves_stored_mode_without_override(
         self, mux_server: MuxEnvironment, workmux_exe_path, mux_repo_path
     ):
@@ -737,6 +741,7 @@ class TestExistingBranch:
         assert_session_exists(env, session_name)
         assert_window_not_exists(env, window_name)
 
+    @pytest.mark.tmux_only
     def test_add_open_if_exists_respects_session_mode_override(
         self, mux_server: MuxEnvironment, workmux_exe_path, mux_repo_path
     ):
@@ -770,6 +775,7 @@ class TestExistingBranch:
         assert_session_exists(env, session_name)
         assert_window_not_exists(env, window_name)
 
+    @pytest.mark.tmux_only
     def test_add_mode_window_overrides_session_config(
         self, mux_server: MuxEnvironment, workmux_exe_path, mux_repo_path
     ):
