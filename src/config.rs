@@ -716,7 +716,8 @@ pub struct Config {
     #[serde(default)]
     pub window_placement: Option<WindowPlacement>,
 
-    /// Automatically check for updates in the background. Default: true
+    /// Automatically check for updates in the background.
+    /// Default: false -- the check has to be asked for, see `command::update`.
     #[serde(default)]
     pub auto_update_check: Option<bool>,
 

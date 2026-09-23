@@ -45,12 +45,16 @@ Update available: workmux v0.1.124 -> v0.1.125 (run `workmux update`)
 
 The check runs at most once every 24 hours via a detached background process and never slows down your commands. The notice is shown at most once per day and only in interactive terminals.
 
-### Disabling
+### Turning it on
 
-To disable the automatic update check, either:
+The check is **off unless it is asked for**: nothing is read or spawned until
+`auto_update_check: true` is set in the global config
+(`~/.config/workmux/config.yaml`). What it looks for is the version of the
+released build, which is not the version of every build of workmux, so the
+notice would name an upgrade that is only an upgrade for a released one.
 
-- Set `auto_update_check: false` in the global config (`~/.config/workmux/config.yaml`)
-- Set the environment variable `WORKMUX_NO_UPDATE_CHECK=1`
+Set the environment variable `WORKMUX_NO_UPDATE_CHECK=1` to turn the check off
+even then.
 
 ## Requirements
 

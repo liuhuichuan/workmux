@@ -352,12 +352,22 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
     l > c
 }
 
+/// Whether this build looks for a newer release without being asked to.
+///
+/// It does not. The releases it would find carry the version of another build,
+/// so the one behind them is not an upgrade here, and the notice would send the
+/// reader to `workmux update` -- which replaces this binary with that other
+/// one. Upstream defaults the check on; here the same setting turns it on.
+fn automatic_check_enabled(configured: Option<bool>) -> bool {
+    configured == Some(true)
+}
+
 /// Called on CLI startup to show an update notice if one is cached.
 /// Also spawns a background check if the cache is stale.
 /// Designed to be completely non-blocking and fail-silent.
 pub fn check_and_notify(config: &crate::config::Config) {
-    // Opt-out via config
-    if config.auto_update_check == Some(false) {
+    // Opt in via config
+    if !automatic_check_enabled(config.auto_update_check) {
         return;
     }
 
@@ -576,6 +586,16 @@ mod tests {
     #[test]
     fn test_is_not_newer_older() {
         assert!(!is_newer_version("0.1.9", "0.1.10"));
+    }
+
+    /// The automatic check is one a reader asks for. What it looks for is the
+    /// released build's version, and the workmux a reader of this branch has is
+    /// not that build, so a notice would name an upgrade that is not one.
+    #[test]
+    fn the_automatic_check_waits_to_be_asked_for() {
+        assert!(!automatic_check_enabled(None));
+        assert!(!automatic_check_enabled(Some(false)));
+        assert!(automatic_check_enabled(Some(true)));
     }
 
     #[test]
