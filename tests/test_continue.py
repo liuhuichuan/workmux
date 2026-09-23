@@ -1,13 +1,13 @@
 """Tests for resuming agents at recreated worktree paths."""
 
 import json
-import shlex
 import sys
 
 import pytest
 
 from .conftest import (
     get_worktree_path,
+    pane_quote,
     poll_until,
     run_workmux_command,
     write_workmux_config,
@@ -58,11 +58,11 @@ def test_continue_at_recreated_path(
     prompt = "Follow up on the previous change"
     command = "add followup --name reused --continue -b"
     if prompt_flag == "-p":
-        command += f" -p {shlex.quote(prompt)}"
+        command += f" -p {pane_quote(prompt)}"
     elif prompt_flag == "-P":
         prompt_file = tmp_path / "followup.md"
         prompt_file.write_text(prompt)
-        command += f" -P {shlex.quote(str(prompt_file))}"
+        command += f" -P {pane_quote(prompt_file)}"
 
     run_workmux_command(mux_server, workmux_exe_path, mux_repo_path, command)
     assert poll_until(lambda: output.exists() and output.stat().st_size > 0)

@@ -2180,17 +2180,17 @@ def run_workmux_open(
     if session:
         flags.append("-s")
     if mode:
-        flags.append(f"--mode {shlex.quote(mode)}")
+        flags.append(f"--mode {pane_quote(mode)}")
     if target_name:
-        flags.append(f"--target-name {shlex.quote(target_name)}")
+        flags.append(f"--target-name {pane_quote(target_name)}")
     if parent_session:
-        flags.append(f"--parent-session {shlex.quote(parent_session)}")
+        flags.append(f"--parent-session {pane_quote(parent_session)}")
     if prompt:
-        flags.append(f"-p {shlex.quote(prompt)}")
+        flags.append(f"-p {pane_quote(prompt)}")
     if prompt_file:
-        flags.append(f"-P {shlex.quote(str(prompt_file))}")
+        flags.append(f"-P {pane_quote(prompt_file)}")
     if config:
-        flags.append(f"--config {shlex.quote(str(config))}")
+        flags.append(f"--config {pane_quote(config)}")
 
     flag_str = f" {' '.join(flags)}" if flags else ""
     if isinstance(branch_name, list):
