@@ -1821,6 +1821,21 @@ def pane_home_env(env: MuxEnvironment) -> Dict[str, str]:
     return values
 
 
+def pane_temp_env(env: MuxEnvironment) -> Dict[str, str]:
+    """Variables that point a pane's run at this test's own temporary files.
+
+    A run writes prompt files and handshake markers into the platform's
+    temporary directory. `TMPDIR` is the POSIX name for that directory;
+    Windows reads `TMP` and `TEMP` instead and has never heard of `TMPDIR`,
+    so a Windows run wrote those files into the account's own temporary
+    directory, and a test looking for one of them in its own found nothing.
+    """
+    temp = env.env.get("TMPDIR") or tempfile.gettempdir()
+    if IS_WINDOWS:
+        return {"TMP": temp, "TEMP": temp}
+    return {"TMPDIR": temp}
+
+
 def pane_cd(path: Path) -> str:
     """A line that makes the pane's shell work relative to `path`."""
     if IS_WINDOWS:
@@ -1909,7 +1924,9 @@ def pane_result_script(
     # A pane inherits the environment of the multiplexer that spawned it, which
     # knows nothing of this test, so every run is told where its home is.
     lines.extend(
-        pane_env_lines({**pane_home_env(env), **(env_vars or {})}).splitlines()
+        pane_env_lines(
+            {**pane_home_env(env), **pane_temp_env(env), **(env_vars or {})}
+        ).splitlines()
     )
     stdin_pipe = pane_stdin_pipe(env, stdin_input) if stdin_input else ""
     if IS_WINDOWS:
@@ -2033,11 +2050,11 @@ def run_workmux_command(
 
     env_vars = {
         "PATH": env.env["PATH"],
-        "TMPDIR": env.env.get("TMPDIR") or tempfile.gettempdir(),
         "SHELL": env.env.get("SHELL", os.environ.get("SHELL", "/bin/sh")),
         "WORKMUX_TEST": "1",
     }
     env_vars.update(pane_home_env(env))
+    env_vars.update(pane_temp_env(env))
     env_vars.update(pre_run_env or {})
 
     # Write the command to a script file to avoid tmux send-keys line length limits.
