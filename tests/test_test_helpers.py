@@ -17,6 +17,11 @@ from .conftest import (
 )
 
 
+# The four scripts below have a POSIX host as their subject: `/bin/sh` reads
+# the script, a shebang is what starts the entry point, an exec'd shell is
+# what a signal reaches. Windows starts an image and reads a `.cmd`, which is
+# a different mechanism, held to by the tests that use it.
+@pytest.mark.posix_only
 def test_env_script_runs_through_interpreter(tmp_path: Path):
     """Generated commands read scripts, without requiring shebang execution."""
     env = TmuxEnvironment(tmp_path)
@@ -81,6 +86,7 @@ def test_wezterm_window_ids_distinguish_tabs_not_titles(
 
 
 @pytest.mark.parametrize("exit_code", [0, 17])
+@pytest.mark.posix_only
 def test_workmux_command_reads_script_through_interpreter(
     mux_server, repo_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
 ):
@@ -123,6 +129,7 @@ def test_workmux_command_reads_script_through_interpreter(
 )
 @pytest.mark.parametrize("absolute", [False, True], ids=["PATH", "absolute"])
 @pytest.mark.parametrize("exit_code", [0, 17])
+@pytest.mark.posix_only
 def test_shared_script_preserves_process_contract(
     tmp_path: Path, interpreter: str, exit_code: int, absolute: bool
 ):
@@ -178,6 +185,7 @@ def test_shared_script_preserves_process_contract(
     assert stderr == "error"
 
 
+@pytest.mark.posix_only
 def test_shared_script_reinstallation_and_signals(tmp_path: Path, script_runner: Path):
     from .support.executable import install_script
 

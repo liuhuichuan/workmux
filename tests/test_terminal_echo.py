@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from .conftest import (
     MuxEnvironment,
     get_window_name,
@@ -11,6 +13,7 @@ from .conftest import (
 )
 
 
+@pytest.mark.posix_only  # the handshake disables echo with `stty`, and bash is what exposes it
 def test_terminal_echo_is_enabled_after_handshake(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
