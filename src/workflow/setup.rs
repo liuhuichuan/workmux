@@ -7,7 +7,7 @@ use crate::multiplexer::{
     CreateSessionParams, CreateWindowInSessionParams, CreateWindowParams, Multiplexer,
     PaneSetupOptions,
 };
-use crate::{cmd, config, prompt::Prompt};
+use crate::{cmd, config, prompt::Prompt, util};
 use tracing::{debug, info};
 
 use super::file_ops::{handle_file_operations, symlink_claude_local_md};
@@ -23,20 +23,6 @@ pub fn resolve_window_placement_target(
 pub struct ProvisionedEnvironment {
     pub working_directory: PathBuf,
     pub post_create_hooks_run: usize,
-}
-
-/// An absolute path for a hook's environment, in this machine's own spelling.
-///
-/// A hook is handed these where a path goes -- a Git command, a file another
-/// program opens -- so they have to be written the way the rest of this
-/// machine writes a path. `canonicalize` answers in the extended-length form
-/// on Windows (`\\?\C:\repo`), which several tools refuse, and which no other
-/// line of workmux's output shows: a hook asked to log its worktree cannot
-/// match the path `workmux list` prints for it.
-fn hook_path(path: &Path) -> String {
-    crate::util::git_path(&crate::util::canon_or_self(path))
-        .to_string_lossy()
-        .into_owned()
 }
 
 pub fn provision_environment(
@@ -68,9 +54,9 @@ pub fn provision_environment(
         && !post_create.is_empty()
     {
         hooks_run = post_create.len();
-        let worktree_path_str = hook_path(worktree_path);
-        let project_root_str = hook_path(project_root);
-        let config_dir_str = hook_path(effective_working_dir);
+        let worktree_path_str = util::hook_path(worktree_path);
+        let project_root_str = util::hook_path(project_root);
+        let config_dir_str = util::hook_path(effective_working_dir);
         let hook_env = [
             ("WORKMUX_HANDLE", handle),
             ("WM_HANDLE", handle),

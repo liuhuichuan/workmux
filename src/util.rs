@@ -316,6 +316,20 @@ pub fn canon_or_self(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// An absolute path for a hook's environment, in this machine's own spelling.
+///
+/// A hook is handed these where a path goes -- a Git command, a file another
+/// program opens -- so they have to be written the way the rest of this
+/// machine writes a path. `canonicalize` answers in the extended-length form
+/// on Windows (`\\?\C:\repo`), which several tools refuse, and which no other
+/// line of workmux's output shows: a hook asked to log its worktree cannot
+/// match the path `workmux list` prints for it.
+pub fn hook_path(path: &Path) -> String {
+    git_path(&canon_or_self(path))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Rewrite a path into the form Git accepts on this platform.
 ///
 /// `std::fs::canonicalize` returns extended-length (`\\?\`) paths on Windows,
@@ -955,6 +969,26 @@ mod tests {
             &*git_path(Path::new(r"C:\repo\.git")),
             OsStr::new(r"C:\repo\.git")
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn hook_path_hands_out_a_path_this_machine_spells() {
+        assert_eq!(hook_path(Path::new(r"\\?\C:\repo\wt")), r"C:\repo\wt");
+
+        // The spelling a hook is handed is the one its shell, Git and every
+        // other reader of a path accept, and it still names the directory the
+        // caller meant.
+        let dir = tempfile::tempdir().unwrap();
+        let text = hook_path(dir.path());
+        assert!(!text.starts_with(r"\\?\"), "{text}");
+        assert!(Path::new(&text).is_dir(), "{text}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hook_path_keeps_a_unix_path() {
+        assert_eq!(hook_path(Path::new("/repo/wt")), "/repo/wt");
     }
 
     #[test]

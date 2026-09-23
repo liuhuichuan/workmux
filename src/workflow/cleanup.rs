@@ -54,20 +54,13 @@ fn run_pre_remove_hooks(
             count = pre_remove_hooks.len(),
             "cleanup:running pre-remove hooks"
         );
-        let abs_worktree_path = worktree_path
-            .canonicalize()
-            .unwrap_or_else(|_| worktree_path.to_path_buf());
-        let abs_project_root = context
-            .main_worktree_root
-            .canonicalize()
-            .unwrap_or_else(|_| context.main_worktree_root.clone());
-        let worktree_path_str = abs_worktree_path.to_string_lossy();
-        let project_root_str = abs_project_root.to_string_lossy();
+        let worktree_path_str = crate::util::hook_path(worktree_path);
+        let project_root_str = crate::util::hook_path(&context.main_worktree_root);
         let hook_env = [
             ("WORKMUX_HANDLE", handle),
             ("WM_HANDLE", handle),
-            ("WM_WORKTREE_PATH", worktree_path_str.as_ref()),
-            ("WM_PROJECT_ROOT", project_root_str.as_ref()),
+            ("WM_WORKTREE_PATH", worktree_path_str.as_str()),
+            ("WM_PROJECT_ROOT", project_root_str.as_str()),
         ];
         for command in pre_remove_hooks {
             // Run the hook with the worktree path as the working directory.
