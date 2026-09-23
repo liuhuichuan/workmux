@@ -536,7 +536,15 @@ impl AgentCommand {
                 parts.push(format!("{}={}", key, value.shell_value()));
             }
         }
-        parts.push(crate::shell::word_quote(&self.program, dialect, true));
+        // A pane's shell starts the program it is given, and the shell that
+        // starts an image cannot start the extensionless entry point beside a
+        // tool's real executable. A POSIX shell reads that entry point itself,
+        // so it is handed the name as it was written.
+        let program = match dialect {
+            crate::shell::ShellDialect::Posix => self.program.clone(),
+            _ => crate::util::startable_program(&self.program),
+        };
+        parts.push(crate::shell::word_quote(&program, dialect, true));
         parts.extend(self.args.iter().map(|arg| quote(arg)));
         parts.join(" ")
     }
@@ -1123,6 +1131,36 @@ mod tests {
         assert_eq!(
             command.shell_string(),
             "env ANTHROPIC_AUTH_TOKEN=$ANTHROPIC_AUTH_TOKEN claude"
+        );
+    }
+
+    /// The pane's own shell starts the program, so workmux names it the way
+    /// that shell can: a POSIX pane reads the extensionless entry point a tool
+    /// was installed with, and a pane that starts an image is given the suffix
+    /// standing beside it, which is the program Windows knows.
+    #[cfg(windows)]
+    #[test]
+    fn test_agent_command_names_its_program_for_the_panes_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry_point = dir.path().join("agent");
+        std::fs::write(&entry_point, "#!/bin/sh\n").unwrap();
+        let image = dir.path().join("agent.cmd");
+        std::fs::write(&image, "@echo off\n").unwrap();
+
+        let command =
+            AgentCommand::parse(&format!("{} --flag", entry_point.display())).expect("parses");
+
+        assert_eq!(
+            command.shell_string_for(Some(PaneCommandShell::Posix)),
+            format!("{} --flag", entry_point.display())
+        );
+        // Windows compares the name without case, and the suffix comes from
+        // `PATHEXT` as it is written there.
+        assert_eq!(
+            command
+                .shell_string_for(Some(PaneCommandShell::PowerShell))
+                .to_lowercase(),
+            format!("{} --flag", image.display()).to_lowercase()
         );
     }
 }

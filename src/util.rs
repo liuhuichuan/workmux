@@ -419,6 +419,52 @@ pub fn program_path(name: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The spelling of a program that a shell starting an executable image runs.
+///
+/// A name that says where it is may still name a file Windows cannot start. A
+/// tool installed as a batch file is `codex.cmd` beside the extensionless
+/// entry point a POSIX shell reads as the script it is, so a pane running
+/// cmd.exe or PowerShell -- which start an image and know nothing of shebangs
+/// -- would be asked for a program that is not there. The suffix that is there
+/// answers for the name.
+///
+/// A bare name is left alone: `PATH` and a shell's own extension list are what
+/// a shell looks such a name up with, and a name already spelled the way a
+/// shell spells it needs no help.
+#[cfg(windows)]
+pub fn startable_program(program: &str) -> String {
+    let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| SHELL_PATH_EXT.to_string());
+    startable_program_in(program, &extensions)
+}
+
+/// The same question where a name is the program: a file whose first line names
+/// its interpreter is something this machine starts as it stands.
+#[cfg(not(windows))]
+pub fn startable_program(program: &str) -> String {
+    program.to_string()
+}
+
+/// Look a program that says where it is up the way Windows starts it: the name
+/// with each of `extensions`, and the name as it came in when none of them is
+/// there to start.
+#[cfg(any(windows, test))]
+fn startable_program_in(program: &str, extensions: &str) -> String {
+    if !program.contains(['\\', '/']) || Path::new(program).extension().is_some() {
+        return program.to_string();
+    }
+
+    for extension in extensions
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+    {
+        let candidate = PathBuf::from(format!("{program}{extension}"));
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    program.to_string()
+}
+
 /// Look a bare name up along `path` as a shell would: the name with each of
 /// `extensions`, directory by directory.
 ///
@@ -627,30 +673,33 @@ pub fn format_elapsed_duration(d: Duration) -> String {
 mod tests {
     use super::*;
 
+    /// A name the way Windows compares it: the disk answers either spelling.
+    fn program_name(path: &Path) -> String {
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase()
+    }
+
     /// A tool Windows installed as a batch file is not something a direct
     /// spawn finds, and a shell finds it by name: workmux looks it up the way
     /// the shell does, extension by extension, as `PATHEXT` orders them.
     #[test]
     fn a_tool_that_is_a_batch_file_is_looked_up_like_a_shell_looks_it_up() {
-        /// A name the way Windows compares it: the disk answers either spelling.
-        fn named(path: &Path) -> String {
-            path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase()
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().as_os_str();
         std::fs::write(dir.path().join("gh.cmd"), "@echo off\n").unwrap();
 
         let found = look_up_program("gh", path, SHELL_PATH_EXT);
-        assert_eq!(named(&found), "gh.cmd");
+        assert_eq!(program_name(&found), "gh.cmd");
         assert!(found.is_file(), "{found:?} is not the tool that is there");
 
         // An image outranks the batch file, as it does in a shell.
         std::fs::write(dir.path().join("gh.exe"), "").unwrap();
-        assert_eq!(named(&look_up_program("gh", path, SHELL_PATH_EXT)), "gh.exe");
+        assert_eq!(
+            program_name(&look_up_program("gh", path, SHELL_PATH_EXT)),
+            "gh.exe"
+        );
 
         // A name that says where it is, or carries an extension, stands.
         assert_eq!(
@@ -669,6 +718,39 @@ mod tests {
             look_up_program("nothing-by-this-name", path, SHELL_PATH_EXT),
             PathBuf::from("nothing-by-this-name")
         );
+    }
+
+    /// A tool's extensionless entry point is a program to a POSIX shell and not
+    /// to one that starts an image, and the suffix beside it is the program
+    /// that shell runs. workmux names the one the pane's shell reads.
+    #[test]
+    fn a_tool_named_by_path_is_spelled_the_way_a_windows_shell_starts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry_point = dir.path().join("codex");
+        std::fs::write(&entry_point, "#!/bin/sh\n").unwrap();
+        let spelling = entry_point.to_string_lossy().into_owned();
+        let starts =
+            |program: &str| program_name(Path::new(&startable_program_in(program, SHELL_PATH_EXT)));
+
+        // Nothing beside it starts, so the name stands for the spawn that
+        // follows to report that.
+        assert_eq!(startable_program_in(&spelling, SHELL_PATH_EXT), spelling);
+
+        // The batch file beside it is what a shell that starts an image runs.
+        std::fs::write(dir.path().join("codex.cmd"), "@echo off\n").unwrap();
+        assert_eq!(starts(&spelling), "codex.cmd");
+
+        // And an image outranks it, as it does in a shell.
+        std::fs::write(dir.path().join("codex.exe"), "").unwrap();
+        assert_eq!(starts(&spelling), "codex.exe");
+
+        // A name already carrying a suffix is the program, and a bare name is
+        // the shell's own to look up along `PATH`.
+        assert_eq!(
+            startable_program_in(r"C:\tools\codex.cmd", SHELL_PATH_EXT),
+            r"C:\tools\codex.cmd"
+        );
+        assert_eq!(startable_program_in("codex", SHELL_PATH_EXT), "codex");
     }
 
     /// Git hands back `C:/repo` on Windows too, and a path workmux prints is
