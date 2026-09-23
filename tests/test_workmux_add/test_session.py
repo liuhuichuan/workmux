@@ -1,5 +1,7 @@
 """Tests for `workmux add --session` command - session mode worktree creation."""
 
+import pytest
+
 from ..conftest import (
     assert_session_exists,
     assert_session_not_exists,
@@ -21,6 +23,7 @@ class TestSessionCreation:
     switch-client would fail.
     """
 
+    @pytest.mark.tmux_only
     def test_add_session_creates_tmux_session(
         self, mux_server, workmux_exe_path, repo_path
     ):
@@ -41,6 +44,7 @@ class TestSessionCreation:
 
         assert_session_exists(env, session_name)
 
+    @pytest.mark.tmux_only
     def test_add_session_creates_worktree(
         self, mux_server, workmux_exe_path, repo_path
     ):
@@ -65,6 +69,7 @@ class TestSessionCreation:
         # Verify worktree directory exists
         assert worktree_path.is_dir()
 
+    @pytest.mark.tmux_only
     def test_add_session_does_not_create_window(
         self, mux_server, workmux_exe_path, repo_path
     ):
@@ -86,6 +91,7 @@ class TestSessionCreation:
         # The session should exist, but no window with that name in the original session
         assert_window_not_exists(env, window_name)
 
+    @pytest.mark.tmux_only
     def test_add_session_naming_follows_prefix(
         self, mux_server, workmux_exe_path, repo_path
     ):
@@ -108,6 +114,7 @@ class TestSessionCreation:
         expected_session = f"{custom_prefix}feature-prefix-test"
         assert_session_exists(env, expected_session)
 
+    @pytest.mark.tmux_only
     def test_add_session_prefix_expands_project_placeholder(
         self, mux_server, workmux_exe_path, repo_path
     ):
@@ -134,6 +141,7 @@ class TestSessionCreation:
 
         assert_session_not_exists(env, expected_session)
 
+    @pytest.mark.tmux_only
     def test_add_session_target_name_overrides_session_target(
         self, mux_server, workmux_exe_path, repo_path
     ):
@@ -173,6 +181,7 @@ class TestSessionCreation:
 
         assert "--parent-session requires window mode" in result.stderr
 
+    @pytest.mark.tmux_only
     def test_add_session_name_collision_fails_before_git_state(
         self, mux_server, workmux_exe_path, repo_path
     ):
@@ -204,6 +213,7 @@ class TestSessionCreation:
 class TestSessionBackground:
     """Tests for --session with --background flag."""
 
+    @pytest.mark.tmux_only
     def test_add_session_background_creates_detached_session(
         self, mux_server, workmux_exe_path, repo_path
     ):
@@ -245,6 +255,7 @@ class TestSessionBackground:
 class TestSessionRemove:
     """Tests for removing session-mode worktrees."""
 
+    @pytest.mark.tmux_only
     def test_remove_cleans_up_session(self, mux_server, workmux_exe_path, repo_path):
         """Verifies `workmux remove` cleans up session-mode worktrees."""
         env = mux_server
@@ -281,6 +292,7 @@ class TestSessionRemove:
 class TestSessionClose:
     """Tests for closing session-mode worktrees."""
 
+    @pytest.mark.tmux_only
     def test_close_closes_session(self, mux_server, workmux_exe_path, repo_path):
         """Verifies `workmux close` closes the session for session-mode worktrees."""
         env = mux_server
@@ -314,6 +326,7 @@ class TestSessionClose:
 class TestSessionOpen:
     """Tests for opening session-mode worktrees."""
 
+    @pytest.mark.tmux_only
     def test_open_respects_stored_session_mode(
         self, mux_server, workmux_exe_path, repo_path
     ):
@@ -372,6 +385,7 @@ class TestSessionOpen:
 class TestOpenSessionFlag:
     """Tests for `workmux open --session` flag to override stored mode."""
 
+    @pytest.mark.tmux_only
     def test_open_session_flag_converts_window_to_session(
         self, mux_server, workmux_exe_path, repo_path
     ):
@@ -411,6 +425,7 @@ class TestOpenSessionFlag:
             f"Open command stderr: {result.stderr}"
         )
 
+    @pytest.mark.tmux_only
     def test_open_session_flag_persists_mode(
         self, mux_server, workmux_exe_path, repo_path
     ):
@@ -466,6 +481,7 @@ class TestOpenSessionFlag:
             f"Existing sessions: {existing_sessions!r}"
         )
 
+    @pytest.mark.tmux_only
     def test_open_session_flag_closes_existing_window(
         self, mux_server, workmux_exe_path, repo_path
     ):
@@ -517,6 +533,7 @@ class TestOpenSessionFlag:
 class TestMixedMode:
     """Tests for mixed-mode scenarios (some worktrees as windows, some as sessions)."""
 
+    @pytest.mark.tmux_only
     def test_mixed_mode_creates_correct_targets(
         self, mux_server, workmux_exe_path, repo_path
     ):
@@ -552,6 +569,7 @@ class TestMixedMode:
         # Verify session exists for session-mode
         assert_session_exists(env, get_session_name(session_branch))
 
+    @pytest.mark.tmux_only
     def test_mixed_mode_remove_cleans_up_correctly(
         self, mux_server, workmux_exe_path, repo_path
     ):
