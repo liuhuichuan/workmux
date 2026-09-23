@@ -7,7 +7,12 @@ from .conftest import (
     MuxEnvironment,
     run_workmux_command,
 )
-from .support.setup import run_setup_with_answers, write_claude_manual_status_hook
+from .support.setup import (
+    bundled_resource,
+    run_setup_with_answers,
+    write_claude_manual_status_hook,
+    write_verbatim,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -87,14 +92,10 @@ class TestSetupNoPrompt:
         """OpenCode with the bundled plugin shows all-configured message."""
         plugin_dir = mux_server.home_path / ".config" / "opencode" / "plugins"
         plugin_dir.mkdir(parents=True)
-        bundled_plugin = (
-            Path(__file__).parent.parent
-            / "resources"
-            / "opencode"
-            / "plugins"
-            / "workmux-status.ts"
+        write_verbatim(
+            plugin_dir / "workmux-status.ts",
+            bundled_resource("opencode", "plugins", "workmux-status.ts"),
         )
-        (plugin_dir / "workmux-status.ts").write_text(bundled_plugin.read_text())
 
         result = run_workmux_command(
             mux_server, workmux_exe_path, repo_path, "setup --hooks"
@@ -110,14 +111,10 @@ class TestSetupNoPrompt:
         """OMP with extension file shows all-configured message."""
         extension_dir = mux_server.home_path / ".omp" / "agent" / "extensions"
         extension_dir.mkdir(parents=True)
-        bundled_extension = (
-            Path(__file__).parent.parent
-            / "resources"
-            / "omp"
-            / "extensions"
-            / "workmux-status.ts"
+        write_verbatim(
+            extension_dir / "workmux-status.ts",
+            bundled_resource("omp", "extensions", "workmux-status.ts"),
         )
-        (extension_dir / "workmux-status.ts").write_text(bundled_extension.read_text())
 
         result = run_workmux_command(
             mux_server, workmux_exe_path, repo_path, "setup --hooks"
@@ -134,14 +131,10 @@ class TestSetupNoPrompt:
         write_claude_manual_status_hook(mux_server.home_path / ".claude")
         plugin_dir = mux_server.home_path / ".config" / "opencode" / "plugins"
         plugin_dir.mkdir(parents=True)
-        bundled_plugin = (
-            Path(__file__).parent.parent
-            / "resources"
-            / "opencode"
-            / "plugins"
-            / "workmux-status.ts"
+        write_verbatim(
+            plugin_dir / "workmux-status.ts",
+            bundled_resource("opencode", "plugins", "workmux-status.ts"),
         )
-        (plugin_dir / "workmux-status.ts").write_text(bundled_plugin.read_text())
 
         result = run_workmux_command(
             mux_server, workmux_exe_path, repo_path, "setup --hooks"
@@ -244,13 +237,7 @@ class TestSetupInstall:
     ):
         plugin_dir = mux_server.home_path / ".config" / "opencode" / "plugins"
         plugin_dir.mkdir(parents=True)
-        bundled_plugin = (
-            Path(__file__).parent.parent
-            / "resources"
-            / "opencode"
-            / "plugins"
-            / "workmux-status.ts"
-        ).read_text()
+        bundled_plugin = bundled_resource("opencode", "plugins", "workmux-status.ts")
         registration = """  try {
     await $`workmux register-agent`.quiet();
   } catch {
@@ -258,8 +245,9 @@ class TestSetupInstall:
   }
 
 """
-        (plugin_dir / "workmux-status.ts").write_text(
-            bundled_plugin.replace(registration, "")
+        write_verbatim(
+            plugin_dir / "workmux-status.ts",
+            bundled_plugin.replace(registration, ""),
         )
 
         run_setup_with_answers(
