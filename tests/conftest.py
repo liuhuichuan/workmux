@@ -1731,6 +1731,17 @@ def pane_script_path(env: MuxEnvironment, name: str) -> Path:
     return get_scripts_dir(env) / f"{name}{suffix}"
 
 
+def hook_env_echo(var: str, path: Path) -> str:
+    """A hook line that writes the value of an environment variable to `path`.
+
+    A hook runs in this host's own shell -- `sh -c` asks for `$NAME`, and
+    cmd.exe, which has no `$` at all, asks for `%NAME%`.
+    """
+    if IS_WINDOWS:
+        return f"echo %{var}% > {pane_quote(path)}"
+    return f"echo ${var} > {shlex.quote(str(path))}"
+
+
 def pane_invocation(script: Path) -> str:
     """The words that make the pane's shell run a helper script.
 

@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from ..conftest import (
     DEFAULT_WINDOW_PREFIX,
     MuxEnvironment,
@@ -9,6 +11,8 @@ from ..conftest import (
     assert_session_exists,
     assert_session_not_exists,
     assert_window_exists,
+    hook_env_echo,
+    pane_quote,
     run_workmux_add,
     run_workmux_command,
     slugify,
@@ -157,7 +161,7 @@ class TestTargetNameOptions:
             env,
             workmux_exe_path,
             mux_repo_path,
-            f"add {branch_name} --target-name '{custom_name}'",
+            f"add {branch_name} --target-name {pane_quote(custom_name)}",
         )
 
         worktree_path = (
@@ -166,6 +170,9 @@ class TestTargetNameOptions:
         assert worktree_path.is_dir()
         assert_window_exists(env, expected_window)
 
+    # A parent session is a tmux session, and WezTerm has no session to name:
+    # `workmux add --parent-session` says so and stops.
+    @pytest.mark.tmux_only
     def test_add_parent_session_preserves_exact_existing_session(
         self,
         mux_server: TmuxEnvironment,
@@ -236,6 +243,7 @@ class TestTargetNameOptions:
         assert "already exists" in result.stderr
         assert f"{DEFAULT_WINDOW_PREFIX}shared-review" in result.stderr
 
+    @pytest.mark.tmux_only
     def test_add_parent_session_parent_session_can_be_reused(
         self,
         mux_server: TmuxEnvironment,
@@ -268,6 +276,7 @@ class TestTargetNameOptions:
         assert f"{DEFAULT_WINDOW_PREFIX}feature-parent-session-a" in windows
         assert f"{DEFAULT_WINDOW_PREFIX}feature-parent-session-b" in windows
 
+    @pytest.mark.tmux_only
     def test_custom_parent_session_lifecycle_uses_persisted_target(
         self,
         mux_server: TmuxEnvironment,
@@ -466,7 +475,7 @@ class TestHandleEnvVar:
         write_workmux_config(
             mux_repo_path,
             worktree_naming="basename",
-            post_create=[f"echo $WORKMUX_HANDLE > {handle_output_file}"],
+            post_create=[hook_env_echo("WORKMUX_HANDLE", handle_output_file)],
         )
 
         # Create the worktree
