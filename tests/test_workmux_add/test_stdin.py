@@ -1,15 +1,18 @@
 """Tests for stdin input support in `workmux add`."""
 
-import shlex
+import sys
 from pathlib import Path
 
 from ..conftest import (
     DEFAULT_WINDOW_PREFIX,
     MuxEnvironment,
+    WINDOWS_COMMAND_TIMEOUT,
     assert_window_exists,
     get_scripts_dir,
     get_worktree_path,
+    pane_quote,
     poll_until_file_has_content,
+    read_workmux_text,
     run_workmux_command,
     slugify,
     write_workmux_config,
@@ -40,6 +43,19 @@ class TestStdinInput:
             if path.exists():
                 path.unlink()
 
+        # The probe below hands `workmux add` a budget and calls the run
+        # blocked when the budget runs out. The thing being ruled out is a
+        # wait that never ends, so the budget has to be one a run that is
+        # merely working can meet: the suite's own answer for how long a
+        # command may take on this host.
+        #
+        # It also reads what workmux printed. Workmux writes UTF-8, and a
+        # pane's Python takes the host's own encoding unless told otherwise,
+        # which on a Chinese Windows is a code page that cannot decode the
+        # tick in the success line: the probe dies of that before it writes
+        # the exit code, and the test then reports the command as blocked.
+        budget = WINDOWS_COMMAND_TIMEOUT
+
         script_file.write_text(
             "import os\n"
             "import subprocess\n"
@@ -47,26 +63,26 @@ class TestStdinInput:
             "read_fd, write_fd = os.pipe()\n"
             "try:\n"
             "    with os.fdopen(read_fd, 'rb', closefd=True) as stdin:\n"
-            "        proc = subprocess.Popen([sys.argv[1], 'add', 'topic'], cwd=sys.argv[2], stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n"
+            "        proc = subprocess.Popen([sys.argv[1], 'add', 'topic'], cwd=sys.argv[2], stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', errors='replace')\n"
             "        try:\n"
-            "            stdout, stderr = proc.communicate(timeout=3)\n"
+            f"            stdout, stderr = proc.communicate(timeout={budget})\n"
             "        except subprocess.TimeoutExpired:\n"
             "            proc.kill()\n"
             "            proc.communicate()\n"
-            "            raise AssertionError('workmux add blocked on open empty stdin pipe')\n"
+            f"            raise AssertionError('workmux add blocked on open empty stdin pipe for {budget}s')\n"
             "finally:\n"
             "    os.close(write_fd)\n"
-            "open(sys.argv[3], 'w').write(stdout)\n"
-            "open(sys.argv[4], 'w').write(stderr)\n"
+            "open(sys.argv[3], 'w', encoding='utf-8').write(stdout)\n"
+            "open(sys.argv[4], 'w', encoding='utf-8').write(stderr)\n"
             "open(sys.argv[5], 'w').write(str(proc.returncode))\n"
         )
 
         env.send_keys(
             "test:",
             " ".join(
-                shlex.quote(str(arg))
+                pane_quote(arg)
                 for arg in [
-                    "python3",
+                    sys.executable,
                     script_file,
                     workmux_exe_path,
                     mux_repo_path,
@@ -78,11 +94,13 @@ class TestStdinInput:
             enter=True,
         )
 
-        assert poll_until_file_has_content(exit_code_file, timeout=5.0), (
+        # Outlast the probe's own budget, so a run it called blocked is
+        # reported with the pane showing why rather than as a bare timeout.
+        assert poll_until_file_has_content(exit_code_file, timeout=budget + 10.0), (
             env.capture_pane("test:")
         )
-        stdout = stdout_file.read_text()
-        stderr = stderr_file.read_text()
+        stdout = read_workmux_text(stdout_file)
+        stderr = read_workmux_text(stderr_file)
 
         assert int(exit_code_file.read_text()) == 0, stderr
         assert "Successfully created worktree" in stdout
@@ -140,11 +158,12 @@ class TestStdinInput:
         write_workmux_config(mux_repo_path)
 
         # Use custom branch template that puts input first
+        template = "{{ input }}-feature"
         run_workmux_command(
             env,
             workmux_exe_path,
             mux_repo_path,
-            "add base --branch-template '{{ input }}-feature'",
+            f"add base --branch-template {pane_quote(template)}",
             stdin_input="api\nauth",
         )
 
@@ -333,12 +352,13 @@ Task for {{ input }}
 
         # Pipe JSON lines - each key should become a template variable
         json_lines = '{"name":"workmux","id":"1"}\n{"name":"tmux-tools","id":"2"}'
+        template = "{{ base_name }}-{{ name }}"
 
         run_workmux_command(
             env,
             workmux_exe_path,
             mux_repo_path,
-            "add analyze --branch-template '{{ base_name }}-{{ name }}'",
+            f"add analyze --branch-template {pane_quote(template)}",
             stdin_input=json_lines,
         )
 
@@ -366,12 +386,13 @@ Task for {{ input }}
 
         # Use {{ input }} in template - should get the raw JSON string (slugified)
         json_line = '{"name":"test"}'
+        template = "{{ base_name }}-{{ index }}"
 
         run_workmux_command(
             env,
             workmux_exe_path,
             mux_repo_path,
-            "add task --branch-template '{{ base_name }}-{{ index }}'",
+            f"add task --branch-template {pane_quote(template)}",
             stdin_input=json_line,
         )
 

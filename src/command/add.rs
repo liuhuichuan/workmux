@@ -155,7 +155,52 @@ fn stdin_has_data(stdin: &std::io::Stdin) -> Result<bool> {
     Ok(ready > 0)
 }
 
-#[cfg(not(unix))]
+/// Whether stdin has anything to hand over right now.
+///
+/// POSIX asks `poll` and waits no time at all: data waiting, or the writer
+/// gone, means read. Windows has no `poll` to ask, so it asks the handle what
+/// it is. A pipe holds something to read only when `PeekNamedPipe` says bytes
+/// are waiting in it, and a pipe that is open and silent is the case this
+/// exists for: `workmux add` reading one waits for input nobody is going to
+/// send, and the command never returns. A file, a console, and a handle that
+/// will not answer are left to the read that follows, which ends or answers at
+/// once.
+#[cfg(windows)]
+fn stdin_has_data(stdin: &std::io::Stdin) -> Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFileType;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let handle = stdin.as_raw_handle();
+    let kind = unsafe { GetFileType(handle) };
+    let mut available = 0u32;
+    let peeked = unsafe {
+        PeekNamedPipe(
+            handle,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    Ok(stdin_kind_has_data(kind, peeked, available))
+}
+
+/// The reading of what `GetFileType` answered, and of whether the pipe that
+/// follow-up peek could be asked.
+#[cfg(any(windows, test))]
+fn stdin_kind_has_data(kind: u32, peeked: i32, available: u32) -> bool {
+    #[cfg(windows)]
+    const PIPE: u32 = windows_sys::Win32::Storage::FileSystem::FILE_TYPE_PIPE;
+    // `FILE_TYPE_PIPE` from `winnt.h`, for a build with no header to read.
+    #[cfg(not(windows))]
+    const PIPE: u32 = 0x0003;
+
+    kind != PIPE || peeked == 0 || available > 0
+}
+
+#[cfg(not(any(unix, windows)))]
 fn stdin_has_data(_stdin: &std::io::Stdin) -> Result<bool> {
     Ok(true)
 }
@@ -1449,5 +1494,38 @@ mod agent_validation_tests {
         let mut config = config("workmux-nonexistent-agent-938472");
         config.sandbox.enabled = Some(true);
         assert!(validate_agent_executable(&config).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod stdin_kind_tests {
+    use super::*;
+
+    /// The `FILE_TYPE_*` values from `winnt.h`. The crate's constants are for
+    /// a Windows build; this rule is not, and is worth checking everywhere.
+    const DISK: u32 = 0x0001;
+    const CHAR: u32 = 0x0002;
+    const PIPE: u32 = 0x0003;
+
+    /// A pipe with nothing in it is not ready to be read, which is the whole
+    /// point: a command must not wait for input that may never come.
+    #[test]
+    fn a_silent_pipe_has_nothing_to_read() {
+        assert!(!stdin_kind_has_data(PIPE, 1, 0));
+    }
+
+    #[test]
+    fn a_pipe_with_bytes_waiting_is_read() {
+        assert!(stdin_kind_has_data(PIPE, 1, 42));
+    }
+
+    /// A pipe that will not answer is left to the read, which reports how it
+    /// went; a console and a redirected file both answer the moment they are
+    /// read.
+    #[test]
+    fn everything_else_is_left_to_the_read() {
+        assert!(stdin_kind_has_data(PIPE, 0, 0));
+        assert!(stdin_kind_has_data(DISK, 1, 0));
+        assert!(stdin_kind_has_data(CHAR, 1, 0));
     }
 }

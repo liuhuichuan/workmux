@@ -74,7 +74,9 @@ nix = { version = "0.31.2", features = ["fs", "dir"] }
 # that would replace it was measured at 980 ms, which is a whole pane listing.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Pipes",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
