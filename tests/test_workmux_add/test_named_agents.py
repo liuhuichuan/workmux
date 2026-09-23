@@ -1,26 +1,17 @@
 """Tests for known agent auto-detection and prompt injection."""
 
-import os
-import shlex
 from pathlib import Path
 
 from ..conftest import (
     FakeAgentInstaller,
     MuxEnvironment,
+    ShellCommands,
     get_window_name,
+    pane_quote,
     wait_for_file,
     write_workmux_config,
 )
 from .conftest import add_branch_and_get_worktree
-
-
-def _write_rc_with_fake_path(env: MuxEnvironment, bin_dir: Path) -> None:
-    """Write a shell RC file that prepends the fake agent bin dir to PATH."""
-    shell = os.environ.get("SHELL", "/bin/zsh")
-    rc_filename = ".zshrc" if "zsh" in shell else ".bashrc"
-    rc_path = env.home_path / rc_filename
-    rc_path.parent.mkdir(parents=True, exist_ok=True)
-    rc_path.write_text(f'export PATH="{bin_dir}:$PATH"\n')
 
 
 class TestKnownAgentAutoDetection:
@@ -32,12 +23,18 @@ class TestKnownAgentAutoDetection:
         workmux_exe_path: Path,
         mux_repo_path: Path,
         fake_agent_installer: FakeAgentInstaller,
+        shell_cmd: ShellCommands,
     ):
         """A literal 'claude' command should auto-detect and inject the prompt."""
         env = mux_server
         branch_name = "feature-auto-detect-claude"
         window_name = get_window_name(branch_name)
         prompt_text = "auto detected prompt"
+
+        # Each test's own home already carries a startup file for this shell
+        # that puts the fake bin directory on PATH. A pane reads it only if it
+        # runs that shell, and on Windows the host's own default is not one.
+        env.configure_default_shell(shell_cmd.path)
 
         fake_agent_installer.install(
             "claude",
@@ -46,9 +43,6 @@ set -e
 printf '%s' "$2" > claude_received.txt
 """,
         )
-
-        # Write RC file so new panes find the fake agent on PATH
-        _write_rc_with_fake_path(env, fake_agent_installer.bin_dir)
 
         # Use literal "claude" in panes -- no <agent:> placeholder, no global agent
         write_workmux_config(
@@ -61,7 +55,7 @@ printf '%s' "$2" > claude_received.txt
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt {shlex.quote(prompt_text)}",
+            extra_args=f"--prompt {pane_quote(prompt_text)}",
         )
 
         agent_output = worktree_path / "claude_received.txt"
@@ -80,12 +74,15 @@ printf '%s' "$2" > claude_received.txt
         workmux_exe_path: Path,
         mux_repo_path: Path,
         fake_agent_installer: FakeAgentInstaller,
+        shell_cmd: ShellCommands,
     ):
         """A literal 'omp' command should auto-detect and inject the prompt."""
         env = mux_server
         branch_name = "feature-auto-detect-omp"
         window_name = get_window_name(branch_name)
         prompt_text = "auto detected omp prompt"
+
+        env.configure_default_shell(shell_cmd.path)
 
         fake_agent_installer.install(
             "omp",
@@ -94,8 +91,6 @@ set -e
 printf '%s' "$1" > omp_received.txt
 """,
         )
-
-        _write_rc_with_fake_path(env, fake_agent_installer.bin_dir)
 
         write_workmux_config(
             mux_repo_path,
@@ -107,7 +102,7 @@ printf '%s' "$1" > omp_received.txt
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt {shlex.quote(prompt_text)}",
+            extra_args=f"--prompt {pane_quote(prompt_text)}",
         )
 
         agent_output = worktree_path / "omp_received.txt"
@@ -126,12 +121,15 @@ printf '%s' "$1" > omp_received.txt
         workmux_exe_path: Path,
         mux_repo_path: Path,
         fake_agent_installer: FakeAgentInstaller,
+        shell_cmd: ShellCommands,
     ):
         """Two literal agent commands should each receive the prompt with their own profile."""
         env = mux_server
         branch_name = "feature-two-auto-detected"
         window_name = get_window_name(branch_name)
         prompt_text = "implement the feature"
+
+        env.configure_default_shell(shell_cmd.path)
 
         # Claude profile: receives -- "$prompt"
         fake_agent_installer.install(
@@ -155,9 +153,6 @@ printf '%s' "$2" > gemini_received.txt
 """,
         )
 
-        # Write RC file so new panes find the fake agents on PATH
-        _write_rc_with_fake_path(env, fake_agent_installer.bin_dir)
-
         write_workmux_config(
             mux_repo_path,
             panes=[
@@ -171,7 +166,7 @@ printf '%s' "$2" > gemini_received.txt
             workmux_exe_path,
             mux_repo_path,
             branch_name,
-            extra_args=f"--prompt {shlex.quote(prompt_text)}",
+            extra_args=f"--prompt {pane_quote(prompt_text)}",
         )
 
         claude_output = worktree_path / "claude_received.txt"
