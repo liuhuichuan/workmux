@@ -9,12 +9,13 @@ are already tested in test_workmux_send/capture/wait.
 
 import json
 import re
-import shlex
 from pathlib import Path
 
 from .conftest import (
+    IS_WINDOWS,
     MuxEnvironment,
     WorkmuxCommandResult,
+    create_file_command,
     get_window_name,
     poll_until,
     run_workmux_add,
@@ -36,6 +37,21 @@ def extract_artifacts_path(stderr: str) -> Path:
     m = re.search(r"Artifacts(?:\s+kept\s+at)?:\s*(.+)", stderr)
     assert m, f"Could not find artifacts path in stderr:\n{stderr}"
     return Path(m.group(1).strip())
+
+
+def install_command(env: MuxEnvironment, name: str, body: str) -> str:
+    """A program for `workmux run` to start, and the word that starts it.
+
+    `_exec` hands the recorded command to the platform's shell in a pane of
+    its own, so the test's PATH is not there to find a bare name, and Windows
+    starts an image rather than a shebang. The word is therefore a path -- the
+    `.cmd` standing beside the POSIX entry point when the shell is cmd.exe --
+    which workmux quotes for the shell that will read it.
+    """
+    path = env.install_script(env.fake_bin_dir / name, f"#!/bin/sh\n{body}\n")
+    if IS_WINDOWS:
+        path = path.with_name(path.name + ".cmd")
+    return str(path)
 
 
 def setup_worktree_with_agent(
@@ -61,7 +77,7 @@ def setup_worktree_with_agent(
     # still be finishing set-window-status output. Touch a marker file so we
     # can poll for prompt readiness without a fixed sleep.
     marker = env.tmp_path / f"ready-{branch_name}"
-    env.send_keys(window_name, f"touch {shlex.quote(str(marker))}")
+    env.send_keys(window_name, create_file_command(marker))
     assert poll_until(lambda: marker.exists(), timeout=3.0), (
         "Shell did not return to prompt after set-window-status"
     )
@@ -96,11 +112,12 @@ def test_run_streams_stdout_and_stderr(
     env = mux_server
     setup_worktree_with_agent(env, workmux_exe_path, mux_repo_path, "feature-run-io")
 
+    command = install_command(env, "run-io", "echo OUT_MARKER\necho ERR_MARKER >&2")
     result = run_workmux_run(
         env,
         workmux_exe_path,
         mux_repo_path,
-        "run feature-run-io -- sh -c 'echo OUT_MARKER; echo ERR_MARKER >&2'",
+        f"run feature-run-io -- {command}",
     )
     assert result.exit_code == 0
     assert "OUT_MARKER" in result.stdout
@@ -114,11 +131,12 @@ def test_run_nonzero_exit_code_propagates(
     env = mux_server
     setup_worktree_with_agent(env, workmux_exe_path, mux_repo_path, "feature-run-exit")
 
+    command = install_command(env, "run-exit", "exit 42")
     result = run_workmux_run(
         env,
         workmux_exe_path,
         mux_repo_path,
-        "run feature-run-exit -- sh -c 'exit 42'",
+        f"run feature-run-exit -- {command}",
         expect_fail=True,
     )
     assert result.exit_code == 42
@@ -131,11 +149,12 @@ def test_run_keep_preserves_artifacts(
     env = mux_server
     setup_worktree_with_agent(env, workmux_exe_path, mux_repo_path, "feature-run-keep")
 
+    command = install_command(env, "run-keep", "echo KEPT_OUTPUT")
     result = run_workmux_run(
         env,
         workmux_exe_path,
         mux_repo_path,
-        "run feature-run-keep --keep -- echo KEPT_OUTPUT",
+        f"run feature-run-keep --keep -- {command}",
     )
     assert result.exit_code == 0
 
@@ -144,7 +163,7 @@ def test_run_keep_preserves_artifacts(
 
     # Verify spec.json
     spec = json.loads((run_dir / "spec.json").read_text())
-    assert "echo" in spec["command"]
+    assert command in spec["command"]
     assert "worktree_path" in spec
 
     # Verify result.json
@@ -163,11 +182,12 @@ def test_run_timeout_exits_124(
     env = mux_server
     setup_worktree_with_agent(env, workmux_exe_path, mux_repo_path, "feature-run-to")
 
+    command = install_command(env, "run-sleep", "sleep 30")
     result = run_workmux_run(
         env,
         workmux_exe_path,
         mux_repo_path,
-        "run feature-run-to --timeout 1 -- sleep 30",
+        f"run feature-run-to --timeout 1 -- {command}",
         expect_fail=True,
     )
     assert result.exit_code == 124
