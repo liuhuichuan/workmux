@@ -33,6 +33,7 @@ The command downloads prebuilt binaries for:
 
 - macOS (Apple Silicon / Intel)
 - Linux (x86_64 / ARM64)
+- Windows (x86_64)
 
 ## Automatic update check
 
@@ -57,3 +58,6 @@ To disable the automatic update check, either:
 - `tar` must be available in PATH (used for extraction)
 - `sha256sum` or `shasum` must be available (used for checksum verification)
 - Write permission to the directory containing the workmux binary
+
+On Windows these are the `curl`, `tar`, and `certutil` the system itself
+provides, so there is nothing to install.
