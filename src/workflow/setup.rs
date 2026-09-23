@@ -25,6 +25,20 @@ pub struct ProvisionedEnvironment {
     pub post_create_hooks_run: usize,
 }
 
+/// An absolute path for a hook's environment, in this machine's own spelling.
+///
+/// A hook is handed these where a path goes -- a Git command, a file another
+/// program opens -- so they have to be written the way the rest of this
+/// machine writes a path. `canonicalize` answers in the extended-length form
+/// on Windows (`\\?\C:\repo`), which several tools refuse, and which no other
+/// line of workmux's output shows: a hook asked to log its worktree cannot
+/// match the path `workmux list` prints for it.
+fn hook_path(path: &Path) -> String {
+    crate::util::git_path(&crate::util::canon_or_self(path))
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub fn provision_environment(
     branch_name: &str,
     handle: &str,
@@ -54,24 +68,15 @@ pub fn provision_environment(
         && !post_create.is_empty()
     {
         hooks_run = post_create.len();
-        let abs_worktree_path = worktree_path
-            .canonicalize()
-            .unwrap_or_else(|_| worktree_path.to_path_buf());
-        let abs_project_root = project_root
-            .canonicalize()
-            .unwrap_or_else(|_| project_root.to_path_buf());
-        let abs_config_dir = effective_working_dir
-            .canonicalize()
-            .unwrap_or_else(|_| effective_working_dir.to_path_buf());
-        let worktree_path_str = abs_worktree_path.to_string_lossy();
-        let project_root_str = abs_project_root.to_string_lossy();
-        let config_dir_str = abs_config_dir.to_string_lossy();
+        let worktree_path_str = hook_path(worktree_path);
+        let project_root_str = hook_path(project_root);
+        let config_dir_str = hook_path(effective_working_dir);
         let hook_env = [
             ("WORKMUX_HANDLE", handle),
             ("WM_HANDLE", handle),
-            ("WM_WORKTREE_PATH", worktree_path_str.as_ref()),
-            ("WM_PROJECT_ROOT", project_root_str.as_ref()),
-            ("WM_CONFIG_DIR", config_dir_str.as_ref()),
+            ("WM_WORKTREE_PATH", worktree_path_str.as_str()),
+            ("WM_PROJECT_ROOT", project_root_str.as_str()),
+            ("WM_CONFIG_DIR", config_dir_str.as_str()),
         ];
         for (idx, command) in post_create.iter().enumerate() {
             info!(branch = branch_name, step = idx + 1, total = hooks_run, command = %command, "provision_environment:hook start");

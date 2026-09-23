@@ -322,9 +322,10 @@ pub fn canon_or_self(p: &Path) -> PathBuf {
 /// but Git rejects those both in environment overrides such as `GIT_DIR` and
 /// when they are passed as arguments such as `git worktree add <path>`.
 ///
-/// It is also the spelling to compare paths in, for the same reason: a
-/// resolved path and a plain one name the same place and share no component,
-/// so a walk from one to the other comes out absolute.
+/// The same spelling is what every other reader of a path wants: a path
+/// compared against another (a resolved one and a plain one name the same
+/// place and share no component, so a walk from one to the other comes out
+/// absolute), and a path handed to a hook or a program that opens it.
 pub fn git_path(path: &Path) -> Cow<'_, OsStr> {
     #[cfg(windows)]
     if let Some(stripped) = strip_verbatim_prefix(path) {

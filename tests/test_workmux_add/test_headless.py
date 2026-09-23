@@ -2,7 +2,6 @@
 
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -11,7 +10,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from ..conftest import MuxEnvironment, write_workmux_config
+from ..conftest import (
+    IS_WINDOWS,
+    MuxEnvironment,
+    create_file_command,
+    pane_quote,
+    write_workmux_config,
+)
 
 
 def run_headless(
@@ -33,6 +38,18 @@ def run_headless(
     )
 
 
+def failing_hook(marker: str, code: int) -> str:
+    """A post-create hook that says `marker` and ends with a failing status.
+
+    `exit 7` is one shell's way of ending a command with a status; cmd.exe
+    wants `exit /b 7`, and a `;` between two commands is not its separator
+    either, so a hook that says both fails on one of the two hosts.
+    """
+    if IS_WINDOWS:
+        return f"echo {marker} & exit /b {code}"
+    return f"echo {marker}; exit {code}"
+
+
 def test_headless_add_emits_json_and_creates_no_mux_target(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
@@ -44,7 +61,7 @@ def test_headless_add_emits_json_and_creates_no_mux_target(
     write_workmux_config(
         mux_repo_path,
         files={"copy": [source.name]},
-        post_create=["echo hook-output; touch hook-ran"],
+        post_create=["echo hook-output", create_file_command("hook-ran")],
     )
     windows_before = mux_server.list_windows()
 
@@ -97,12 +114,33 @@ def test_headless_config_outside_repo_uses_git_project_root(
     source_name = "config-source.txt"
     (external_dir / source_name).write_text("external config source\n")
     (mux_repo_path / source_name).write_text("project source\n")
-    hook = (
-        "printf '%s\\n%s\\n%s\\n%s\\n' "
-        '"$WM_PROJECT_ROOT" "$WM_CONFIG_DIR" "$WM_WORKTREE_PATH" "$PWD" '
-        f"> {shlex.quote(str(hook_env_path))}; "
-        'git -C "$WM_PROJECT_ROOT" rev-parse --show-toplevel '
-        f"> {shlex.quote(str(git_root_path))}"
+    # The hook reports four values and the project root Git answers with, and
+    # it runs in whatever shell this host runs hooks in -- cmd.exe on Windows,
+    # where `$VAR` and `printf` name nothing at all. Both readings are plain
+    # work, so the hook is written once, in the language both hosts read.
+    hook_writer = external_dir / "hook-writer.py"
+    hook_writer.write_text(
+        "import os\n"
+        "import subprocess\n"
+        "import sys\n"
+        "\n"
+        "names = ['WM_PROJECT_ROOT', 'WM_CONFIG_DIR', 'WM_WORKTREE_PATH']\n"
+        "values = [os.environ[name] for name in names] + [os.getcwd()]\n"
+        "with open(sys.argv[1], 'w', encoding='utf-8') as handle:\n"
+        "    handle.write('\\n'.join(values) + '\\n')\n"
+        "root = subprocess.run(\n"
+        "    ['git', '-C', os.environ['WM_PROJECT_ROOT'], 'rev-parse',"
+        " '--show-toplevel'],\n"
+        "    capture_output=True,\n"
+        "    text=True,\n"
+        "    check=True,\n"
+        ").stdout\n"
+        "with open(sys.argv[2], 'w', encoding='utf-8') as handle:\n"
+        "    handle.write(root)\n"
+    )
+    hook = " ".join(
+        pane_quote(part)
+        for part in [sys.executable, hook_writer, hook_env_path, git_root_path]
     )
     config_path.write_text(
         yaml.safe_dump(
@@ -144,7 +182,7 @@ def test_headless_add_rolls_back_failed_provisioning(
     mux_repo_path: Path,
 ):
     branch = "suba-failed-a1b2c3d4"
-    write_workmux_config(mux_repo_path, post_create=["echo failed-hook; exit 7"])
+    write_workmux_config(mux_repo_path, post_create=[failing_hook("failed-hook", 7)])
 
     result = run_headless(
         mux_server,
@@ -233,7 +271,6 @@ def test_headless_rename_restores_attachment_when_move_fails(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
     mux_repo_path: Path,
-    tmp_path: Path,
 ):
     branch = "suba-rename-failure-a1b2c3d4"
     renamed = "suba-rename-failure-new-a1b2c3d4"
@@ -250,27 +287,16 @@ def test_headless_rename_restores_attachment_when_move_fails(
     assert result.returncode == 0, result.stderr
     receipt = json.loads(result.stdout)
 
-    real_git = shutil.which("git")
-    assert real_git is not None
-    wrapper_dir = tmp_path / "bin"
-    wrapper_dir.mkdir()
-    wrapper = wrapper_dir / "git"
-    wrapper.write_text(
-        f"""#!{sys.executable}
-import os
-import sys
-
-for index in range(len(sys.argv)):
-    if sys.argv[index : index + 2] == ["worktree", "move"]:
-        print("forced worktree move failure", file=sys.stderr)
-        raise SystemExit(1)
-os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
-"""
+    # A locked worktree is one Git itself refuses to move, and Git says so the
+    # same way on every host. Shadowing `git` with a script cannot stand in for
+    # it: Windows starts an image rather than reading a shebang, so the `git`
+    # on PATH is not the one that runs.
+    worktree_path = receipt["worktree_path"]
+    mux_server.run_command(
+        ["git", "worktree", "lock", str(worktree_path)], cwd=mux_repo_path
     )
-    wrapper.chmod(0o755)
 
     process_env = mux_server.env.copy()
-    process_env["PATH"] = f"{wrapper_dir}{os.pathsep}{process_env['PATH']}"
     process_env.pop("TMUX", None)
     process_env.pop("TMUX_PANE", None)
     failed = subprocess.run(
@@ -281,9 +307,14 @@ os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
         text=True,
         check=False,
     )
+    mux_server.run_command(
+        ["git", "worktree", "unlock", str(worktree_path)],
+        cwd=mux_repo_path,
+        check=False,
+    )
 
     assert failed.returncode != 0
-    assert "forced worktree move failure" in failed.stderr
+    assert "cannot move a locked working tree" in failed.stderr
     assert Path(receipt["worktree_path"]).exists()
     old_attachment = mux_server.run_command(
         [
@@ -329,7 +360,7 @@ def test_headless_remove_does_not_close_same_named_window(
     assert result.returncode == 0, result.stderr
 
     same_name = f"wm-{branch}"
-    mux_server.mux_command(["new-window", "-d", "-n", same_name])
+    mux_server.new_window(same_name)
     mux_server.run_command(
         [
             "git",

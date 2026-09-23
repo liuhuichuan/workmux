@@ -104,15 +104,25 @@ pub fn snippet_argv(script: &str) -> Vec<String> {
 /// `cmd.exe` re-parses its own command line, so its snippet has to arrive
 /// verbatim: the C runtime quoting `Command::arg` applies would escape the
 /// quotes in e.g. `echo hi > "C:\dir\file"` and cmd would treat the backslashes
-/// as part of the file name. Every other interpreter takes its snippet through
-/// standard argument quoting.
+/// as part of the file name.
+///
+/// Verbatim is not enough on its own, because cmd.exe also reads the line
+/// after `/C` with a quoting rule of its own: a line that opens with a quote
+/// and carries more than two of them loses its first and its last, so
+/// `"C:\Program Files\tool.exe" one two` arrives as
+/// `C:\Program Files\tool.exe" one two` and cmd answers "The filename,
+/// directory name, or volume label syntax is incorrect." One pair of quotes
+/// around the whole snippet is the form cmd strips back to what was written:
+/// it is the first and last character, so the snippet's own words survive.
+/// Every other interpreter takes its snippet through standard argument
+/// quoting.
 pub fn append_snippet(command: &mut Command, shell: &str, script: &str) {
     #[cfg(not(windows))]
     let _ = shell;
     #[cfg(windows)]
     if dialect_of(shell) == ShellDialect::Cmd {
         use std::os::windows::process::CommandExt;
-        command.raw_arg(script);
+        command.raw_arg(format!("\"{script}\""));
         return;
     }
     command.arg(script);
@@ -437,6 +447,25 @@ mod tests {
             std::fs::read_to_string(&output).unwrap().trim(),
             "compatible"
         );
+    }
+
+    /// A snippet that opens with a quoted program name is the one cmd.exe
+    /// mangles: more than two quotes and a leading quote make it drop the
+    /// first and the last, which cuts the program name in half.
+    #[cfg(windows)]
+    #[test]
+    fn append_snippet_keeps_a_quoted_program_name_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("ran.txt");
+        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        let script = format!("\"{comspec}\" /C echo ran > \"{}\"", output.display());
+
+        let mut command = Command::new("cmd.exe");
+        command.args(["/C"]);
+        append_snippet(&mut command, "cmd.exe", &script);
+
+        assert!(command.status().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&output).unwrap().trim(), "ran");
     }
 
     #[test]
