@@ -37,10 +37,7 @@ pub fn resolve_file_operations(
         ),
     ] {
         for pattern in patterns {
-            let full_pattern = repo_root.join(pattern).to_string_lossy().to_string();
-            for entry in glob::glob(&full_pattern)? {
-                let source = entry?;
-                validate_path_within_repo(&source, repo_root, label, pattern)?;
+            for source in sources_named_by(repo_root, pattern, label)? {
                 let relative = source.strip_prefix(repo_root)?;
                 operations.push(FileOperation {
                     destination: worktree_path.join(relative),
@@ -51,6 +48,39 @@ pub fn resolve_file_operations(
         }
     }
     Ok(operations)
+}
+
+/// The paths a `files` pattern names, or the reason the pattern is refused.
+///
+/// A pattern that names a parent directory is refused here, before the
+/// filesystem is asked anything. `symlink: ["link_to_elsewhere/../secret"]`
+/// reaches outside the repository through the symlink's parent, so the `..`
+/// is the request to leave and is refused whether or not a file matches it.
+/// Asking glob first would make the refusal depend on how the host spells the
+/// repository root: a resolved Windows root (`\\?\C:\repo`) is not read the
+/// way a plain one is, and glob hands back `repo\secret.txt` -- a path inside
+/// the repository -- for a pattern that asks to leave it, so a pattern refused
+/// on one host would be allowed on another.
+fn sources_named_by(repo_root: &Path, pattern: &str, op: &str) -> Result<Vec<PathBuf>> {
+    if Path::new(pattern)
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "Path traversal detected for {} pattern '{}'. The pattern contains '..' components.",
+            op,
+            pattern
+        ));
+    }
+
+    let full_pattern = repo_root.join(pattern).to_string_lossy().to_string();
+    let mut sources = Vec::new();
+    for entry in glob::glob(&full_pattern)? {
+        let source = entry?;
+        validate_path_within_repo(&source, repo_root, op, pattern)?;
+        sources.push(source);
+    }
+    Ok(sources)
 }
 
 /// Performs copy and symlink operations from the repo root to the worktree
@@ -73,12 +103,7 @@ pub fn handle_file_operations(
     // Handle copies
     if let Some(copy_patterns) = &file_config.copy {
         for pattern in copy_patterns {
-            let full_pattern = repo_root.join(pattern).to_string_lossy().to_string();
-            for entry in glob::glob(&full_pattern)? {
-                let source_path = entry?;
-
-                validate_path_within_repo(&source_path, repo_root, "copy", pattern)?;
-
+            for source_path in sources_named_by(repo_root, pattern, "copy")? {
                 let relative_path = source_path.strip_prefix(repo_root)?;
                 let dest_path = worktree_path.join(relative_path);
 
@@ -109,12 +134,7 @@ pub fn handle_file_operations(
     // Handle symlinks
     if let Some(symlink_patterns) = &file_config.symlink {
         for pattern in symlink_patterns {
-            let full_pattern = repo_root.join(pattern).to_string_lossy().to_string();
-            for entry in glob::glob(&full_pattern)? {
-                let source_path = entry?;
-
-                validate_path_within_repo(&source_path, repo_root, "symlink", pattern)?;
-
+            for source_path in sources_named_by(repo_root, pattern, "symlink")? {
                 let relative_path = source_path.strip_prefix(repo_root)?;
                 let dest_path = worktree_path.join(relative_path);
 
@@ -132,7 +152,7 @@ pub fn handle_file_operations(
                     )
                 })?;
 
-                let relative_source = pathdiff::diff_paths(&source_path, dest_parent)
+                let relative_source = relative_to(&source_path, dest_parent)
                     .ok_or_else(|| anyhow!("Could not create relative path for symlink"))?;
 
                 // Remove existing file/symlink at destination to avoid errors
@@ -205,7 +225,7 @@ pub fn symlink_claude_local_md(repo_root: &Path, worktree_path: &Path) -> Result
         return Ok(());
     }
 
-    let relative_source = pathdiff::diff_paths(&source, worktree_path)
+    let relative_source = relative_to(&source, worktree_path)
         .ok_or_else(|| anyhow!("Could not create relative path for CLAUDE.local.md symlink"))?;
 
     #[cfg(unix)]
@@ -218,6 +238,20 @@ pub fn symlink_claude_local_md(repo_root: &Path, worktree_path: &Path) -> Result
 
     info!("Symlinked CLAUDE.local.md to worktree");
     Ok(())
+}
+
+/// How to walk from `base` to `target`, with both ends in the spelling this
+/// machine reads.
+///
+/// The two ends arrive spelled differently. The repository root went through
+/// `canonicalize`, which on Windows spells a path `\\?\C:\repo`, while the
+/// worktree path is the one Git was given. Two spellings of one place share no
+/// components, and a diff that finds no shared component answers with the
+/// absolute path -- so a symlink meant to hold a relative target is left
+/// holding an absolute one. `util::git_path` is the machine's own spelling;
+/// on a host with no extended-length form it is a no-op.
+fn relative_to(target: &Path, base: &Path) -> Option<PathBuf> {
+    pathdiff::diff_paths(crate::util::git_path(target), crate::util::git_path(base))
 }
 
 fn validate_path_within_repo(
@@ -290,4 +324,61 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod file_op_path_tests {
+    use super::*;
+
+    /// A pattern that names a parent directory is the request to leave the
+    /// repository, and the refusal cannot wait for a match to hang it on.
+    #[test]
+    fn a_pattern_that_names_a_parent_directory_is_refused() {
+        let root = std::env::temp_dir();
+
+        for pattern in [
+            "../sensitive_file",
+            "external_link/../secret.txt",
+            "nested/../../outside",
+        ] {
+            let error = sources_named_by(&root, pattern, "symlink")
+                .expect_err("a pattern naming a parent directory is refused");
+            let text = error.to_string();
+            assert!(text.contains("Path traversal"), "{text}");
+            assert!(text.contains("'..' components"), "{text}");
+        }
+    }
+
+    /// The refusal is about `..` and nothing else: a pattern that names no
+    /// parent directory is handed to the filesystem, and one that matches
+    /// nothing is not an error.
+    #[test]
+    fn a_pattern_without_a_parent_directory_is_left_to_the_filesystem() {
+        let root = std::env::temp_dir().join("workmux_absent_root");
+
+        assert_eq!(
+            sources_named_by(&root, "cache/nothing-here", "copy").unwrap(),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    /// The same place, spelled the two ways this host spells it: resolved, as
+    /// `canonicalize` writes it, and plain, as Git writes it. A walk from one
+    /// to the other is a relative path, not the absolute one a diff that
+    /// found no shared component answers with.
+    #[test]
+    #[cfg(windows)]
+    fn two_spellings_of_one_place_still_walk() {
+        let expected = Path::new("..").join("..").join("project").join("plain.txt");
+        let plain_base = Path::new(r"C:\project__worktrees\feature");
+        let resolved_base = Path::new(r"\\?\C:\project__worktrees\feature");
+
+        for source in [
+            Path::new(r"C:\project\plain.txt"),
+            Path::new(r"\\?\C:\project\plain.txt"),
+        ] {
+            assert_eq!(relative_to(source, plain_base), Some(expected.clone()));
+            assert_eq!(relative_to(source, resolved_base), Some(expected.clone()));
+        }
+    }
 }

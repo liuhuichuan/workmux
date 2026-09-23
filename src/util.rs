@@ -321,6 +321,10 @@ pub fn canon_or_self(p: &Path) -> PathBuf {
 /// `std::fs::canonicalize` returns extended-length (`\\?\`) paths on Windows,
 /// but Git rejects those both in environment overrides such as `GIT_DIR` and
 /// when they are passed as arguments such as `git worktree add <path>`.
+///
+/// It is also the spelling to compare paths in, for the same reason: a
+/// resolved path and a plain one name the same place and share no component,
+/// so a walk from one to the other comes out absolute.
 pub fn git_path(path: &Path) -> Cow<'_, OsStr> {
     #[cfg(windows)]
     if let Some(stripped) = strip_verbatim_prefix(path) {
