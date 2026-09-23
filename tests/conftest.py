@@ -26,6 +26,17 @@ from .support.executable import SCRIPT_RUNNER, install_script
 # Shell names to test - paths are discovered dynamically via shutil.which()
 SHELL_NAMES = ["bash", "zsh", "fish", "nu"]
 
+# How long a shell is given to answer the probe below.
+SHELL_PROBE_SECS = 20
+
+# A Git for Windows install keeps the POSIX shells in its own `bin`, which the
+# installer leaves off PATH.
+WINDOWS_SHELL_DIRS = (
+    r"C:\Program Files\Git\bin",
+    r"C:\Program Files (x86)\Git\bin",
+    r"%LOCALAPPDATA%\Programs\Git\bin",
+)
+
 
 @dataclass
 class ShellCommands:
@@ -35,8 +46,12 @@ class ShellCommands:
 
     @property
     def name(self) -> str:
-        """Return shell name (e.g., 'zsh', 'bash', 'fish', 'nu')."""
-        return Path(self.path).name
+        """Return shell name (e.g., 'zsh', 'bash', 'fish', 'nu').
+
+        The extension is dropped because a Windows install spells the
+        interpreter `bash.EXE`, and this name keys the tables below.
+        """
+        return Path(self.path).stem.lower()
 
     @property
     def rc_filename(self) -> str:
@@ -111,6 +126,62 @@ class ShellCommands:
                 return f"echo '{text}' >> {file_path}"
 
 
+def _candidate_shell_paths(name: str) -> list[str]:
+    """Every path that could be the shell `name`, in the order to try them."""
+    if os.name != "nt":
+        path = shutil.which(name)
+        return [path] if path else []
+
+    directories = [
+        entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry
+    ]
+    directories += [
+        os.path.expandvars(directory)
+        for directory in WINDOWS_SHELL_DIRS
+        if os.path.isdir(os.path.expandvars(directory))
+    ]
+
+    paths = []
+    for directory in directories:
+        for suffix in (".com", ".exe", ".bat", ".cmd"):
+            path = os.path.join(directory, name + suffix)
+            if os.path.isfile(path):
+                paths.append(path)
+                break
+    return paths
+
+
+def _shell_runs(path: str) -> bool:
+    """Whether the interpreter at `path` can run a command of its own.
+
+    `shutil.which` hands back whatever the name resolves to, and on Windows
+    that can be a Microsoft Store app-alias stub in `WindowsApps` whose target
+    subsystem is not installed. Such a stub starts, reports its own failure and
+    exits, so a pane that runs it dies before the test can look at it: the test
+    sees a shell that was never there. A shell the tests cannot run is not one
+    they can test, so only a shell that answers a probe is offered to them.
+    """
+    try:
+        result = subprocess.run(
+            [path, "-c", "exit 0"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=SHELL_PROBE_SECS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def find_runnable_shell(name: str) -> str | None:
+    """The first shell named `name` on this machine that runs, if any."""
+    for path in _candidate_shell_paths(name):
+        if _shell_runs(path):
+            return path
+    return None
+
+
 def get_shells_to_test() -> list[str]:
     """Return list of shell paths to test based on environment variables.
 
@@ -118,18 +189,20 @@ def get_shells_to_test() -> list[str]:
         TEST_SHELL: Test a specific shell only (e.g., "fish", "nu", "bash", "zsh")
 
     By default, tests run against all installed shells (bash, zsh, fish, nu).
-    Uses shutil.which() to discover actual shell paths rather than hardcoding,
-    ensuring portability across different systems (Linux, macOS, Homebrew, etc.).
+    Discovered paths are probed rather than taken on trust, so a name that
+    resolves to something which cannot run is passed over in favour of the next
+    candidate: on Windows `bash` is otherwise the Store stub, and the shell the
+    tests want is the one a Git for Windows install ships.
     """
     # Test a specific shell
     if specific_shell := os.environ.get("TEST_SHELL"):
-        path = shutil.which(specific_shell)
+        path = find_runnable_shell(specific_shell)
         if path:
             return [path]
-        raise ValueError(f"Shell '{specific_shell}' not found")
+        raise ValueError(f"Shell '{specific_shell}' not found, or does not run")
 
     # Default: test all installed shells
-    shells = [p for p in (shutil.which(name) for name in SHELL_NAMES) if p]
+    shells = [p for p in (find_runnable_shell(name) for name in SHELL_NAMES) if p]
     return shells if shells else ["/bin/sh"]
 
 
@@ -1202,7 +1275,7 @@ def mux_server(request, tmp_path: Path) -> Generator[MuxEnvironment, None, None]
         shutil.rmtree(test_env._scripts_dir, ignore_errors=True)
 
 
-@pytest.fixture(params=get_shells_to_test(), ids=lambda s: Path(s).name)
+@pytest.fixture(params=get_shells_to_test(), ids=lambda s: Path(s).stem.lower())
 def shell_cmd(request) -> ShellCommands:
     """
     Fixture providing shell-specific command helpers.

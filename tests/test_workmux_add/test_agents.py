@@ -319,9 +319,14 @@ printf '%s' "$2" > "{agent_output}"
         workmux_exe_path: Path,
         mux_repo_path: Path,
         fake_agent_installer: FakeAgentInstaller,
+        shell_cmd: ShellCommands,
     ):
         """Named wrapper agents with type: claude should allow prompt injection into Claude panes."""
         env = mux_server
+        # The pane runs the wrapper by name, and a name is found on the PATH the
+        # pane's shell builds for itself: only a shell with a startup file the
+        # harness writes reads the directory the doubles are installed in.
+        env.configure_default_shell(shell_cmd.path)
         branch_name = "feature-typed-wrapper-pane"
         window_name = get_window_name(branch_name)
         prompt_text = "Use the typed wrapper pane"
