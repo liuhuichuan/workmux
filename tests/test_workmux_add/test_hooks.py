@@ -146,5 +146,8 @@ class TestShellRcFiles:
             env,
             window_name,
             alias_output,
-            timeout=5.0,  # Increased for slower shells like nushell
+            # A shell has to start and read its rc file before the alias can
+            # answer. On a loaded machine that is slow enough for the pane to
+            # still be empty well past five seconds.
+            timeout=15.0,
         )
