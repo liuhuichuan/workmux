@@ -15,6 +15,39 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use tracing::debug;
 
+/// What the user has to be told about how a host-exec command will run, or
+/// `None` when it runs under the OS sandbox with no caveat.
+///
+/// A command that runs without its filesystem isolation is a decision the user
+/// has to be able to see, and the guest reads its own stderr while it never
+/// reads this host's log. The caller sends this to whoever asked for the
+/// command, so the news arrives where the command's output does.
+pub fn sandbox_warning(allow_unsandboxed: bool) -> Option<String> {
+    if allow_unsandboxed {
+        return Some(
+            "workmux: dangerously_allow_unsandboxed_host_exec is set; \
+             host-exec is running unsandboxed"
+                .to_string(),
+        );
+    }
+    sandbox_unsupported_reason().map(str::to_string)
+}
+
+/// Why host-exec cannot be sandboxed on this OS, or `None` where it can.
+///
+/// A platform without one of the sandboxes named below has nothing to put the
+/// command under, so the command still runs -- only without isolation.
+pub const fn sandbox_unsupported_reason() -> Option<&'static str> {
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        None
+    } else {
+        Some(
+            "workmux: host-exec sandboxing is not supported on this OS; \
+             host-exec is running unsandboxed",
+        )
+    }
+}
+
 /// Directories under $HOME that are denied read access.
 /// These contain credentials, keys, and other secrets.
 const DENY_READ_DIRS: &[&str] = &[
@@ -429,6 +462,34 @@ fn spawn_bwrap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host that cannot sandbox a host-exec command has to say so: a command
+    /// running without its filesystem isolation is the user's news to have.
+    #[test]
+    fn unsupported_platform_reports_why_it_runs_unsandboxed() {
+        let reason = sandbox_unsupported_reason();
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert_eq!(reason, None);
+        } else {
+            assert!(reason.unwrap().contains("running unsandboxed"));
+        }
+    }
+
+    /// The opt-out is the user's own setting, so a warning for it says which
+    /// setting to remove; a platform that cannot sandbox is not a setting.
+    #[test]
+    fn warning_names_the_setting_that_skipped_the_sandbox() {
+        let warning = sandbox_warning(true).unwrap();
+        assert!(
+            warning.contains("dangerously_allow_unsandboxed_host_exec"),
+            "got: {warning}"
+        );
+
+        assert_eq!(
+            sandbox_warning(false),
+            sandbox_unsupported_reason().map(str::to_string)
+        );
+    }
 
     #[test]
     fn test_deny_read_dirs_are_valid() {

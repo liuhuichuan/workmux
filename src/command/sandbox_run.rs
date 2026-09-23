@@ -112,6 +112,7 @@ fn start_rpc(
         allowed_commands,
         detected_toolchain,
         allow_unsandboxed_host_exec,
+        sandbox_warning_sent: std::sync::atomic::AtomicBool::new(false),
     });
 
     Ok((rpc_server, rpc_port, rpc_token, ctx))

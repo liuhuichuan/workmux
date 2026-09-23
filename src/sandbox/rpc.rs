@@ -96,6 +96,12 @@ pub struct RpcContext {
     pub detected_toolchain: crate::sandbox::toolchain::DetectedToolchain,
     /// Whether to allow host-exec without bwrap on Linux.
     pub allow_unsandboxed_host_exec: bool,
+    /// Whether the reason host-exec runs without its sandbox has been told.
+    ///
+    /// A guest runs many host-exec commands in a session and the reason never
+    /// changes, so the guest is told once, before the first command's output,
+    /// rather than over and over into every command's stderr.
+    pub sandbox_warning_sent: std::sync::atomic::AtomicBool,
 }
 
 /// TCP RPC server that accepts guest connections.
@@ -898,6 +904,23 @@ fn handle_exec(
         (command.to_string(), args.to_vec())
     };
 
+    // The guest reads its own stderr; it never reads this host's log, and a
+    // command that runs without its filesystem isolation is the user's news to
+    // have. Told once, before the first command's own output.
+    if let Some(warning) =
+        crate::sandbox::host_exec_sandbox::sandbox_warning(ctx.allow_unsandboxed_host_exec)
+        && !ctx
+            .sandbox_warning_sent
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        write_response(
+            writer,
+            &RpcResponse::ExecError {
+                data: format!("{warning}\n"),
+            },
+        )?;
+    }
+
     let envs = sanitized_env();
     let spawn_result = crate::sandbox::host_exec_sandbox::spawn_sandboxed(
         &program,
@@ -1021,6 +1044,7 @@ mod tests {
             allowed_commands: std::collections::HashSet::new(),
             detected_toolchain: crate::sandbox::toolchain::DetectedToolchain::None,
             allow_unsandboxed_host_exec: false,
+            sandbox_warning_sent: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1278,6 +1302,7 @@ mod tests {
             allowed_commands: allowed.iter().map(|s| s.to_string()).collect(),
             detected_toolchain: crate::sandbox::toolchain::DetectedToolchain::None,
             allow_unsandboxed_host_exec: allow_unsandboxed,
+            sandbox_warning_sent: std::sync::atomic::AtomicBool::new(false),
         });
 
         let handle = server.spawn(ctx);
@@ -1453,6 +1478,24 @@ mod tests {
         );
         // Should fail to spawn, not hang
         assert_ne!(code, 0);
+    }
+
+    /// A command that runs without its filesystem isolation says so once, on
+    /// the stream the guest reads, ahead of the command's own output.
+    #[test]
+    fn exec_tells_the_guest_once_that_it_runs_unsandboxed() {
+        let command = "this-command-definitely-does-not-exist-xyz";
+        let (mut client, _tmp, _handle) = start_exec_server(&[command], true);
+        let expected = crate::sandbox::host_exec_sandbox::sandbox_warning(true).unwrap();
+
+        let (_stdout, first, _code) = exec_collect(&mut client, command, &[]);
+        assert!(first.starts_with(&expected), "got: {first}");
+
+        let (_stdout, second, _code) = exec_collect(&mut client, command, &[]);
+        assert!(
+            !second.contains(&expected),
+            "the guest is told once, got: {second}"
+        );
     }
 
     #[cfg(unix)]
@@ -1858,6 +1901,7 @@ mod tests {
             allowed_commands: std::collections::HashSet::new(),
             detected_toolchain: crate::sandbox::toolchain::DetectedToolchain::None,
             allow_unsandboxed_host_exec: false,
+            sandbox_warning_sent: std::sync::atomic::AtomicBool::new(false),
         });
 
         let _handle = server.spawn(ctx);
