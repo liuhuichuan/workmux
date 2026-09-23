@@ -1,11 +1,14 @@
 ---
 title: "sidebar"
-description: Control a live agent status sidebar in tmux
+description: Control a live agent status sidebar in tmux or WezTerm
 ---
 
 Controls a live agent status sidebar on the left or top edge of tmux windows. By default, each sidebar pane shows active agents across all tmux
 sessions with live status updates. Use `workmux sidebar filter session` to show
 only agents in the current tmux session.
+
+On Windows the sidebar runs in a WezTerm workspace instead, and covers every tab
+of it, so the global and `--session` forms are the same command there.
 
 ```bash
 workmux sidebar                         # Toggle sidebar on/off (all sessions)

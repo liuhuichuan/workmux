@@ -1,14 +1,15 @@
 ---
 title: "Sidebar"
-description: A persistent agent status sidebar for tmux windows
+description: A persistent agent status sidebar for tmux windows and WezTerm tabs
 ---
 
 import Screenshot from "../../../../components/Screenshot.astro";
 import screenshot from "../../../../assets/screenshots/sidebar.webp";
 
 The sidebar provides an always-visible agent overview pinned to the left edge or
-top edge of every tmux window. Unlike the dashboard, which is a full-screen TUI
-you open on demand, the sidebar stays on screen while you work.
+top edge of every tmux window -- or every WezTerm tab on Windows. Unlike the
+dashboard, which is a full-screen TUI you open on demand, the sidebar stays on
+screen while you work.
 
 <div style="display: flex; justify-content: center; margin: 1.5rem 0;">
 
@@ -20,7 +21,8 @@ you open on demand, the sidebar stays on screen while you work.
 
 :::caution[Prerequisites]
 The sidebar requires [status tracking hooks](/guide/status-tracking/) to be
-configured and tmux as the backend.
+configured, and one of the two backends it runs under: tmux, or WezTerm on
+Windows.
 :::
 
 Toggle the sidebar with:
@@ -36,6 +38,9 @@ across all sessions. Use `--session` to scope it to the current session only,
 leaving other sessions untouched. Use `--position left` or `--position top` to
 override the configured placement when enabling the sidebar. Running the command
 again disables it.
+
+On Windows the sidebar is scoped to one WezTerm workspace and appears in every
+tab of it, so the global and `--session` forms are the same command.
 
 When the global sidebar is active, `workmux sidebar --session` hides it in the
 current tmux session only. Run it again to show the sidebar in that session
@@ -200,7 +205,10 @@ bind -n M-3 run-shell "workmux sidebar jump 3"
 ## How it works
 
 The sidebar is a bit of a hack on top of tmux's pane system, but it works quite
-well. It uses a daemon + client architecture with event-driven rendering:
+well. It uses a daemon + client architecture with event-driven rendering. Where
+WezTerm is the backend the shape is a different one -- each sidebar pane polls
+WezTerm and the state store itself, and there is no daemon to push to. That is
+written up under [WezTerm](/guide/wezterm/):
 
 1. **Toggle on** (`workmux sidebar`): creates a tmux pane on the left or top
    edge of every window, starts a background daemon, and installs tmux hooks.
