@@ -2565,7 +2565,7 @@ exit 1
     env.install_script(gh_script, script_content)
 
     # Add the bin directory to PATH
-    new_path = f"{bin_dir}:{env.env.get('PATH', '')}"
+    new_path = os.pathsep.join([str(bin_dir), env.env.get("PATH", "")])
     env.env["PATH"] = new_path
     # Set PATH in the multiplexer session so workmux can find the fake gh
     env.set_session_env("PATH", new_path)
