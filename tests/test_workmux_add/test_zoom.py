@@ -7,10 +7,12 @@ a zoomed window. WezTerm reports it on the pane, as `is_zoomed` in
 """
 
 from pathlib import Path
+from typing import cast
 
 from ..conftest import (
     MuxEnvironment,
     TmuxEnvironment,
+    WezTermEnvironment,
     get_window_name,
     write_workmux_config,
 )
@@ -19,7 +21,11 @@ from .conftest import add_branch_and_get_worktree
 
 def wezterm_tab_panes(env: MuxEnvironment, window_name: str) -> list[dict]:
     """The panes of a WezTerm tab, in the order they were created."""
-    panes = [p for p in env._list_panes() if p.get("tab_title") == window_name]
+    panes = [
+        p
+        for p in cast(WezTermEnvironment, env)._list_panes()
+        if p.get("tab_title") == window_name
+    ]
     return sorted(panes, key=lambda pane: pane["pane_id"])
 
 

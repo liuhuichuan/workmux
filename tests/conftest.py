@@ -125,6 +125,18 @@ class ShellCommands:
             case _:
                 return f"echo '{text}' >> {file_path}"
 
+    def exit_after(self, seconds: int) -> str:
+        """A pane command that stays up for `seconds`, then ends its shell.
+
+        Nushell rejects `&&` outright and reads `sleep` as taking a duration
+        literal, so the two halves are spelled per shell.
+        """
+        match self.name:
+            case "nu":
+                return f"sleep {seconds}sec; exit"
+            case _:
+                return f"sleep {seconds} && exit"
+
 
 def _candidate_shell_paths(name: str) -> list[str]:
     """Every path that could be the shell `name`, in the order to try them."""
@@ -1711,7 +1723,7 @@ def pane_quote(value: Any) -> str:
     return shlex.quote(text)
 
 
-def create_file_command(filename: str, text: str = "created") -> str:
+def create_file_command(filename: Union[str, Path], text: str = "created") -> str:
     """A command that makes `filename` appear, in whichever shell runs it.
 
     A `post_create` hook or a pane command is run through the platform's own

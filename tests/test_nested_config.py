@@ -8,6 +8,7 @@ from urllib.request import url2pathname
 from .conftest import (
     MuxEnvironment,
     TmuxEnvironment,
+    WezTermEnvironment,
     hook_env_echo,
     hook_print_cwd,
     run_workmux_command,
@@ -35,6 +36,7 @@ def get_pane_cwd(env: MuxEnvironment, window_name: str) -> Path:
         )
         return Path(result.stdout.strip())
 
+    assert isinstance(env, WezTermEnvironment), env.backend_name
     pane = env._find_pane_by_tab_title(window_name)
     assert pane is not None, f"No pane in tab '{window_name}'"
     return Path(url2pathname(urlparse(pane["cwd"]).path))

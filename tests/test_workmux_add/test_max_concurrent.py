@@ -32,7 +32,9 @@ class TestMaxConcurrent:
         env.configure_default_shell(shell_cmd.path)
 
         # Configure pane to auto-close after a short delay (simulates agent completing)
-        write_workmux_config(mux_repo_path, panes=[{"command": "sleep 1 && exit"}])
+        write_workmux_config(
+            mux_repo_path, panes=[{"command": shell_cmd.exit_after(1)}]
+        )
 
         # 2 items with max-concurrent 1 = sequential processing
         # If worker pool works, this completes; if broken, it hangs forever

@@ -7,11 +7,13 @@ port added, so it stands aside where tmux is the backend.
 """
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from .conftest import (
     MuxEnvironment,
+    WezTermEnvironment,
     make_env_script,
     pane_home_env,
     pane_quote,
@@ -32,14 +34,14 @@ def skip_on_tmux(env: MuxEnvironment) -> None:
         )
 
 
-def host_pane_id(env: MuxEnvironment) -> str:
+def host_pane_id(env: WezTermEnvironment) -> str:
     """The pane the test's own shell runs in, which a sidebar splits off."""
     panes = env._list_panes()
     assert panes, "the test workspace has no pane to put a sidebar beside"
     return str(panes[0]["pane_id"])
 
 
-def sidebar_panes(env: MuxEnvironment) -> list[dict]:
+def sidebar_panes(env: WezTermEnvironment) -> list[dict]:
     """The sidebar panes of the test workspace, as the mux reports them."""
     return [p for p in env._list_panes() if p.get("title") == SIDEBAR_PANE_TITLE]
 
@@ -67,7 +69,7 @@ def run_in_pane(env: MuxEnvironment, pane_id: str, command: str) -> None:
     send_to_pane(env, pane_id, invocation + "\r")
 
 
-def open_sidebar(env: MuxEnvironment, workmux_exe_path: Path) -> str:
+def open_sidebar(env: WezTermEnvironment, workmux_exe_path: Path) -> str:
     """Ask the host pane for a sidebar and answer with the pane it landed in."""
     run_in_pane(env, host_pane_id(env), f"{pane_quote(workmux_exe_path)} sidebar on")
     assert poll_until(lambda: len(sidebar_panes(env)) == 1, timeout=20.0), (
@@ -83,7 +85,7 @@ class TestWezTermSidebar:
         self, mux_server: MuxEnvironment, workmux_exe_path: Path
     ):
         """`workmux sidebar on` puts a drawing sidebar in the host pane's tab."""
-        env = mux_server
+        env = cast(WezTermEnvironment, mux_server)
         skip_on_tmux(env)
         host = host_pane_id(env)
 
@@ -106,7 +108,7 @@ class TestWezTermSidebar:
         self, mux_server: MuxEnvironment, workmux_exe_path: Path
     ):
         """A quit typed into the sidebar asks, then takes only the sidebar."""
-        env = mux_server
+        env = cast(WezTermEnvironment, mux_server)
         skip_on_tmux(env)
         host = host_pane_id(env)
         sidebar = open_sidebar(env, workmux_exe_path)
@@ -128,7 +130,7 @@ class TestWezTermSidebar:
         self, mux_server: MuxEnvironment, workmux_exe_path: Path
     ):
         """`workmux sidebar off` takes the sidebar and nothing else."""
-        env = mux_server
+        env = cast(WezTermEnvironment, mux_server)
         skip_on_tmux(env)
         host = host_pane_id(env)
         open_sidebar(env, workmux_exe_path)
