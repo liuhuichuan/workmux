@@ -2506,7 +2506,17 @@ mod tests {
         let mut replacement = old.clone();
         replacement.boot_id = Some("boot-b".to_string());
         replacement.updated_ts += 1;
-        write_raw_agent(&store, &replacement);
+        let path = store.agent_path(&old.pane_key);
+        let original_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        // The record is replaced the way the store replaces one -- written
+        // beside it and renamed over it -- with the timestamp put back where it
+        // was: a truncating write of the same size leaves a file the revision
+        // can read as the one the snapshot took, which is the timing this case
+        // would then be measuring instead of the replacement.
+        crate::util::write_atomic(&path, &serde_json::to_vec_pretty(&replacement).unwrap())
+            .unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(original_mtime))
+            .unwrap();
 
         let sources: Vec<_> = snapshot.into_iter().map(|record| record.source).collect();
         store.consume_agent_sources(&sources).unwrap();
