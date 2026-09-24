@@ -1026,12 +1026,13 @@ fn wait_for_source_target(
         || mux.reread(),
         || match source_target_exists(mux, mode, source_target, source_id) {
             Ok(exists) => Ok(exists),
-            // A multiplexer that has stopped answering will not report the
-            // target again, and the window went with it.
-            Err(error) => match mux.is_running() {
-                Ok(true) => Err(error),
-                Ok(false) | Err(_) => Ok(false),
-            },
+            Err(error) => {
+                if mux_stopped_answering(|| mux.is_running()) {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
         },
         || started.elapsed(),
         thread::sleep,
@@ -1043,6 +1044,16 @@ fn wait_for_source_target(
         "deferred cleanup worker: waited for source target to close"
     );
     result
+}
+
+/// Whether a mux that could not report a window has stopped answering.
+///
+/// A WezTerm GUI that is wedged answers nothing at all, and a window it cannot
+/// report is a window that went down with it. The readers here take the source
+/// target as closed rather than retry a mux that is not there; `is_running` is
+/// the mux's own question, passed in so a test can answer it.
+fn mux_stopped_answering(is_running: impl FnOnce() -> Result<bool>) -> bool {
+    !matches!(is_running(), Ok(true))
 }
 
 /// Ask the multiplexer whether the source target is still there.
@@ -1108,8 +1119,54 @@ pub fn navigate_to_target_and_close(
 ) -> Result<()> {
     use crate::multiplexer::MuxHandle;
 
-    let mux_running = mux.is_running()?;
+    let kind = crate::multiplexer::handle::mode_label(mode);
+    let Some(source) = cleanup_result.source_target_to_close.as_ref() else {
+        if !cleanup_result.tmux_window_killed {
+            info!(
+                handle = source_handle,
+                target = target_window_name,
+                kind,
+                "cleanup:skipped target selection because source target was not deferred"
+            );
+        }
+        return Ok(());
+    };
+    let source_full = match source {
+        SourceTarget::Window(target) => target.full_name.clone(),
+        SourceTarget::Session { name, .. } => name.clone(),
+    };
+
+    // The worker that removes the worktree and the branch starts before the mux
+    // is asked anything: it is the part that changes the repository, while
+    // everything below only moves a client between windows. Starting it here
+    // also keeps it on this executable's own image, ahead of any script the mux
+    // runs. A mux that has stopped answering must not cost a merge the cleanup
+    // it already earned, so the worker is in place before the first question
+    // that can stall.
+    let mut worker = cleanup_result
+        .deferred_cleanup
+        .as_ref()
+        .map(|cleanup| spawn_deferred_cleanup_worker(cleanup, mode, source))
+        .transpose()?;
+
     let target_full = prefixed(prefix, target_window_name);
+    let mux_running = match mux.is_running() {
+        Ok(running) => running,
+        Err(error) => {
+            // A window the mux cannot be asked about is a window that went with
+            // the mux -- the reading the deferred worker makes of the same
+            // silence -- so the worker is left to finish the removal rather than
+            // killed for a client that cannot be moved.
+            warn!(
+                error = %error,
+                source = source_handle,
+                target = target_window_name,
+                kind,
+                "cleanup:mux stopped answering; leaving the removal to the deferred worker"
+            );
+            return Ok(());
+        }
+    };
     let (target_exists, target_mode) = if mux_running {
         let is_session = mux.session_exists(&target_full).unwrap_or(false);
         let is_window = mux
@@ -1125,32 +1182,23 @@ pub fn navigate_to_target_and_close(
     } else {
         (false, mode)
     };
-    let kind = crate::multiplexer::handle::mode_label(mode);
-    let source = cleanup_result.source_target_to_close.as_ref();
-    let source_full = source
-        .map(|source| match source {
-            SourceTarget::Window(target) => target.full_name.clone(),
-            SourceTarget::Session { name, .. } => name.clone(),
-        })
-        .unwrap_or_else(|| prefixed(prefix, source_handle));
-    let kill_source_cmd = source
-        .and_then(|source| match source {
-            SourceTarget::Window(target) => target
-                .window_id
-                .as_deref()
-                .and_then(|id| mux.shell_close_window_by_id_guard_cmd(id).ok())
-                .or_else(|| MuxHandle::shell_kill_window_target_cmd(mux, target).ok()),
-            SourceTarget::Session { id, .. } => id.as_deref().and_then(|id| {
-                // A managed session for the destination branch wins; otherwise
-                // fall back to the configured session before the client's own
-                // previous session.
-                let preferred = (target_exists && target_mode == MuxMode::Session)
-                    .then_some(target_full.as_str())
-                    .or(default_session);
-                mux.shell_close_session_by_id_guard_cmd(id, preferred).ok()
-            }),
-        })
-        .or_else(|| MuxHandle::shell_kill_cmd_full(mux, mode, &source_full).ok());
+    let kill_source_cmd = match source {
+        SourceTarget::Window(target) => target
+            .window_id
+            .as_deref()
+            .and_then(|id| mux.shell_close_window_by_id_guard_cmd(id).ok())
+            .or_else(|| MuxHandle::shell_kill_window_target_cmd(mux, target).ok()),
+        SourceTarget::Session { id, .. } => id.as_deref().and_then(|id| {
+            // A managed session for the destination branch wins; otherwise
+            // fall back to the configured session before the client's own
+            // previous session.
+            let preferred = (target_exists && target_mode == MuxMode::Session)
+                .then_some(target_full.as_str())
+                .or(default_session);
+            mux.shell_close_session_by_id_guard_cmd(id, preferred).ok()
+        }),
+    }
+    .or_else(|| MuxHandle::shell_kill_cmd_full(mux, mode, &source_full).ok());
     let select_target_cmd = MuxHandle::shell_select_cmd_full(mux, target_mode, &target_full).ok();
 
     info!(
@@ -1169,18 +1217,6 @@ pub fn navigate_to_target_and_close(
         deferred_cleanup = cleanup_result.deferred_cleanup.is_some(),
         "navigate_to_target_and_close:entry"
     );
-
-    let Some(source) = source else {
-        if !cleanup_result.tmux_window_killed {
-            info!(
-                handle = source_handle,
-                target = target_window_name,
-                kind,
-                "cleanup:skipped target selection because source target was not deferred"
-            );
-        }
-        return Ok(());
-    };
 
     let delay = Duration::from_millis(WINDOW_CLOSE_DELAY_MS);
     let delay_secs = format!("{:.3}", delay.as_secs_f64());
@@ -1212,15 +1248,20 @@ pub fn navigate_to_target_and_close(
         kind, "navigate_to_target_and_close:nav_and_kill_script"
     );
 
-    // Start the worker before scheduling source closure so it retains the
-    // trusted executable image and observes the complete target lifecycle.
-    let mut worker = cleanup_result
-        .deferred_cleanup
-        .as_ref()
-        .map(|cleanup| spawn_deferred_cleanup_worker(cleanup, mode, source))
-        .transpose()?;
-
     if let Err(error) = mux.run_deferred_script(&script) {
+        if mux_stopped_answering(|| mux.is_running()) {
+            // The mux went while the close was being scheduled, and its window
+            // went with it -- which is exactly what the worker waits to see. It
+            // is left to finish the removal.
+            warn!(
+                error = %error,
+                source = source_handle,
+                target = target_window_name,
+                kind,
+                "cleanup:mux stopped answering while scheduling the source close; leaving the removal to the deferred worker"
+            );
+            return Ok(());
+        }
         if let Some(worker) = worker.as_mut() {
             let _ = worker.kill();
             let _ = worker.wait();
@@ -1312,6 +1353,18 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("no mux server"), "{error}");
+    }
+
+    /// A mux that cannot answer is read as a window that is gone, and a mux that
+    /// answers "no windows" is read the same way -- but a mux that answers at all
+    /// keeps its failure to report a window: that one is a real query error.
+    #[test]
+    fn only_a_mux_that_stopped_answering_reads_as_a_window_that_is_gone() {
+        assert!(mux_stopped_answering(|| {
+            Err(anyhow!("Command timed out after 20s: wezterm cli list"))
+        }));
+        assert!(mux_stopped_answering(|| Ok(false)));
+        assert!(!mux_stopped_answering(|| Ok(true)));
     }
 
     /// The window being waited for closes while the wait runs, and a backend

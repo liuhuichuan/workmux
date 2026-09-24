@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cmd::Cmd;
 use crate::config::SplitDirection;
@@ -339,6 +339,71 @@ fn drop_url_trailing_separator(path: PathBuf) -> PathBuf {
     PathBuf::from(trimmed)
 }
 
+/// How long a mux that did not answer a read is left alone, and how long that
+/// wait grows to.
+///
+/// One call that meets a wedged GUI costs the whole deadline, `WEZTERM_CLI_TIMEOUT`,
+/// and is a process besides. A caller that polls would spend that on every poll
+/// against the very mux that has stopped working -- six sidebars on this machine
+/// already stretch a healthy call to five seconds -- so a mux that did not answer
+/// is left alone instead. The wait doubles with each unanswered read and stops at
+/// half a minute, so a wedged GUI is asked rarely while one that comes back is
+/// picked up within that.
+const MUX_BACKOFF_FIRST: Duration = Duration::from_secs(2);
+const MUX_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// How long to leave a mux that did not answer `unanswered` reads alone.
+fn backoff_after_unanswered(unanswered: u32) -> Duration {
+    let mut wait = MUX_BACKOFF_FIRST;
+    for _ in 1..unanswered.min(64) {
+        wait = (wait * 2).min(MUX_BACKOFF_MAX);
+    }
+    wait
+}
+
+/// The silence kept on a mux that stopped answering.
+///
+/// Held per process, beside the reading: a command that runs once asks its one
+/// question and quits, while the callers that run in a loop -- a sidebar, a
+/// dashboard -- are the ones that would otherwise put a question to a wedged GUI
+/// for the whole deadline, once per poll, each time.
+#[derive(Default)]
+struct MuxBackoff {
+    unanswered: u32,
+    left_alone_until: Option<Instant>,
+}
+
+impl MuxBackoff {
+    /// Fail while the mux is left alone after reads it did not answer.
+    fn may_ask(&self, now: Instant) -> Result<()> {
+        let Some(until) = self.left_alone_until else {
+            return Ok(());
+        };
+        if now >= until {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "WezTerm did not answer the last {} call(s); not asking again for {:.1}s",
+            self.unanswered,
+            (until - now).as_secs_f64()
+        ))
+    }
+
+    /// Take note of what a read of the mux found.
+    ///
+    /// An answered read puts the mux back on the poll it had: the callers here
+    /// run in a loop, and one answer is what its recovery looks like.
+    fn note(&mut self, answered: bool, now: Instant) {
+        if answered {
+            self.unanswered = 0;
+            self.left_alone_until = None;
+            return;
+        }
+        self.unanswered = self.unanswered.saturating_add(1);
+        self.left_alone_until = Some(now + backoff_after_unanswered(self.unanswered));
+    }
+}
+
 /// The panes workmux last read from the mux.
 ///
 /// A `wezterm cli` call is a whole process on Windows, measured at 69-230 ms,
@@ -350,9 +415,28 @@ fn drop_url_trailing_separator(path: PathBuf) -> PathBuf {
 #[derive(Default)]
 struct PaneReading {
     panes: Mutex<Option<Vec<WezTermPane>>>,
+    /// The silence kept on a mux that did not answer.
+    backoff: Mutex<MuxBackoff>,
 }
 
 impl PaneReading {
+    /// Put a question to the mux, in the silence a mux that did not answer is
+    /// kept in.
+    ///
+    /// A read that came back with an error is a mux that left the caller with
+    /// the deadline, or with no answer at all: it is left alone for a while
+    /// rather than asked again at once.
+    fn ask<T>(&self, question: impl FnOnce() -> Result<T>) -> Result<T> {
+        if let Ok(backoff) = self.backoff.lock() {
+            backoff.may_ask(Instant::now())?;
+        }
+        let result = question();
+        if let Ok(mut backoff) = self.backoff.lock() {
+            backoff.note(result.is_ok(), Instant::now());
+        }
+        result
+    }
+
     /// The reading held, or one read from the mux and held now.
     fn get_or_read(
         &self,
@@ -460,11 +544,16 @@ impl WezTermBackend {
         panes_reading().read_now(|| self.read_panes())
     }
 
+    /// The `wezterm cli list --format json` call that reports the panes.
+    fn list_panes_cmd(&self) -> Result<String> {
+        self.cli(&["cli", "list", "--format", "json"])
+            .run_and_capture_stdout()
+    }
+
     /// Ask WezTerm for its panes, and parse what it reports.
     fn read_panes(&self) -> Result<Vec<WezTermPane>> {
-        let output = self
-            .cli(&["cli", "list", "--format", "json"])
-            .run_and_capture_stdout()
+        let output = panes_reading()
+            .ask(|| self.list_panes_cmd())
             .context("Failed to list WezTerm panes")?;
 
         let panes: Vec<WezTermPane> =
@@ -928,6 +1017,9 @@ impl Multiplexer for WezTermBackend {
     // === Server/Session ===
 
     fn is_running(&self) -> Result<bool> {
+        // Asked for real, never answered from the silence a failed listing
+        // leaves behind: this is the question callers read as "the mux is
+        // gone", and it must be their own evidence, not a wait workmux chose.
         self.cli(&["cli", "list"]).run_as_check()
     }
 
@@ -1638,6 +1730,62 @@ mod tests {
         assert!(reading.get_or_read(read).is_err());
         assert_eq!(reads.get(), 2);
         assert!(reading.held().is_none());
+    }
+
+    /// Each unanswered read doubles the wait before the mux is asked again,
+    /// and the wait stops growing at the cap.
+    #[test]
+    fn the_wait_doubles_with_each_unanswered_read() {
+        assert_eq!(backoff_after_unanswered(1), MUX_BACKOFF_FIRST);
+        assert_eq!(backoff_after_unanswered(2), MUX_BACKOFF_FIRST * 2);
+        assert_eq!(backoff_after_unanswered(3), MUX_BACKOFF_FIRST * 4);
+        assert_eq!(backoff_after_unanswered(4), MUX_BACKOFF_FIRST * 8);
+
+        for unanswered in 5..1_000 {
+            assert_eq!(backoff_after_unanswered(unanswered), MUX_BACKOFF_MAX);
+        }
+    }
+
+    /// The wait doubles with each unanswered read, up to the cap, and one
+    /// answered read ends the silence at once.
+    #[test]
+    fn the_silence_grows_by_doubling_and_ends_with_one_answer() {
+        let now = Instant::now();
+        let mut backoff = MuxBackoff::default();
+
+        backoff.note(false, now);
+        assert!(backoff.may_ask(now).is_err());
+        assert!(backoff.may_ask(now + MUX_BACKOFF_FIRST).is_ok());
+
+        // A second read that did not answer doubles the wait it leaves behind.
+        backoff.note(false, now);
+        assert!(backoff.may_ask(now + MUX_BACKOFF_FIRST).is_err());
+        assert!(backoff.may_ask(now + MUX_BACKOFF_FIRST * 2).is_ok());
+
+        backoff.note(true, now);
+        assert_eq!(backoff.unanswered, 0);
+        assert!(backoff.may_ask(now).is_ok(), "an answer puts the mux back");
+    }
+
+    /// The silence is kept where the mux is asked, so a question put while a
+    /// mux that did not answer is still left alone never reaches it.
+    #[test]
+    fn a_question_put_while_the_mux_is_left_alone_never_reaches_it() {
+        let reading = PaneReading::default();
+        let asked = Cell::new(0);
+        let question = || {
+            asked.set(asked.get() + 1);
+            Ok(())
+        };
+
+        reading.ask(question).unwrap();
+        assert_eq!(asked.get(), 1, "the first question goes out");
+
+        // A read that came back with nothing leaves the silence behind it.
+        reading.backoff.lock().unwrap().note(false, Instant::now());
+        let error = reading.ask(question).unwrap_err();
+        assert!(error.to_string().contains("did not answer"), "{error}");
+        assert_eq!(asked.get(), 1, "a mux left alone is not asked again");
     }
 
     /// A listing is kept, and the subcommands that can change what a listing
