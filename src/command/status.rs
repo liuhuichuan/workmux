@@ -501,6 +501,9 @@ mod tests {
 
     /// Two worktrees of one repository ask the repository's questions, and the
     /// answer is the repository's, so only the first worktree pays for it.
+    // The borrow is deliberate: the closure answers both calls, so it cannot be
+    // moved into the first one.
+    #[allow(clippy::needless_borrows_for_generic_args)]
     #[test]
     fn a_repository_is_resolved_once_however_many_worktrees_ask() {
         let mut branches = RepositoryBranches::default();
@@ -524,6 +527,9 @@ mod tests {
     }
 
     /// Two repositories are two answers, so the second one is asked for.
+    // The borrow is deliberate: the closure answers both calls, so it cannot be
+    // moved into the first one.
+    #[allow(clippy::needless_borrows_for_generic_args)]
     #[test]
     fn another_repository_is_resolved_separately() {
         let mut branches = RepositoryBranches::default();
@@ -571,7 +577,12 @@ mod tests {
             &["worktree", "add", worktree.to_str().unwrap()],
         );
 
-        assert_eq!(repository_root(&worktree), repository);
+        // A temporary directory can be a short (8.3) path while the repository
+        // root is spelled out in full, so compare canonical forms.
+        assert_eq!(
+            test_support::canonical_dir(&repository_root(&worktree)),
+            test_support::canonical_dir(&repository)
+        );
     }
 
     /// A bare repository keeps its worktrees where a main repository keeps
@@ -595,6 +606,9 @@ mod tests {
         let worktree = dir.path().join("worktree");
         test_support::run_git(&bare, &["worktree", "add", worktree.to_str().unwrap()]);
 
-        assert_eq!(repository_root(&worktree), bare);
+        assert_eq!(
+            test_support::canonical_dir(&repository_root(&worktree)),
+            test_support::canonical_dir(&bare)
+        );
     }
 }

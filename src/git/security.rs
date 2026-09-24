@@ -457,7 +457,11 @@ mod tests {
                 if path.is_dir() {
                     visit(&path, violations);
                 } else if path.extension() == Some(OsStr::new("rs")) {
-                    let source = std::fs::read_to_string(&path).unwrap();
+                    // A checkout with `core.autocrlf` on hands us CRLF line
+                    // endings, which would hide the marker searched for below.
+                    let source = std::fs::read_to_string(&path)
+                        .unwrap()
+                        .replace("\r\n", "\n");
                     let production_end = source
                         .rfind("\n#[cfg(test)]\nmod tests")
                         .unwrap_or(source.len());

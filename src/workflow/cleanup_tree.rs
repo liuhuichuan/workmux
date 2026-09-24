@@ -55,7 +55,7 @@ pub(super) fn remove(path: &Path, expected: DirectoryIdentity) -> io::Result<()>
         Err(Errno::ENOENT) => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    if !metadata_matches(&directory.metadata()?, expected) {
+    if !metadata_matches(path, &directory.metadata()?, expected) {
         return Err(io::Error::other(
             "Quarantined worktree identity changed before deletion",
         ));

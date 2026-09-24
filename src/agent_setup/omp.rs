@@ -140,15 +140,17 @@ mod tests {
     fn test_extension_without_registration_needs_update() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("workmux-status.ts");
-        let previous_source = EXTENSION_SOURCE
-            .replace(
+        // A CRLF checkout of the embedded extension source would keep the
+        // block below from matching, so drop carriage returns first.
+        let source = EXTENSION_SOURCE.replace("\r\n", "\n");
+        let previous_source = source.replace(
                 "  pi.on(\"session_start\", async () => {\n    await pi.exec(\"workmux\", [\"register-agent\"]).catch(() => {});\n  });\n\n",
                 "",
             );
         std::fs::write(&path, previous_source).unwrap();
 
         assert!(matches!(
-            extension_file::check_installed(Some(&path), EXTENSION_SOURCE).unwrap(),
+            extension_file::check_installed(Some(&path), &source).unwrap(),
             StatusCheck::UpdateAvailable
         ));
     }

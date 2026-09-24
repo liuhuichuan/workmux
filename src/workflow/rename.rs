@@ -170,7 +170,7 @@ pub fn rename(
         )?;
         // Only reconnect what was connected: a worktree whose window is already
         // closed (`workmux close`) has to stay closed.
-        closed.then(|| ClosedPanes { agent })
+        closed.then_some(ClosedPanes { agent })
     } else {
         None
     };

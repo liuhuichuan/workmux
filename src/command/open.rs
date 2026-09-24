@@ -1,7 +1,7 @@
 use crate::command::args::PromptArgs;
 use crate::config::MuxMode;
-use crate::multiplexer::{create_backend, detect_backend};
 use crate::multiplexer::handle::target_label;
+use crate::multiplexer::{create_backend, detect_backend};
 use crate::workflow::prompt_loader::{PromptLoadArgs, load_prompt};
 use crate::workflow::{SetupOptions, WorkflowContext};
 use crate::{config, workflow};

@@ -905,10 +905,8 @@ pub(super) fn run_sidebar() -> Result<()> {
         Quit::Silent => kill(&host_pane_id),
         // Ourselves last: killing this pane takes this process with it, so
         // anything after it would never run.
-        Quit::Workspace => {
-            close_except(Some(&host_identity.session_name), Some(&host_pane_id))
-                .and_then(|()| kill(&host_pane_id))
-        }
+        Quit::Workspace => close_except(Some(&host_identity.session_name), Some(&host_pane_id))
+            .and_then(|()| kill(&host_pane_id)),
     };
     Ok(())
 }
@@ -1225,11 +1223,7 @@ mod tests {
     /// applies has to be the sidebar's, not every workspace on the server.
     #[test]
     fn listing_agents_under_the_session_filter_keeps_the_workspace() {
-        let agents = vec![
-            agent("1", "ws-a"),
-            agent("2", "ws-b"),
-            agent("3", "ws-a"),
-        ];
+        let agents = vec![agent("1", "ws-a"), agent("2", "ws-b"), agent("3", "ws-a")];
 
         assert_eq!(
             listed_pane_ids(agents.clone(), SidebarFilterMode::Session, "ws-a"),

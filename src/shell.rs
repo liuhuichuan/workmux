@@ -59,6 +59,9 @@ pub const fn default_interactive_shell() -> &'static str {
 /// where a pane's PATH, aliases and environment come from, so a pane started
 /// without it runs a shell the user would not recognise as their own. `cmd.exe`
 /// and PowerShell have no such flag and are started as they are.
+///
+/// Only the Windows pane handshake starts a shell this way.
+#[cfg(windows)]
 pub fn interactive_shell_argv(shell: &str) -> Vec<String> {
     let mut argv = vec![shell.to_string()];
     if dialect_of(shell) == ShellDialect::Posix {
@@ -361,6 +364,7 @@ mod tests {
     /// A pane's shell is started the way its own profile expects: a shell that
     /// reads a profile arrives as a login shell, and an interpreter with no such
     /// flag arrives as itself.
+    #[cfg(windows)]
     #[test]
     fn interactive_shell_argv_logs_in_only_for_a_profile_reading_shell() {
         assert_eq!(

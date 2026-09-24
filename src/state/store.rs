@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Read};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;

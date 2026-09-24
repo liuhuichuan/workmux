@@ -906,8 +906,10 @@ mod tests {
         let temp = std::env::var_os("WM_TEST_TEMP").map(PathBuf::from).unwrap();
         let repo_a = temp.join("repo-a");
         let repo_b = temp.join("repo-b");
+        // The child was handed the temporary directory verbatim, which can be a
+        // short (8.3) path on Windows, so compare canonical forms.
         assert_eq!(
-            std::env::current_dir().unwrap(),
+            test_support::canonical_dir(&std::env::current_dir().unwrap()),
             test_support::canonical_dir(&repo_a)
         );
 

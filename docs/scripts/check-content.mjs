@@ -16,9 +16,7 @@ function walk(directory) {
   });
 }
 
-for (const file of walk(contentRoot).filter((name) =>
-  /\.mdx?$/.test(name),
-)) {
+for (const file of walk(contentRoot).filter((name) => /\.mdx?$/.test(name))) {
   const relative = path.relative(contentRoot, file);
   const source = fs.readFileSync(file, "utf8");
   const frontmatter = source.match(/^---\n([\s\S]*?)\n---\n/);

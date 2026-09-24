@@ -245,7 +245,10 @@ struct WezTermPane {
     workspace: String,
     /// Cell extent of this pane, and where it starts within its tab.
     size: WezTermPaneSize,
+    // Read by `tab_extent`, which only the Windows sidebar asks for.
+    #[allow(dead_code)]
     left_col: u16,
+    #[allow(dead_code)]
     top_row: u16,
     /// Terminal title (set by running process via escape sequences)
     title: String,
@@ -653,7 +656,11 @@ impl WezTermBackend {
         (Some(root), command)
     }
 
-    fn live_pane_snapshot(&self, p: &WezTermPane, tab_index: Option<u32>) -> util::LivePaneSnapshot {
+    fn live_pane_snapshot(
+        &self,
+        p: &WezTermPane,
+        tab_index: Option<u32>,
+    ) -> util::LivePaneSnapshot {
         let (pid, current_command) = self.foreground_process_info(p);
         util::LivePaneSnapshot {
             pane_id: p.pane_id.to_string(),
@@ -841,6 +848,7 @@ fn zoom_args(pane_id: &str) -> [&str; 5] {
 ///
 /// The sidebar reads geometry through this: the backend's trait surface has no
 /// pane-extent query, and `wezterm cli list` is where the numbers are.
+#[cfg(windows)]
 pub(crate) struct HostPane {
     /// Workspace holding the pane, the closest thing WezTerm has to a session.
     pub workspace: String,
@@ -855,6 +863,7 @@ pub(crate) struct HostPane {
 }
 
 /// Measure the pane named by `WEZTERM_PANE`.
+#[cfg(windows)]
 pub(crate) fn current_host_pane() -> Option<HostPane> {
     let pane_id: u64 = std::env::var("WEZTERM_PANE").ok()?.parse().ok()?;
     let panes = WezTermBackend::new().list_panes().ok()?;
@@ -878,6 +887,10 @@ pub(crate) fn current_host_pane() -> Option<HostPane> {
 
 /// One pane of the WezTerm instance this process is attached to, in the shape
 /// the sidebar reads.
+///
+/// Only the Windows sidebar reads these fields; the other platforms still fill
+/// them in on the way to the live pane map.
+#[allow(dead_code)]
 pub(crate) struct PaneSummary {
     pub pane_id: String,
     pub tab_id: u64,
@@ -898,6 +911,7 @@ pub(crate) struct PaneSummary {
 }
 
 /// Every pane of the instance.
+#[cfg(windows)]
 pub(crate) fn panes() -> Result<Vec<PaneSummary>> {
     let panes = WezTermBackend::new().list_panes()?;
     Ok(summarize(&panes))
@@ -909,6 +923,7 @@ pub(crate) fn panes() -> Result<Vec<PaneSummary>> {
 /// Windows, and the sidebar asks once a second in every tab it runs in.
 pub(crate) struct InstancePanes {
     /// The panes as the sidebar renders them.
+    #[allow(dead_code)]
     pub summaries: Vec<PaneSummary>,
     /// The panes as the state store reconciles agents against.
     pub live: HashMap<String, LivePaneInfo>,
@@ -961,6 +976,7 @@ fn summarize(panes: &[WezTermPane]) -> Vec<PaneSummary> {
 ///
 /// The backend makes the command, so that a subcommand which can change the
 /// panes drops the reading workmux holds.
+#[cfg(windows)]
 pub(crate) fn cli(args: &[&str]) -> Result<String> {
     WezTermBackend::new()
         .cli(args)
@@ -997,6 +1013,7 @@ fn key_sequence(key: &str) -> &str {
 /// Panes tile their tab but leave a separator cell between neighbours, so
 /// summing their sizes would count those separators as content; the outermost
 /// corner is the extent the tab actually has.
+#[cfg(windows)]
 fn tab_extent<'a>(panes: impl Iterator<Item = &'a WezTermPane>) -> Option<(u16, u16)> {
     let mut cols = 0;
     let mut rows = 0;
@@ -1546,7 +1563,10 @@ impl Multiplexer for WezTermBackend {
 fn tab_indexes(panes: &[WezTermPane]) -> HashMap<u64, u32> {
     let mut tabs_by_window: HashMap<u64, Vec<u64>> = HashMap::new();
     for pane in panes {
-        tabs_by_window.entry(pane.window_id).or_default().push(pane.tab_id);
+        tabs_by_window
+            .entry(pane.window_id)
+            .or_default()
+            .push(pane.tab_id);
     }
 
     let mut indexes = HashMap::new();
@@ -1841,21 +1861,23 @@ mod tests {
     /// A tab's extent is its outermost pane corner. Panes tile their tab but
     /// leave a separator cell between neighbours, so adding their sizes up
     /// would count those separators as content.
+    #[cfg(windows)]
     #[test]
     fn tab_extent_is_the_outermost_pane_corner() {
-        let side_by_side = vec![
+        let side_by_side = [
             pane_in_tab(1, 7, 30, 24, 0, 0),
             pane_in_tab(2, 7, 49, 24, 31, 0),
         ];
         assert_eq!(tab_extent(side_by_side.iter()), Some((80, 24)));
 
-        let stacked = vec![
+        let stacked = [
             pane_in_tab(3, 8, 80, 3, 0, 0),
             pane_in_tab(4, 8, 80, 20, 0, 4),
         ];
         assert_eq!(tab_extent(stacked.iter()), Some((80, 24)));
     }
 
+    #[cfg(windows)]
     #[test]
     fn tab_extent_of_no_panes_is_unknown() {
         assert_eq!(tab_extent(std::iter::empty::<&WezTermPane>()), None);
@@ -2045,7 +2067,7 @@ mod tests {
 
         // Nothing named by the environment: the install directory answers.
         assert_eq!(
-            wezterm_program_from(None, &[installed.clone()]),
+            wezterm_program_from(None, std::slice::from_ref(&installed)),
             Some(installed_cli.clone())
         );
 
@@ -2246,7 +2268,15 @@ mod tests {
     fn a_command_string_is_run_by_the_shell() {
         let argv = crate::shell::snippet_argv("echo hi");
 
-        let args = split_args("12", "cwd", &SplitDirection::Vertical, None, None, Some(&argv)).unwrap();
+        let args = split_args(
+            "12",
+            "cwd",
+            &SplitDirection::Vertical,
+            None,
+            None,
+            Some(&argv),
+        )
+        .unwrap();
 
         assert_eq!(args[args.len() - argv.len() - 1], "--");
         assert!(args.ends_with(&argv), "{args:?}");

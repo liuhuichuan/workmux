@@ -1,0 +1,6 @@
+# Check every text file out with LF on every platform. The tests read
+# repository sources and bundled fixtures back as text, so a checkout that
+# rewrites LF to CRLF -- the default `core.autocrlf` on Windows -- changes
+# what they see. Git still stores these files as LF, so this only pins what
+# lands in the working tree.
+* text=auto eol=lf

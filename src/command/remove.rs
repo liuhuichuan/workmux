@@ -1,5 +1,5 @@
-use crate::multiplexer::{create_backend, detect_backend};
 use crate::multiplexer::handle::target_label;
+use crate::multiplexer::{create_backend, detect_backend};
 use crate::workflow::WorkflowContext;
 use crate::{config, git, spinner, workflow};
 use anyhow::{Context, Result, anyhow};

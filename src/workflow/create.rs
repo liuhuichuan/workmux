@@ -1256,10 +1256,10 @@ mod tests {
         .unwrap();
 
         // The worktree is populated from the PR head...
-        assert_eq!(
-            std::fs::read_to_string(result.worktree_path.join("feature.txt")).unwrap(),
-            "feature\n"
-        );
+        // A checkout with `core.autocrlf` on rewrites the file to CRLF.
+        let checked_out =
+            std::fs::read_to_string(result.worktree_path.join("feature.txt")).unwrap();
+        assert_eq!(checked_out.replace("\r\n", "\n"), "feature\n");
         assert_eq!(
             test_support::run_git_output(&result.worktree_path, &["rev-parse", "HEAD"]),
             feature_commit
@@ -1361,8 +1361,10 @@ mod tests {
         let repo_a = temp.join("repo-a");
         let repo_b = temp.join("repo-b");
         let non_repo = temp.join("not-a-repo");
+        // The child was handed the temporary directory verbatim, which can be a
+        // short (8.3) path on Windows, so compare canonical forms.
         assert_eq!(
-            std::env::current_dir().unwrap(),
+            test_support::canonical_dir(&std::env::current_dir().unwrap()),
             test_support::canonical_dir(&non_repo)
         );
 
