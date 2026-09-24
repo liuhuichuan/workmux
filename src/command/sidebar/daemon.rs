@@ -790,6 +790,10 @@ struct ResolvedGitWorktree {
 const GIT_ROOT_REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Expire both positive and negative discoveries independently of agent updates.
+///
+/// A discovery is dropped along with what git was read for it: a reading is
+/// held for a moment, and a revalidation answered from before the moment it
+/// asks about would find the repository as it no longer is.
 fn expire_git_roots(
     roots_by_agent: &mut HashMap<PathBuf, Option<PathBuf>>,
     last_revalidation: &mut Instant,
@@ -801,6 +805,9 @@ fn expire_git_roots(
     *last_revalidation = now;
     let expired = !roots_by_agent.is_empty();
     roots_by_agent.clear();
+    if expired {
+        crate::git::forget_repository_readings();
+    }
     expired
 }
 
@@ -3240,6 +3247,9 @@ mod tests {
 
             init_repo(&child);
             run_git(&child, &["symbolic-ref", "HEAD", "refs/heads/child"]);
+            // A repository appearing on disk is what `worktree add` makes, and
+            // that asks git afresh rather than answer from what it read before.
+            crate::git::forget_repository_readings();
             assert_eq!(
                 crate::git::get_repo_root_for(&child)
                     .unwrap()

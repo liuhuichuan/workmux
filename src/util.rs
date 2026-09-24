@@ -396,7 +396,7 @@ pub fn path_for_posix_shell(text: &str) -> String {
 }
 
 /// Extensions Windows looks a bare name up with, in the order it tries them.
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const SHELL_PATH_EXT: &str = ".COM;.EXE;.BAT;.CMD";
 
 /// The program this machine runs for a bare command name.
@@ -447,7 +447,7 @@ pub fn startable_program(program: &str) -> String {
 /// Look a program that says where it is up the way Windows starts it: the name
 /// with each of `extensions`, and the name as it came in when none of them is
 /// there to start.
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn startable_program_in(program: &str, extensions: &str) -> String {
     if !program.contains(['\\', '/']) || Path::new(program).extension().is_some() {
         return program.to_string();
@@ -476,7 +476,7 @@ fn startable_program_in(program: &str, extensions: &str) -> String {
 /// and a file whose name has no extension is not one. Choosing such a file --
 /// a shell script a Git installation left in a directory on `PATH`, say --
 /// would answer with a path that cannot be started at all.
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn look_up_program(name: &str, path: &OsStr, extensions: &str) -> PathBuf {
     if name.contains(['\\', '/']) || Path::new(name).extension().is_some() {
         return PathBuf::from(name);
@@ -674,6 +674,7 @@ mod tests {
     use super::*;
 
     /// A name the way Windows compares it: the disk answers either spelling.
+    #[cfg(windows)]
     fn program_name(path: &Path) -> String {
         path.file_name()
             .unwrap_or_default()
@@ -684,6 +685,11 @@ mod tests {
     /// A tool Windows installed as a batch file is not something a direct
     /// spawn finds, and a shell finds it by name: workmux looks it up the way
     /// the shell does, extension by extension, as `PATHEXT` orders them.
+    ///
+    /// Windows compares a name without case, which is what lets the `gh.cmd` a
+    /// shell installed answer to the `gh.CMD` `PATHEXT` spells, so the lookup
+    /// is asked where the filesystem answers the way Windows does.
+    #[cfg(windows)]
     #[test]
     fn a_tool_that_is_a_batch_file_is_looked_up_like_a_shell_looks_it_up() {
         let dir = tempfile::tempdir().unwrap();
@@ -723,6 +729,10 @@ mod tests {
     /// A tool's extensionless entry point is a program to a POSIX shell and not
     /// to one that starts an image, and the suffix beside it is the program
     /// that shell runs. workmux names the one the pane's shell reads.
+    ///
+    /// The suffix is a Windows spelling, found the way the lookup above finds
+    /// one: where a name carries no case.
+    #[cfg(windows)]
     #[test]
     fn a_tool_named_by_path_is_spelled_the_way_a_windows_shell_starts_it() {
         let dir = tempfile::tempdir().unwrap();

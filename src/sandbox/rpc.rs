@@ -1512,7 +1512,12 @@ mod tests {
         let (mut client, _tmp, _handle) = start_exec_server(&["sh"], true);
         let (_stdout, stderr, code) = exec_collect(&mut client, "sh", &["-c", "echo oops >&2"]);
         assert_eq!(code, 0);
-        assert_eq!(stderr.trim(), "oops");
+        // A guest is told once, ahead of the command's own streams, that the
+        // host runs it unsandboxed, so the command's line is what follows.
+        assert!(
+            stderr.lines().any(|line| line.trim() == "oops"),
+            "the command's own stderr is delivered, got: {stderr}"
+        );
     }
 
     #[cfg(unix)]

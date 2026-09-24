@@ -19,11 +19,13 @@ pub enum ShellDialect {
 /// A shell is written down as a path on one host and as a bare name on another,
 /// and Windows spells the same program `bash.EXE` where Unix spells it `bash`.
 /// Every table that asks what a shell can do is keyed by this name, so that a
-/// shell is recognised wherever its path came from.
+/// shell is recognised wherever its path came from -- a path carries the
+/// separator of the platform that wrote it, not of the one reading it, so the
+/// last component is taken off both.
 pub fn shell_name(shell: &str) -> String {
-    let name = std::path::Path::new(shell)
-        .file_name()
-        .and_then(|name| name.to_str())
+    let name = shell
+        .rsplit(['/', '\\'])
+        .find(|component| !component.is_empty())
         .unwrap_or(shell)
         .to_ascii_lowercase();
     match name.strip_suffix(".exe") {
@@ -159,6 +161,9 @@ pub fn shell_quote(s: &str) -> String {
 
 /// Quote `value` as one argument for the shell `snippet_argv` names.
 ///
+/// The shell that names is this platform's, so the quoting is `cmd_quote`'s on
+/// Windows and `shell_quote`'s everywhere else.
+///
 /// A POSIX quoted argument is not a quoted argument to `cmd.exe`, which has no
 /// single-quote form: it looks for a program whose name carries the quotes and
 /// fails. cmd quotes with `"`, so anything outside the plain set is wrapped in
@@ -166,20 +171,29 @@ pub fn shell_quote(s: &str) -> String {
 /// escapes any quote it finds.
 pub fn snippet_quote(value: &str) -> String {
     if cfg!(windows) {
-        /// Characters cmd reads as syntax rather than as text.
-        const UNSAFE: &[char] = &[' ', '\t', '"', '&', '|', '<', '>', '^', '(', ')', '%', '!'];
-
-        if value.is_empty() {
-            return "\"\"".to_string();
-        }
-        if !value.contains(UNSAFE) {
-            return value.to_string();
-        }
-        // cmd has no escape for a quote inside a quoted argument, so doubling
-        // it is as far as a command line can carry.
-        return format!("\"{}\"", value.replace('"', "\"\""));
+        cmd_quote(value)
+    } else {
+        shell_quote(value)
     }
-    shell_quote(value)
+}
+
+/// Quote `value` the way `cmd.exe` reads it.
+///
+/// cmd has no single-quote form, so anything outside the characters it reads as
+/// text is wrapped in a double quote, and a path stays bare.
+fn cmd_quote(value: &str) -> String {
+    /// Characters cmd reads as syntax rather than as text.
+    const UNSAFE: &[char] = &[' ', '\t', '"', '&', '|', '<', '>', '^', '(', ')', '%', '!'];
+
+    if value.is_empty() {
+        return "\"\"".to_string();
+    }
+    if !value.contains(UNSAFE) {
+        return value.to_string();
+    }
+    // cmd has no escape for a quote inside a quoted argument, so doubling
+    // it is as far as a command line can carry.
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 /// Quote `value` as one word of a command line that `dialect` will read.
@@ -192,6 +206,10 @@ pub fn snippet_quote(value: &str) -> String {
 /// `is_program` says whether the word is the command being run rather than one
 /// of its arguments -- the two are quoted the same way everywhere but in
 /// PowerShell, where the call operator is part of naming the program.
+///
+/// The dialect decides, not the machine: a word spelled for `cmd.exe` is
+/// spelled that way wherever workmux runs, because the pane that reads it is
+/// the one that named the dialect.
 pub fn word_quote(value: &str, dialect: ShellDialect, is_program: bool) -> String {
     if !value.is_empty() && value.chars().all(is_word_character) {
         return value.to_string();
@@ -205,7 +223,7 @@ pub fn word_quote(value: &str, dialect: ShellDialect, is_program: bool) -> Strin
                 quoted
             }
         }
-        ShellDialect::Cmd => snippet_quote(value),
+        ShellDialect::Cmd => cmd_quote(value),
         ShellDialect::Posix => shell_quote(value),
     }
 }
